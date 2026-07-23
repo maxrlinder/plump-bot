@@ -40,6 +40,12 @@ def parse_args() -> argparse.Namespace:
         default=50,
         help="Rolling window over sparse non-evaluation diagnostic observations.",
     )
+    parser.add_argument(
+        "--bid-smooth",
+        type=int,
+        default=150,
+        help="Rolling iteration window for the noisier bid-hit-rate panel.",
+    )
     parser.add_argument("--dpi", type=int, default=150)
     parser.add_argument(
         "--min-iteration",
@@ -70,6 +76,7 @@ def main() -> None:
         output_path=output_path,
         smooth=args.smooth,
         diagnostic_smooth=args.diagnostic_smooth,
+        bid_smooth=args.bid_smooth,
         dpi=args.dpi,
         title=f"Plump PPO Training: {args.run_dir.name}",
         min_iteration=args.min_iteration,
@@ -90,6 +97,7 @@ def render_metrics_plot(
     output_path: Path,
     smooth: int = 50,
     diagnostic_smooth: int = 50,
+    bid_smooth: int = 150,
     dpi: int = 150,
     title: str | None = None,
     min_iteration: int | None = None,
@@ -133,10 +141,11 @@ def render_metrics_plot(
     x = _series(rows, "iteration")
     smooth = max(smooth, 1)
     diagnostic_smooth = max(diagnostic_smooth, 1)
+    bid_smooth = max(bid_smooth, 1)
 
     # Row 1: the game — strength, bids, and beliefs, clean rounds only.
     _plot_reward_vs_pool(axes[0][0], rows, x, smooth)
-    _plot_bid_quality(axes[0][1], rows, x, smooth)
+    _plot_bid_quality(axes[0][1], rows, x, bid_smooth)
     _plot_trick_belief(axes[0][2], rows, diagnostic_smooth)
     _plot_suit_belief(axes[0][3], rows, diagnostic_smooth)
 
@@ -360,7 +369,7 @@ def _plot_bid_quality(
         ax.plot(x, _smooth(values, smooth), label=label, color=color, linewidth=width)
         plotted = True
     ax.set_ylim(0.0, 1.0)
-    ax.set_title("Bid Hit Rate (clean arms)")
+    ax.set_title(f"Bid Hit Rate ({smooth}-iteration rolling, clean arms)")
     ax.set_ylabel("focal bid hit rate")
     if plotted:
         ax.legend(fontsize=8, loc="upper left")

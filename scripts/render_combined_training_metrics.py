@@ -32,6 +32,12 @@ def parse_args() -> argparse.Namespace:
         default=50,
         help="Rolling window for sparse diagnostic metric observations.",
     )
+    parser.add_argument(
+        "--bid-smooth",
+        type=int,
+        default=150,
+        help="Rolling iteration window for bid-hit-rate series.",
+    )
     return parser.parse_args()
 
 
@@ -154,6 +160,7 @@ def main() -> None:
         output_path=args.output,
         smooth=args.smooth,
         diagnostic_smooth=args.diagnostic_smooth,
+        bid_smooth=args.bid_smooth,
         title="Plump PPO Training: Modal L40S \u2192 local M5 Pro",
         since_restart=True,
     )

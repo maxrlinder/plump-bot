@@ -37,6 +37,7 @@ while true; do
       --combined-csv "$combined_csv" \
       --smooth 50 \
       --diagnostic-smooth 50 \
+      --bid-smooth 150 \
       >> "$log_file" 2>&1; then
     last_signature="$signature"
     print -r -- "[$timestamp] refreshed" >> "$log_file"
