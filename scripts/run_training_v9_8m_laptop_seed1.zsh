@@ -30,7 +30,7 @@ args=(
   --lr 2e-4
   --entropy-coef 0.0
   --branch-rollouts
-  --branch-decision-budget-per-arm 20000
+  --branch-decision-budget-per-arm 30000
   --branch-update-decisions-per-arm 2400
   --branch-max-active 1536
   --branch-bid-max-actions 4

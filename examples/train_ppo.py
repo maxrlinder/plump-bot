@@ -78,7 +78,10 @@ def parse_args() -> argparse.Namespace:
         "--branch-decision-budget-per-arm",
         type=int,
         default=0,
-        help="Terminal environment-decision budget for each of self/history.",
+        help=(
+            "Non-forced neural-decision budget for each of self/history; "
+            "a player's deterministic final card is played for free."
+        ),
     )
     parser.add_argument(
         "--branch-update-decisions-per-arm",

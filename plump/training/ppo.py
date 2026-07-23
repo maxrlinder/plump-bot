@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import gc
 import math
 import random
 import time
@@ -302,9 +303,10 @@ class TrainingConfig:
     entropy_coef: float = 0.01
     # Counterfactual branch collection keeps one raw-policy focal spine per
     # dealt round, then evaluates alternative focal actions with complete
-    # terminal side rollouts.  Side rollouts are reduced to action-value
+    # terminal side rollouts. Side rollouts are reduced to action-value
     # targets and never enter the PPO buffer, so the branch compute budget is
-    # independent of update memory.
+    # independent of update memory. A player's final held card is forced and
+    # is played through without a policy forward or decision-budget charge.
     branch_rollouts: bool = False
     branch_decision_budget_per_arm: int = 0
     branch_update_decision_budget_per_arm: int = 2_400
@@ -1164,9 +1166,52 @@ class PPOTrainer:
             if self.config.training_mode == "game":
                 return self._collect_game_rollouts(iteration=iteration)
             if self.config.branch_rollouts:
-                return self._collect_recursive_branch_rollouts(
-                    iteration=iteration
-                )
+                # Recursive trees allocate thousands of short-lived acyclic
+                # env/path objects. Avoid repeatedly scanning that live
+                # frontier with cyclic GC; refcounting still releases it as
+                # each tree resolves.
+                gc_was_enabled = gc.isenabled()
+                if gc_was_enabled:
+                    gc.disable()
+                try:
+                    # An outer autocast scope preserves PyTorch's casted-weight
+                    # cache across every frontier wave. Without it, each nested
+                    # per-forward scope returns nesting to zero and clears the
+                    # cache, recasting the same 8M current-policy parameters
+                    # dozens of times per collection. Only share the scope when
+                    # every neural historical policy requests the same
+                    # precision, so this never changes model numerics.
+                    shared_autocast = all(
+                        isinstance(policy, ModelPolicy)
+                        and policy.precision == self.config.precision
+                        for policy in self.historical_policies
+                    )
+                    with torch.inference_mode():
+                        if shared_autocast:
+                            with model_autocast(
+                                self.device,
+                                self.config.precision,
+                            ):
+                                # Preserve the original fp32 sampling/back-up
+                                # semantics between forwards. Individual model
+                                # calls re-enable bf16 inside this disabled
+                                # child scope, while the outermost scope keeps
+                                # the casted-weight cache alive.
+                                with torch.autocast(
+                                    device_type=self.device.type,
+                                    enabled=False,
+                                ):
+                                    return (
+                                        self._collect_recursive_branch_rollouts(
+                                            iteration=iteration
+                                        )
+                                    )
+                        return self._collect_recursive_branch_rollouts(
+                            iteration=iteration
+                        )
+                finally:
+                    if gc_was_enabled:
+                        gc.enable()
             if self.env_pool is not None:
                 return self._collect_round_rollouts_workers(iteration=iteration)
             return self._collect_round_rollouts(iteration=iteration)
@@ -1330,7 +1375,8 @@ class PPOTrainer:
         eligible = [
             spec
             for spec in self.config.specs
-            if spec.num_players * (spec.hand_size + 1) <= remaining
+            # Every player bids once and makes H-1 non-forced card choices.
+            if spec.num_players * spec.hand_size <= remaining
         ]
         if not eligible:
             return None
@@ -1470,14 +1516,17 @@ class PPOTrainer:
             action_by_path: dict[
                 int,
                 tuple[RolloutSample | None, BidAction | PlayCardAction],
-            ] = {
-                id(path): (sample if request.collect else None, action)
-                for path, request, (sample, action) in zip(
-                    current_rows,
-                    current_requests,
-                    current_results,
-                )
-            }
+            ] = {}
+            for path, request, (sample, action) in zip(
+                current_rows,
+                current_requests,
+                current_results,
+            ):
+                if request.collect and sample is None:
+                    raise RuntimeError(
+                        "Focal recursive decision is missing a rollout sample."
+                    )
+                action_by_path[id(path)] = (sample, action)
             for key, paths in frozen_groups.items():
                 policy = frozen_policies[key]
                 started = time.perf_counter()
@@ -1712,6 +1761,17 @@ class PPOTrainer:
         started = time.perf_counter()
         path.env.step(action)
         path.root.rollout_decisions += 1
+        # The final card in every player's hand is fully determined. Once the
+        # penultimate trick is complete, finish the forced final trick without
+        # constructing observations, running either policy, storing samples,
+        # or consuming the neural-decision budget.
+        while self._is_forced_final_card_play(path.env):
+            legal = path.env.legal_actions()
+            if len(legal) != 1:
+                raise RuntimeError(
+                    "A player's final card must be the sole legal action."
+                )
+            path.env.step(legal[0])
         stats = self._active_collection_stats
         if stats is not None:
             stats.env_step_sec += time.perf_counter() - started
@@ -1917,6 +1977,10 @@ class PPOTrainer:
                     if episode.episode_id in sampled:
                         sample, action = sampled[episode.episode_id]
                         if acting_player in episode.trainable_players:
+                            if sample is None:
+                                raise RuntimeError(
+                                    "Trainable decision is missing a rollout sample."
+                                )
                             episode.samples.append(sample)
                             if (
                                 self.config.branch_rollouts
@@ -2099,16 +2163,27 @@ class PPOTrainer:
     @staticmethod
     def _remaining_round_decisions(env: PlumpEnv) -> int:
         round_state = env.state.current_round
-        players = env.config.num_players
         if env.phase() == Phase.BIDDING:
             return (
-                players - len(round_state.bids)
-                + players * round_state.hand_size
+                env.config.num_players - len(round_state.bids)
+                + sum(
+                    max(len(hand) - 1, 0)
+                    for hand in round_state.current_hands.values()
+                )
             )
         if env.phase() == Phase.PLAYING:
-            played = sum(len(trick.plays) for trick in round_state.tricks)
-            return players * round_state.hand_size - played
+            return sum(
+                max(len(hand) - 1, 0)
+                for hand in round_state.current_hands.values()
+            )
         return 0
+
+    @staticmethod
+    def _is_forced_final_card_play(env: PlumpEnv) -> bool:
+        if env.phase() != Phase.PLAYING:
+            return False
+        hand = env.state.current_round.current_hands[env.current_player()]
+        return len(hand) == 1
 
     @staticmethod
     def _record_branch_decision(
@@ -2443,6 +2518,10 @@ class PPOTrainer:
                 for request, (sample, action) in zip(current_requests, rows):
                     trainable_players = episode_meta[request.episode_id][3]
                     if request.player in trainable_players:
+                        if sample is None:
+                            raise RuntimeError(
+                                "Trainable worker decision is missing a rollout sample."
+                            )
                         samples_by_episode[request.episode_id].append(sample)
                     actions[request.episode_id] = action
             frozen_requests: dict[str, list[DecisionRequest]] = defaultdict(list)
@@ -2522,6 +2601,10 @@ class PPOTrainer:
                     if episode.episode_id in sampled:
                         sample, action = sampled[episode.episode_id]
                         if acting_player in episode.trainable_players:
+                            if sample is None:
+                                raise RuntimeError(
+                                    "Trainable game decision is missing a rollout sample."
+                                )
                             episode.samples.append(sample)
                     else:
                         action = opponent_actions[episode.episode_id]
@@ -2589,6 +2672,88 @@ class PPOTrainer:
             dtype=torch.float32,
             device=self.device,
         )
+        phase_is_bid = torch.tensor(
+            [sample.phase == "bid" for sample in samples],
+            dtype=torch.bool,
+            device=self.device,
+        )
+        action_indices = torch.tensor(
+            [sample.action_index for sample in samples],
+            dtype=torch.long,
+            device=self.device,
+        )
+        # Recursive branches use singleton action groups. Pack their ragged
+        # candidate sets once so every PPO epoch can evaluate all branch rows
+        # with a handful of wide tensor operations instead of launching tiny
+        # MPS kernels once per sample and candidate.
+        branch_groups_are_singletons = all(
+            sample.branch_action_values is None
+            or all(
+                len(group) == 1
+                for group in (
+                    sample.branch_action_groups
+                    or [
+                        [index]
+                        for index in (
+                            sample.branch_candidate_action_indices or []
+                        )
+                    ]
+                )
+            )
+            for sample in samples
+        )
+        packed_branch_indices: Tensor | None = None
+        packed_branch_mask: Tensor | None = None
+        packed_branch_priors: Tensor | None = None
+        packed_branch_values: Tensor | None = None
+        if branch_groups_are_singletons and bool(branch_enabled.any()):
+            max_branch_actions = max(
+                (
+                    len(sample.branch_action_values or [])
+                    for sample in samples
+                ),
+                default=1,
+            )
+            max_branch_actions = max(max_branch_actions, 1)
+            index_rows: list[list[int]] = []
+            mask_rows: list[list[bool]] = []
+            prior_rows: list[list[float]] = []
+            value_rows: list[list[float]] = []
+            for sample in samples:
+                indices = sample.branch_candidate_action_indices or []
+                priors = sample.branch_prior_probabilities or []
+                values = sample.branch_action_values or []
+                count = len(values)
+                if not (len(indices) == len(priors) == count):
+                    raise RuntimeError(
+                        "Branch candidate indices, priors, and values "
+                        "must have matching lengths."
+                    )
+                padding = max_branch_actions - count
+                index_rows.append([*indices, *([0] * padding)])
+                mask_rows.append([*([True] * count), *([False] * padding)])
+                prior_rows.append([*priors, *([0.0] * padding)])
+                value_rows.append([*values, *([0.0] * padding)])
+            packed_branch_indices = torch.tensor(
+                index_rows,
+                dtype=torch.long,
+                device=self.device,
+            )
+            packed_branch_mask = torch.tensor(
+                mask_rows,
+                dtype=torch.bool,
+                device=self.device,
+            )
+            packed_branch_priors = torch.tensor(
+                prior_rows,
+                dtype=torch.float32,
+                device=self.device,
+            )
+            packed_branch_values = torch.tensor(
+                value_rows,
+                dtype=torch.float32,
+                device=self.device,
+            )
         enabled_advantages = raw_advantages[policy_enabled.bool()]
         if len(enabled_advantages) > 0:
             advantages = (
@@ -2755,6 +2920,14 @@ class PPOTrainer:
                             0,
                             selected_tensor,
                         )
+                        mb_phase_is_bid = phase_is_bid.index_select(
+                            0,
+                            selected_tensor,
+                        )
+                        mb_action_indices = action_indices.index_select(
+                            0,
+                            selected_tensor,
+                        )
                         batch = index_model_batch(staged_batch, selected_tensor)
                         mb_owner_targets = owner_targets.index_select(0, selected_tensor)
                         with model_autocast(self.device, self.config.precision):
@@ -2769,7 +2942,14 @@ class PPOTrainer:
                                     else None
                                 ),
                             )
-                        new_logprobs, entropy_by_sample = self._logprobs_and_entropy(output, mb_samples)
+                        new_logprobs, entropy_by_sample = (
+                            self._logprobs_and_entropy(
+                                output,
+                                mb_samples,
+                                phase_is_bid=mb_phase_is_bid,
+                                action_indices=mb_action_indices,
+                            )
+                        )
                         if magnet_output is not None:
                             selected_magnet_output = PolicyModelOutput(
                                 masked_bid_logits=(
@@ -2829,11 +3009,45 @@ class PPOTrainer:
                         policy_scale = objective_scale * mb_policy_enabled
                         policy_loss = (policy_scale * policy_terms).sum() / logical_count
                         entropy = (policy_scale * entropy_by_sample).sum() / logical_count
-                        (
-                            branch_terms,
-                            branch_kl_by_sample,
-                            branch_target_entropy_by_sample,
-                        ) = self._branch_policy_terms(output, mb_samples)
+                        if packed_branch_indices is not None:
+                            (
+                                branch_terms,
+                                branch_kl_by_sample,
+                                branch_target_entropy_by_sample,
+                            ) = self._packed_branch_policy_terms(
+                                output,
+                                phase_is_bid=mb_phase_is_bid,
+                                candidate_indices=(
+                                    packed_branch_indices.index_select(
+                                        0,
+                                        selected_tensor,
+                                    )
+                                ),
+                                candidate_mask=(
+                                    packed_branch_mask.index_select(
+                                        0,
+                                        selected_tensor,
+                                    )
+                                ),
+                                old_probabilities=(
+                                    packed_branch_priors.index_select(
+                                        0,
+                                        selected_tensor,
+                                    )
+                                ),
+                                action_values=(
+                                    packed_branch_values.index_select(
+                                        0,
+                                        selected_tensor,
+                                    )
+                                ),
+                            )
+                        else:
+                            (
+                                branch_terms,
+                                branch_kl_by_sample,
+                                branch_target_entropy_by_sample,
+                            ) = self._branch_policy_terms(output, mb_samples)
                         branch_scale = objective_scale * mb_branch_enabled
                         branch_policy_loss = (
                             branch_scale * branch_terms
@@ -4403,7 +4617,10 @@ class PPOTrainer:
     def _sample_batched_actions(
         self,
         episodes: list[_ActiveEpisode],
-    ) -> dict[int, tuple[RolloutSample, BidAction | PlayCardAction]]:
+    ) -> dict[
+        int,
+        tuple[RolloutSample | None, BidAction | PlayCardAction],
+    ]:
         include_game_context = (
             self.config.training_mode == "game"
             or self.config.include_game_context
@@ -4499,7 +4716,9 @@ class PPOTrainer:
     def _forward_decision_rows(
         self,
         requests: list[DecisionRequest],
-    ) -> list[tuple[RolloutSample, BidAction | PlayCardAction]]:
+    ) -> list[
+        tuple[RolloutSample | None, BidAction | PlayCardAction]
+    ]:
         started = time.perf_counter()
         encoded = [request.encoded for request in requests]
         owner_targets = [request.owner_targets for request in requests]
@@ -4655,35 +4874,79 @@ class PPOTrainer:
             if output.oracle_value is not None
             else output.value.squeeze(-1).float()
         )
-        rollout_rows = torch.stack(
-            (
-                action_indices.float(),
-                output.value.squeeze(-1).float(),
-                sample_logprobs,
-                policy_logprobs,
-                distribution.entropy(),
-                baseline_residuals,
-                implied_values_tensor,
-            ),
-            dim=-1,
-        ).cpu().tolist()
-        policy_probability_rows = (
-            distribution.probs.float().cpu().tolist()
-            if self.config.branch_rollouts
-            else [None] * len(requests)
+        collect_indices = [
+            index
+            for index, request in enumerate(requests)
+            if request.collect
+        ]
+        action_index_values = action_indices.cpu().tolist()
+        rollout_rows: list[list[float] | None] = [None] * len(requests)
+        policy_probability_rows: list[list[float] | None] = (
+            [None] * len(requests)
         )
-        results: list[tuple[RolloutSample, BidAction | PlayCardAction]] = []
+        if collect_indices:
+            collect_tensor = torch.tensor(
+                collect_indices,
+                dtype=torch.long,
+                device=self.device,
+            )
+            collected_rows = torch.stack(
+                (
+                    output.value.squeeze(-1).float().index_select(
+                        0,
+                        collect_tensor,
+                    ),
+                    sample_logprobs.index_select(0, collect_tensor),
+                    policy_logprobs.index_select(0, collect_tensor),
+                    distribution.entropy().index_select(0, collect_tensor),
+                    baseline_residuals.index_select(0, collect_tensor),
+                    implied_values_tensor.index_select(0, collect_tensor),
+                ),
+                dim=-1,
+            ).cpu().tolist()
+            if self.config.branch_rollouts:
+                collected_probabilities = (
+                    distribution.probs.float()
+                    .index_select(0, collect_tensor)
+                    .cpu()
+                    .tolist()
+                )
+            else:
+                collected_probabilities = [None] * len(collect_indices)
+            for request_index, row, probabilities in zip(
+                collect_indices,
+                collected_rows,
+                collected_probabilities,
+            ):
+                rollout_rows[request_index] = row
+                policy_probability_rows[request_index] = probabilities
+        results: list[
+            tuple[RolloutSample | None, BidAction | PlayCardAction]
+        ] = []
         for index, request in enumerate(requests):
+            action_index = int(action_index_values[index])
+            action: BidAction | PlayCardAction
+            if request.phase == "bid":
+                action = BidAction(request.player, action_index)
+            else:
+                action = PlayCardAction(
+                    request.player,
+                    card_from_id(action_index),
+                )
+            if not request.collect:
+                results.append((None, action))
+                continue
+            rollout_row = rollout_rows[index]
+            if rollout_row is None:
+                raise RuntimeError("Missing collected rollout outputs.")
             (
-                action_index_value,
                 residual,
                 old_logprob,
                 old_policy_logprob,
                 old_entropy,
                 baseline_residual,
                 implied_value,
-            ) = rollout_rows[index]
-            action_index = int(action_index_value)
+            ) = rollout_row
             position = request.encoded.bidding_position
             current_spec = RoundSpec(request.num_players, request.hand_size)
             key = (current_spec.num_players, current_spec.hand_size, position)
@@ -4694,11 +4957,6 @@ class PPOTrainer:
             )
             if implied_values_enabled:
                 intercept += implied_value
-            action: BidAction | PlayCardAction
-            if request.phase == "bid":
-                action = BidAction(request.player, action_index)
-            else:
-                action = PlayCardAction(request.player, card_from_id(action_index))
             sample = RolloutSample(
                 encoded=request.encoded,
                 phase=request.phase,
@@ -4964,26 +5222,92 @@ class PPOTrainer:
         self,
         output,
         samples: list[RolloutSample],
+        *,
+        phase_is_bid: Tensor | None = None,
+        action_indices: Tensor | None = None,
     ) -> tuple[Tensor, Tensor]:
-        logprobs = torch.empty(len(samples), dtype=torch.float32, device=self.device)
-        entropies = torch.empty(len(samples), dtype=torch.float32, device=self.device)
-        bid_indices = [index for index, sample in enumerate(samples) if sample.phase == "bid"]
-        play_indices = [index for index, sample in enumerate(samples) if sample.phase == "play"]
-        for indices, logits in (
-            (bid_indices, output.masked_bid_logits),
-            (play_indices, output.masked_card_logits),
-        ):
-            if not indices:
-                continue
-            actions = torch.tensor(
-                [samples[index].action_index for index in indices],
+        if phase_is_bid is None:
+            phase_is_bid = torch.tensor(
+                [sample.phase == "bid" for sample in samples],
+                dtype=torch.bool,
+                device=self.device,
+            )
+        if action_indices is None:
+            action_indices = torch.tensor(
+                [sample.action_index for sample in samples],
                 dtype=torch.long,
                 device=self.device,
             )
-            distribution = Categorical(logits=logits[indices].float())
-            logprobs[indices] = distribution.log_prob(actions)
-            entropies[indices] = distribution.entropy()
-        return logprobs, entropies
+        distribution = Categorical(
+            logits=combined_action_logits(output, phase_is_bid),
+        )
+        return (
+            distribution.log_prob(action_indices),
+            distribution.entropy(),
+        )
+
+    def _packed_branch_policy_terms(
+        self,
+        output,
+        *,
+        phase_is_bid: Tensor,
+        candidate_indices: Tensor,
+        candidate_mask: Tensor,
+        old_probabilities: Tensor,
+        action_values: Tensor,
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        """Vectorized singleton-group branch PPO over a padded candidate set."""
+
+        logits = combined_action_logits(output, phase_is_bid)
+        gathered = logits.gather(1, candidate_indices).float()
+        active = candidate_mask.any(dim=-1)
+        candidate_logits = gathered.masked_fill(
+            ~candidate_mask,
+            float("-inf"),
+        )
+        # Rows without a branch target still share the microbatch. Give those
+        # rows a benign finite distribution; their all-zero old mass and
+        # advantages make every returned term exactly zero.
+        candidate_logits = torch.where(
+            active.unsqueeze(-1),
+            candidate_logits,
+            torch.zeros_like(candidate_logits),
+        )
+        candidate_logprobs = torch.log_softmax(
+            candidate_logits,
+            dim=-1,
+        )
+        safe_candidate_logprobs = torch.where(
+            candidate_mask,
+            candidate_logprobs,
+            torch.zeros_like(candidate_logprobs),
+        )
+        old = old_probabilities * candidate_mask
+        old = old / old.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+        masked_values = action_values * candidate_mask
+        baseline = (old * masked_values).sum(dim=-1, keepdim=True)
+        advantages = (masked_values - baseline) * candidate_mask
+        new = safe_candidate_logprobs.exp() * candidate_mask
+        log_old = torch.log(old.clamp_min(1e-12))
+        log_ratio = safe_candidate_logprobs - log_old
+        clipped_ratio = torch.exp(
+            log_ratio.clamp(-20.0, 20.0)
+        ).clamp(
+            1.0 - self.config.ppo_clip_eps,
+            1.0 + self.config.ppo_clip_eps,
+        )
+        losses = -torch.minimum(
+            new * advantages,
+            old * clipped_ratio * advantages,
+        ).sum(dim=-1)
+        divergences = (
+            old * (log_old - safe_candidate_logprobs)
+        ).sum(dim=-1)
+        return (
+            losses,
+            divergences,
+            torch.zeros_like(losses),
+        )
 
     def _branch_policy_terms(
         self,

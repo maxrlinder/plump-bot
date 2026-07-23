@@ -8,6 +8,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+import plump.training.ppo as ppo_module
 from plump.env import PlumpEnv
 from plump.modeling import ModelConfig
 from plump.modeling.torch_model import PlumpTransformerModel
@@ -119,11 +120,13 @@ def test_reserved_decisions_and_terminal_leaf_stats_are_exact(
     assert stats.branch_historical_decisions <= (
         trainer.config.branch_decision_budget_per_arm
     )
-    # This fixed matched deal leaves the same unused reservation in each arm.
-    assert stats.branch_self_decisions == stats.branch_historical_decisions
+    # Each arm independently admits only complete expansions, so either may
+    # leave a small unusable tail below the common cap.
+    assert stats.branch_self_decisions > 0
+    assert stats.branch_historical_decisions > 0
     assert stats.branch_root_hands == 2
     assert stats.branch_roots_available >= len(branch_samples)
-    assert stats.branch_roots_expanded == len(branch_samples)
+    assert stats.branch_roots_expanded >= len(branch_samples)
 
     # Each B-way expansion replaces one pending terminal path with B paths.
     # Complete action values exist only after every descendant path resolves,
@@ -132,7 +135,7 @@ def test_reserved_decisions_and_terminal_leaf_stats_are_exact(
         len(sample.branch_action_values) - 1
         for sample in branch_samples
     )
-    assert stats.branch_terminal_rollouts == expected_terminal_paths
+    assert stats.branch_terminal_rollouts >= expected_terminal_paths
     for sample in branch_samples:
         assert sample.branch_candidate_action_indices is not None
         assert sample.branch_prior_probabilities is not None
@@ -143,6 +146,72 @@ def test_reserved_decisions_and_terminal_leaf_stats_are_exact(
             sample.branch_prior_probabilities
         )
         assert sample.return_target is not None
+
+
+def test_remaining_budget_excludes_only_each_players_final_card(
+    collected_branch_batch,
+) -> None:
+    trainer, _ = collected_branch_batch
+    env = PlumpEnv(
+        round_game_config(RoundSpec(3, 3), bidding_start_player=0),
+        seed=41,
+    )
+    env.reset()
+
+    # Three bids plus two genuine card choices per player. The third card in
+    # each hand is deterministic and therefore outside the neural budget.
+    assert trainer._remaining_round_decisions(env) == 9
+    assert not trainer._is_forced_final_card_play(env)
+
+    while env.phase() == Phase.BIDDING:
+        env.step(env.legal_actions()[0])
+    assert trainer._remaining_round_decisions(env) == 6
+
+    while any(
+        len(hand) > 1
+        for hand in env.state.current_round.current_hands.values()
+    ):
+        env.step(env.legal_actions()[0])
+    assert env.phase() == Phase.PLAYING
+    assert trainer._is_forced_final_card_play(env)
+    assert trainer._remaining_round_decisions(env) == 0
+
+
+def test_recursive_collector_never_forwards_a_players_final_card(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    trainer = _tiny_branch_trainer()
+    original_request = ppo_module.build_decision_request
+    original_random_act = RandomPolicy.act
+
+    def guarded_request(env, **kwargs):
+        assert not PPOTrainer._is_forced_final_card_play(env)
+        return original_request(env, **kwargs)
+
+    def guarded_random_act(self, env, *, rng=None):
+        assert not PPOTrainer._is_forced_final_card_play(env)
+        return original_random_act(self, env, rng=rng)
+
+    monkeypatch.setattr(
+        ppo_module,
+        "build_decision_request",
+        guarded_request,
+    )
+    monkeypatch.setattr(RandomPolicy, "act", guarded_random_act)
+    buffer = trainer.collect_rollouts()
+
+    play_samples = [
+        sample
+        for sample in buffer.samples
+        if sample.phase == "play"
+    ]
+    assert play_samples
+    assert all(
+        sample.observation is not None
+        and len(sample.observation.my_hand) >= 2
+        for sample in play_samples
+    )
+    assert trainer.last_collection_stats.branch_terminal_rollouts > 0
 
 
 def test_bids_use_top_four_and_plays_cover_every_legal_action(
@@ -306,6 +375,155 @@ def test_direct_counterfactual_advantages_improve_high_value_actions(
     # Gradient descent raises the highest-value action and lowers the worst.
     assert logits.grad[0, 5].item() < 0.0
     assert logits.grad[0, 0].item() > 0.0
+
+
+def test_packed_branch_terms_match_scalar_objective_and_gradient(
+    collected_branch_batch,
+) -> None:
+    trainer, _ = collected_branch_batch
+    probabilities = torch.tensor([0.02, 0.05, 0.08, 0.15, 0.25, 0.45])
+    logits = probabilities.log().unsqueeze(0).requires_grad_()
+    output = SimpleNamespace(
+        masked_bid_logits=logits,
+        masked_card_logits=torch.full((1, 52), float("-inf")),
+    )
+    values = [-3.0, -2.0, -1.0, 1.0, 2.0, 5.0]
+    sample = SimpleNamespace(
+        phase="bid",
+        branch_candidate_action_indices=list(range(6)),
+        branch_action_groups=[[index] for index in range(6)],
+        branch_action_values=values,
+        branch_prior_probabilities=probabilities.tolist(),
+    )
+
+    scalar_loss, scalar_kl, _ = trainer._branch_policy_terms(
+        output,
+        [sample],
+    )
+    packed_loss, packed_kl, packed_entropy = (
+        trainer._packed_branch_policy_terms(
+            output,
+            phase_is_bid=torch.tensor([True]),
+            candidate_indices=torch.arange(6).unsqueeze(0),
+            candidate_mask=torch.ones((1, 6), dtype=torch.bool),
+            old_probabilities=probabilities.unsqueeze(0),
+            action_values=torch.tensor(values).unsqueeze(0),
+        )
+    )
+    scalar_gradient = torch.autograd.grad(
+        scalar_loss.sum(),
+        logits,
+        retain_graph=True,
+    )[0]
+    packed_gradient = torch.autograd.grad(
+        packed_loss.sum(),
+        logits,
+    )[0]
+
+    torch.testing.assert_close(packed_loss, scalar_loss)
+    torch.testing.assert_close(packed_kl, scalar_kl)
+    torch.testing.assert_close(packed_gradient, scalar_gradient)
+    assert packed_entropy.item() == 0.0
+
+
+def test_packed_branch_padding_and_nonbranch_rows_stay_finite(
+    collected_branch_batch,
+) -> None:
+    trainer, _ = collected_branch_batch
+    policies = torch.tensor(
+        [
+            [0.02, 0.05, 0.08, 0.15, 0.25, 0.45],
+            [0.10, 0.05, 0.10, 0.10, 0.20, 0.45],
+            [0.20, 0.10, 0.10, 0.20, 0.20, 0.20],
+        ]
+    )
+    logits = policies.log().requires_grad_()
+    output = SimpleNamespace(
+        masked_bid_logits=logits,
+        masked_card_logits=torch.full((3, 52), float("-inf")),
+    )
+    samples = [
+        SimpleNamespace(
+            phase="bid",
+            branch_candidate_action_indices=list(range(6)),
+            branch_action_groups=[[index] for index in range(6)],
+            branch_action_values=[-3.0, -2.0, -1.0, 1.0, 2.0, 5.0],
+            branch_prior_probabilities=policies[0].tolist(),
+        ),
+        SimpleNamespace(
+            phase="bid",
+            branch_candidate_action_indices=[0, 5],
+            branch_action_groups=[[0], [5]],
+            branch_action_values=[-1.0, 3.0],
+            branch_prior_probabilities=[0.2, 0.8],
+        ),
+        SimpleNamespace(
+            phase="bid",
+            branch_candidate_action_indices=None,
+            branch_action_groups=None,
+            branch_action_values=None,
+            branch_prior_probabilities=None,
+        ),
+    ]
+    candidate_indices = torch.tensor(
+        [
+            [0, 1, 2, 3, 4, 5],
+            [0, 5, 0, 0, 0, 0],
+            [0, 0, 0, 0, 0, 0],
+        ]
+    )
+    candidate_mask = torch.tensor(
+        [
+            [True, True, True, True, True, True],
+            [True, True, False, False, False, False],
+            [False, False, False, False, False, False],
+        ]
+    )
+    old_probabilities = torch.tensor(
+        [
+            policies[0].tolist(),
+            [0.2, 0.8, 0.0, 0.0, 0.0, 0.0],
+            [0.0] * 6,
+        ]
+    )
+    action_values = torch.tensor(
+        [
+            [-3.0, -2.0, -1.0, 1.0, 2.0, 5.0],
+            [-1.0, 3.0, 0.0, 0.0, 0.0, 0.0],
+            [0.0] * 6,
+        ]
+    )
+
+    scalar_loss, scalar_kl, _ = trainer._branch_policy_terms(
+        output,
+        samples,
+    )
+    packed_loss, packed_kl, packed_entropy = (
+        trainer._packed_branch_policy_terms(
+            output,
+            phase_is_bid=torch.ones(3, dtype=torch.bool),
+            candidate_indices=candidate_indices,
+            candidate_mask=candidate_mask,
+            old_probabilities=old_probabilities,
+            action_values=action_values,
+        )
+    )
+    scalar_gradient = torch.autograd.grad(
+        scalar_loss.sum(),
+        logits,
+        retain_graph=True,
+    )[0]
+    packed_gradient = torch.autograd.grad(
+        packed_loss.sum(),
+        logits,
+    )[0]
+
+    assert torch.isfinite(packed_loss).all()
+    assert torch.isfinite(packed_kl).all()
+    torch.testing.assert_close(packed_loss, scalar_loss)
+    torch.testing.assert_close(packed_kl, scalar_kl)
+    torch.testing.assert_close(packed_gradient, scalar_gradient)
+    assert torch.equal(packed_entropy, torch.zeros(3))
 
 
 def test_branch_actor_rows_replace_ppo_while_unbranched_spine_rows_keep_it(

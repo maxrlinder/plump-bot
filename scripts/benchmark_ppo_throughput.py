@@ -47,7 +47,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ppo-epochs", type=int, default=4)
     parser.add_argument("--minibatch-size", type=int, default=1440)
     parser.add_argument("--microbatch-size", type=int, default=480)
-    parser.add_argument("--branch-decision-budget-per-arm", type=int, default=20_000)
+    parser.add_argument("--branch-decision-budget-per-arm", type=int, default=30_000)
     parser.add_argument("--branch-update-decisions-per-arm", type=int, default=2_400)
     parser.add_argument("--branch-max-active", type=int, default=768)
     parser.add_argument("--self-play-fraction", type=float)
