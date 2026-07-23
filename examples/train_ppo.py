@@ -95,13 +95,45 @@ def parse_args() -> argparse.Namespace:
         "--branch-bid-max-actions",
         type=int,
         default=4,
-        help="Maximum top-probability legal bid branches; 0 means exhaustive.",
+        help=(
+            "Maximum bid branches, including the sampled bid plus the "
+            "highest-probability alternatives; 0 means exhaustive."
+        ),
     )
     parser.add_argument("--branch-support-floor", type=float, default=0.0)
     parser.add_argument("--branch-target-temperature", type=float, default=1.0)
     parser.add_argument("--branch-advantage-clip", type=float, default=4.0)
     parser.add_argument("--branch-policy-coef", type=float, default=1.0)
+    parser.add_argument(
+        "--branch-policy-objective",
+        choices=("ppo", "neurd"),
+        default="ppo",
+        help=(
+            "Direct branch actor objective. 'neurd' applies signed "
+            "counterfactual advantages to centered logits."
+        ),
+    )
+    parser.add_argument("--branch-neurd-regret-coef", type=float, default=1.0)
+    parser.add_argument("--branch-neurd-kl-coef", type=float, default=1.0)
     parser.add_argument("--branch-kl-cap", type=float, default=0.005)
+    parser.add_argument(
+        "--branch-tree-decision-budget-per-arm",
+        type=int,
+        default=0,
+        help=(
+            "Maximum terminal rollout decisions spent per arm and matched "
+            "deal; 0 leaves only the global per-arm cap."
+        ),
+    )
+    parser.add_argument(
+        "--branch-tree-update-decisions-per-arm",
+        type=int,
+        default=0,
+        help=(
+            "Maximum directly trained branch states per arm and matched "
+            "deal; 0 leaves only the global update-row cap."
+        ),
+    )
     parser.add_argument("--trick-coef", type=float, default=0.1)
     parser.add_argument(
         "--belief-head-only",
@@ -465,7 +497,16 @@ def main() -> None:
         branch_target_temperature=args.branch_target_temperature,
         branch_advantage_clip=args.branch_advantage_clip,
         branch_policy_coef=args.branch_policy_coef,
+        branch_policy_objective=args.branch_policy_objective,
+        branch_neurd_regret_coef=args.branch_neurd_regret_coef,
+        branch_neurd_kl_coef=args.branch_neurd_kl_coef,
         branch_kl_cap=args.branch_kl_cap,
+        branch_tree_decision_budget_per_arm=(
+            args.branch_tree_decision_budget_per_arm
+        ),
+        branch_tree_update_decisions_per_arm=(
+            args.branch_tree_update_decisions_per_arm
+        ),
         trick_coef=args.trick_coef,
         belief_head_only=args.belief_head_only,
         owner_coef=args.owner_coef,

@@ -50,6 +50,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--branch-decision-budget-per-arm", type=int, default=30_000)
     parser.add_argument("--branch-update-decisions-per-arm", type=int, default=2_400)
     parser.add_argument("--branch-max-active", type=int, default=768)
+    parser.add_argument(
+        "--branch-policy-objective",
+        choices=("ppo", "neurd"),
+        default="neurd",
+    )
+    parser.add_argument("--branch-neurd-regret-coef", type=float, default=0.25)
+    parser.add_argument("--branch-neurd-kl-coef", type=float, default=1.0)
+    parser.add_argument(
+        "--branch-tree-decision-budget-per-arm",
+        type=int,
+        default=10_000,
+    )
+    parser.add_argument(
+        "--branch-tree-update-decisions-per-arm",
+        type=int,
+        default=800,
+    )
     parser.add_argument("--self-play-fraction", type=float)
     parser.add_argument("--heuristic-fraction", type=float)
     parser.add_argument("--mixed-fraction", type=float)
@@ -199,7 +216,16 @@ def checkpoint_config(
                 "branch_target_temperature": 1.0,
                 "branch_advantage_clip": 4.0,
                 "branch_policy_coef": 1.0,
+                "branch_policy_objective": args.branch_policy_objective,
+                "branch_neurd_regret_coef": args.branch_neurd_regret_coef,
+                "branch_neurd_kl_coef": args.branch_neurd_kl_coef,
                 "branch_kl_cap": 0.005,
+                "branch_tree_decision_budget_per_arm": (
+                    args.branch_tree_decision_budget_per_arm
+                ),
+                "branch_tree_update_decisions_per_arm": (
+                    args.branch_tree_update_decisions_per_arm
+                ),
             }
         )
     del payload
@@ -287,6 +313,21 @@ def main() -> None:
                     update.approx_kl
                     if update is not None
                     else 0.0
+                ),
+                "branch_kl": (
+                    update.branch_kl
+                    if update is not None
+                    else 0.0
+                ),
+                "branch_policy_loss": (
+                    update.branch_policy_loss
+                    if update is not None
+                    else 0.0
+                ),
+                "branch_samples": (
+                    update.branch_samples
+                    if update is not None
+                    else 0
                 ),
                 "total_loss": (
                     update.total_loss

@@ -35,7 +35,12 @@ args=(
   --branch-max-active 1536
   --branch-bid-max-actions 4
   --branch-policy-coef 1.0
+  --branch-policy-objective neurd
+  --branch-neurd-regret-coef 0.25
+  --branch-neurd-kl-coef 1.0
   --branch-kl-cap 0.005
+  --branch-tree-decision-budget-per-arm 10000
+  --branch-tree-update-decisions-per-arm 800
   --trick-baseline
   --belief-head-only
   --oracle-critic
