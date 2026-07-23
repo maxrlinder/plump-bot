@@ -266,6 +266,11 @@ def parse_args() -> argparse.Namespace:
         default=16,
         help="Rewrite tournament.csv and the plot after this many completed items.",
     )
+    parser.add_argument(
+        "--no-sync",
+        action="store_true",
+        help="Skip the Modal volume listing/download; use local checkpoints only.",
+    )
     return parser.parse_args()
 
 
@@ -282,7 +287,7 @@ def main() -> None:
 
     local_paths = checkpoint_iterations(archive_dir)
     pulled_paths = checkpoint_iterations(ckpt_dir)
-    volume_iters = set(volume_iterations(args.run_name))
+    volume_iters = set() if args.no_sync else set(volume_iterations(args.run_name))
 
     available = sorted(
         iteration

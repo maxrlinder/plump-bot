@@ -46,7 +46,7 @@ class DecisionRequest:
     encoded: object  # EncodedObservation
     owner_targets: list[int]
     suit_presence_targets: list[list[int]]
-    observation: object  # trimmed Observation snapshot
+    observation: object | None  # trimmed snapshot; absent for discarded rows
     round_index: int
     num_players: int
     hand_size: int

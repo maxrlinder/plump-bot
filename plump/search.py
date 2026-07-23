@@ -41,6 +41,7 @@ class SearchConfig:
     maximum_target_js: float = 0.05
     exact_tricks_remaining: int = 3
     exact_node_budget: int = 4_096
+    use_owner_beliefs: bool = True
     interactive_wall_clock_seconds: float | None = None
     seed: int = 1
 
@@ -237,12 +238,19 @@ class RootSearchPolicy:
     ) -> SearchDecision:
         root_prediction = None
         if isinstance(self.base_policy, ModelPolicy):
-            encoded, output = self.base_policy.predict_observation(observation)
+            encoded, output = self.base_policy.predict_observation(
+                observation,
+                need_owner=self.config.use_owner_beliefs,
+            )
             root_prediction = self._root_prediction(
                 observation,
                 legal_actions,
                 encoded.observer_player,
-                output.owner_probs[0].detach().cpu().tolist(),
+                (
+                    output.owner_probs[0].detach().cpu().tolist()
+                    if output.owner_probs is not None
+                    else None
+                ),
                 (
                     output.masked_bid_logits[0].float()
                     if observation.phase == Phase.BIDDING
@@ -281,7 +289,10 @@ class RootSearchPolicy:
                 for observation, legal_actions, rng in requests
             ]
         observations = [request[0] for request in requests]
-        encoded, output = self.base_policy.predict_observations(observations)
+        encoded, output = self.base_policy.predict_observations(
+            observations,
+            need_owner=self.config.use_owner_beliefs,
+        )
         predictions = []
         for index, (observation, legal_actions, _) in enumerate(requests):
             logits = (
@@ -294,7 +305,11 @@ class RootSearchPolicy:
                     observation,
                     legal_actions,
                     encoded[index].observer_player,
-                    output.owner_probs[index].detach().cpu().tolist(),
+                    (
+                        output.owner_probs[index].detach().cpu().tolist()
+                        if output.owner_probs is not None
+                        else None
+                    ),
                     logits.softmax(dim=-1).detach().cpu().tolist(),
                 )
             )
@@ -319,7 +334,7 @@ class RootSearchPolicy:
         legal_actions: list[BidAction | PlayCardAction],
         rng: random.Random,
         root_prediction: tuple[
-            list[list[float]],
+            list[list[float]] | None,
             dict[BidAction | PlayCardAction, float],
             ModelConfig,
         ]
@@ -331,8 +346,7 @@ class RootSearchPolicy:
         owner_probs = None
         prior = {action: 1.0 / len(legal_actions) for action in legal_actions}
         model_config = ModelConfig()
-        before_base = self.base_policy.forward_passes
-        before_opponent = self.opponent_policy.forward_passes
+        before_forwards = self._policy_forward_passes()
 
         if root_prediction is not None:
             owner_probs, prior, model_config = root_prediction
@@ -373,6 +387,7 @@ class RootSearchPolicy:
                 rollout_seeds.append(rng.randrange(2**31))
 
             completed = min(len(values[next(iter(values))]), target)
+            continuations: list[tuple[BidAction | PlayCardAction, PlumpEnv, int]] = []
             for index in range(completed, target):
                 determinization = determinizations[index]
                 seed = rollout_seeds[index]
@@ -383,19 +398,30 @@ class RootSearchPolicy:
                         scoring=self.scoring,
                     )
                     rollout_env.step(action)
-                    reward = self._evaluate_continuation(
-                        rollout_env,
-                        root_player=root_player,
-                        seed=seed,
-                    )
+                    continuations.append((action, rollout_env, seed))
+            if (
+                continuations
+                and self.base_policy is self.opponent_policy
+                and isinstance(self.base_policy, ModelPolicy)
+            ):
+                rewards = self._evaluate_self_play_continuations(
+                    [row[1] for row in continuations],
+                    root_player=root_player,
+                    seeds=[row[2] for row in continuations],
+                )
+                for (action, _, _), reward in zip(continuations, rewards):
                     values[action].append(reward)
+            else:
+                for action, rollout_env, seed in continuations:
+                    values[action].append(
+                        self._evaluate_continuation(
+                            rollout_env,
+                            root_player=root_player,
+                            seed=seed,
+                        )
+                    )
 
-            used = (
-                self.base_policy.forward_passes
-                - before_base
-                + self.opponent_policy.forward_passes
-                - before_opponent
-            )
+            used = self._policy_forward_passes() - before_forwards
             if target >= adaptive_max or used >= self.config.forward_pass_budget:
                 break
             if (
@@ -435,10 +461,7 @@ class RootSearchPolicy:
             key=lambda action: (means[action], -legal_actions.index(action)),
         )
         used = root_forward_passes + (
-            self.base_policy.forward_passes
-            - before_base
-            + self.opponent_policy.forward_passes
-            - before_opponent
+            self._policy_forward_passes() - before_forwards
         )
         return SearchDecision(
             action=best_action,
@@ -474,10 +497,10 @@ class RootSearchPolicy:
         observation: Observation,
         legal_actions: list[BidAction | PlayCardAction],
         observer_player: int,
-        owner_probs: list[list[float]],
+        owner_probs: list[list[float]] | None,
         probabilities: list[float],
     ) -> tuple[
-        list[list[float]],
+        list[list[float]] | None,
         dict[BidAction | PlayCardAction, float],
         ModelConfig,
     ]:
@@ -492,6 +515,49 @@ class RootSearchPolicy:
             for action in legal_actions
         }
         return owner_probs, prior, self.base_policy.model_config
+
+    def _policy_forward_passes(self) -> int:
+        """Count each distinct policy wrapper once when roles share it."""
+
+        policies = {id(self.base_policy): self.base_policy}
+        policies[id(self.opponent_policy)] = self.opponent_policy
+        return sum(policy.forward_passes for policy in policies.values())
+
+    def _evaluate_self_play_continuations(
+        self,
+        envs: list[PlumpEnv],
+        *,
+        root_player: int,
+        seeds: list[int],
+    ) -> list[float]:
+        """Roll out same-policy continuations in batched decision waves.
+
+        All candidate root actions use matched determinization and RNG seeds.
+        Batching the active environments preserves that common-random-number
+        comparison while avoiding thousands of batch-size-one MPS forwards.
+        """
+
+        if not isinstance(self.base_policy, ModelPolicy):
+            raise TypeError("Batched self-play search requires ModelPolicy.")
+        if len(envs) != len(seeds):
+            raise ValueError("envs and seeds must have equal length.")
+        rngs = [random.Random(seed) for seed in seeds]
+        pending = list(range(len(envs)))
+        while pending:
+            active = [index for index in pending if not envs[index].is_done()]
+            if not active:
+                break
+            actions = self.base_policy.act_many(
+                [envs[index] for index in active],
+                rngs=[rngs[index] for index in active],
+            )
+            for index, action in zip(active, actions):
+                envs[index].step(action)
+            pending = active
+        return [
+            _relative_rewards(env.state.current_round.round_scores)[root_player]
+            for env in envs
+        ]
 
     def _evaluate_continuation(
         self,

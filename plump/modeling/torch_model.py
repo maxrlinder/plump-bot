@@ -514,6 +514,7 @@ class PlumpTransformerModel(nn.Module):
         *,
         need_owner: bool = True,
         detach_owner_trunk: bool = False,
+        detach_belief_trunk: bool = False,
         privileged_owner_targets: Tensor | None = None,
     ) -> PlumpModelOutput:
         state = self._encode_state(batch)
@@ -533,7 +534,11 @@ class PlumpTransformerModel(nn.Module):
             privileged_owner_targets,
         )
 
-        player_state = self._player_states(state, batch.player_features)
+        # Suit-presence and final-trick-count supervision can be made
+        # head-only. The belief-specific query/MLP/head stack still learns,
+        # while these auxiliary targets cannot reshape the policy/value trunk.
+        belief_state = state.detach() if detach_belief_trunk else state
+        player_state = self._player_states(belief_state, batch.player_features)
         trick_count_logits = self.trick_count_head(player_state)
         masked_trick_count_logits = _masked_logits(
             trick_count_logits,
@@ -857,12 +862,14 @@ class PlumpSearchModel(PlumpTransformerModel):
         *,
         need_owner: bool = True,
         detach_owner_trunk: bool = False,
+        detach_belief_trunk: bool = False,
         privileged_owner_targets: Tensor | None = None,
     ) -> PlumpModelOutput:
         output = super().forward(
             batch,
             need_owner=need_owner,
             detach_owner_trunk=detach_owner_trunk,
+            detach_belief_trunk=detach_belief_trunk,
             privileged_owner_targets=privileged_owner_targets,
         )
         bid_q_values = self.bid_q_head(output.state).float()

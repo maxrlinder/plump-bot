@@ -21,6 +21,12 @@ OpponentArm = Literal[
     "historical",
     "explore_self",
     "explore_historical",
+    "tempered_self",
+    "tempered_historical",
+    "capped_self",
+    "capped_historical",
+    "epsilon_self",
+    "epsilon_historical",
 ]
 PositionKey = tuple[int, int, int]
 
@@ -115,6 +121,12 @@ def allocate_opponent_arms(
         "historical",
         "explore_self",
         "explore_historical",
+        "tempered_self",
+        "tempered_historical",
+        "capped_self",
+        "capped_historical",
+        "epsilon_self",
+        "epsilon_historical",
     )
     raw = {arm: rounds * fractions.get(arm, 0.0) for arm in order}
     counts = {arm: int(math.floor(raw[arm])) for arm in order}

@@ -2,10 +2,10 @@
 
 Eight panels, two rows. Row 1 is the game: strength vs the frozen pool, bid
 quality, and the belief heads, all measured on clean (non-explore) rounds.
-Row 2 is the machine: sharpness, value fit, PPO trust-region health,
-throughput. Per-arm explore rewards, player-count splits, losses, and every
-other logged column stay in metrics.csv and the printed summary — the
-dashboard shows only what a glance can act on.
+Row 2 is the machine: sharpness, value fit, PPO trust-region health, and
+throughput. The suit-belief and value-fit panels also show their corresponding
+training losses on a right-hand axis so fit quality and optimization pressure
+can be read together.
 """
 
 from __future__ import annotations
@@ -21,6 +21,7 @@ import matplotlib
 matplotlib.use("Agg")
 
 import matplotlib.pyplot as plt
+from matplotlib.ticker import FuncFormatter, LogLocator
 
 
 def parse_args() -> argparse.Namespace:
@@ -116,7 +117,17 @@ def render_metrics_plot(
     fig, axes = plt.subplots(2, 4, figsize=(22, 10), constrained_layout=True)
     resolved_title = title or f"Plump PPO Training: {metrics_path.parent.name}"
     if min_iteration is not None:
-        resolved_title += f" — from iteration {min_iteration}"
+        visible_iterations = [
+            int(row["iteration"])
+            for row in rows
+            if isinstance(row.get("iteration"), float)
+            and not math.isnan(row["iteration"])
+        ]
+        first_iteration = min(visible_iterations, default=min_iteration)
+        last_iteration = max(visible_iterations, default=min_iteration)
+        resolved_title += (
+            f" — iterations {first_iteration:,}–{last_iteration:,} (live)"
+        )
     fig.suptitle(resolved_title, fontsize=16)
 
     x = _series(rows, "iteration")
@@ -368,7 +379,7 @@ def _plot_trick_belief(
     strictly upward as cards reveal information.
     """
 
-    plotted = _plot_diagnostic_lines(
+    accuracy_plotted = _plot_diagnostic_lines(
         ax,
         rows,
         smooth,
@@ -383,8 +394,33 @@ def _plot_trick_belief(
     ax.set_ylim(0.0, 1.0)
     ax.set_title("Trick Belief by Stage")
     ax.set_ylabel("trick-count accuracy")
-    if plotted:
-        ax.legend(fontsize=8, loc="upper left")
+
+    loss_ax = ax.twinx()
+    loss_x, loss = _diagnostic_series(rows, "loss_trick", smooth)
+    loss_plotted = bool(loss)
+    if loss_plotted:
+        loss_ax.plot(
+            loss_x,
+            loss,
+            label="training loss",
+            color="tab:purple",
+            linestyle="--",
+            linewidth=1.5,
+            alpha=0.8,
+        )
+        loss_ax.set_ylim(bottom=0.0)
+    loss_ax.set_ylabel("trick-belief loss", color="tab:purple")
+    loss_ax.tick_params(axis="y", colors="tab:purple")
+
+    if accuracy_plotted or loss_plotted:
+        handles, labels = ax.get_legend_handles_labels()
+        loss_handles, loss_labels = loss_ax.get_legend_handles_labels()
+        ax.legend(
+            [*handles, *loss_handles],
+            [*labels, *loss_labels],
+            fontsize=8,
+            loc="upper left",
+        )
     else:
         _no_data(ax)
 
@@ -400,7 +436,7 @@ def _plot_suit_belief(
     Later stages should sit higher as follows/discards reveal voids. (The
     card-owner head is retired — it never beat chance on opponent cards.)"""
 
-    plotted = _plot_diagnostic_lines(
+    accuracy_plotted = _plot_diagnostic_lines(
         ax,
         rows,
         smooth,
@@ -414,8 +450,33 @@ def _plot_suit_belief(
     ax.set_ylim(0.0, 1.0)
     ax.set_title("Suit Belief by Stage")
     ax.set_ylabel("suit-presence accuracy")
-    if plotted:
-        ax.legend(fontsize=8, loc="lower right")
+
+    loss_ax = ax.twinx()
+    loss_x, loss = _diagnostic_series(rows, "loss_suit_presence", smooth)
+    loss_plotted = bool(loss)
+    if loss_plotted:
+        loss_ax.plot(
+            loss_x,
+            loss,
+            label="training loss",
+            color="tab:purple",
+            linestyle="--",
+            linewidth=1.5,
+            alpha=0.8,
+        )
+        loss_ax.set_ylim(bottom=0.0)
+    loss_ax.set_ylabel("suit-presence loss", color="tab:purple")
+    loss_ax.tick_params(axis="y", colors="tab:purple")
+
+    if accuracy_plotted or loss_plotted:
+        handles, labels = ax.get_legend_handles_labels()
+        loss_handles, loss_labels = loss_ax.get_legend_handles_labels()
+        ax.legend(
+            [*handles, *loss_handles],
+            [*labels, *loss_labels],
+            fontsize=8,
+            loc="lower right",
+        )
     else:
         _no_data(ax)
 
@@ -465,7 +526,7 @@ def _plot_explained_variance(
 ) -> None:
     """How much of the return the critics explain — climb, then hold."""
 
-    plotted = _plot_diagnostic_lines(
+    variance_plotted = _plot_diagnostic_lines(
         ax,
         rows,
         smooth,
@@ -481,9 +542,41 @@ def _plot_explained_variance(
     )
     ax.axhline(0.0, color="black", linewidth=1, alpha=0.4)
     ax.set_ylim(-0.1, 1.0)
-    ax.set_title("Value Explained Variance")
-    if plotted:
-        ax.legend(fontsize=8, loc="lower right")
+    ax.set_title("Value / Critic Fit")
+    ax.set_ylabel("explained variance")
+
+    loss_ax = ax.twinx()
+    loss_plotted = False
+    for name, label, color in (
+        ("loss_value", "value-head loss", "tab:green"),
+        ("loss_oracle_value", "oracle-critic loss", "tab:red"),
+    ):
+        loss_x, loss = _diagnostic_series(rows, name, smooth)
+        if not loss:
+            continue
+        loss_ax.plot(
+            loss_x,
+            loss,
+            label=label,
+            color=color,
+            linestyle="--",
+            linewidth=1.4,
+            alpha=0.65,
+        )
+        loss_plotted = True
+    if loss_plotted:
+        loss_ax.set_ylim(bottom=0.0)
+    loss_ax.set_ylabel("training loss")
+
+    if variance_plotted or loss_plotted:
+        handles, labels = ax.get_legend_handles_labels()
+        loss_handles, loss_labels = loss_ax.get_legend_handles_labels()
+        ax.legend(
+            [*handles, *loss_handles],
+            [*labels, *loss_labels],
+            fontsize=8,
+            loc="lower right",
+        )
     else:
         _no_data(ax)
 
@@ -511,6 +604,12 @@ def _plot_ppo_stability(
         ax.plot(x, values, label=label, color=color)
         plotted = True
     ax.set_yscale("log")
+    ax.yaxis.set_major_locator(
+        LogLocator(base=10.0, subs=(1.0, 2.0, 5.0))
+    )
+    ax.yaxis.set_major_formatter(
+        FuncFormatter(lambda value, _position: f"{value:.3g}")
+    )
     ax.set_title("PPO Stability")
     ax.set_ylabel("per-update level (log)")
     if plotted:

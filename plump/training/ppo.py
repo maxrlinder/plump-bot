@@ -6,7 +6,7 @@ import copy
 import math
 import random
 import time
-from collections import defaultdict
+from collections import defaultdict, deque
 from dataclasses import asdict, dataclass, field, replace as dataclass_replace
 from pathlib import Path
 from typing import Iterable, Literal, Sequence
@@ -27,8 +27,9 @@ from plump.modeling import (
     card_id,
     encode_observation,
 )
-from plump.modeling.encoding import NUM_CARDS
+from plump.modeling.encoding import NUM_CARDS, SUITS
 from plump.modeling.torch_model import (
+    PolicyModelOutput,
     PlumpTransformerModel,
     best_torch_device,
     combined_action_logits,
@@ -80,13 +81,174 @@ OpponentArm = Literal[
     "historical",
     "explore_self",
     "explore_historical",
+    "tempered_self",
+    "tempered_historical",
+    "capped_self",
+    "capped_historical",
+    "epsilon_self",
+    "epsilon_historical",
 ]
-# Arms whose focal seat samples from the noised behavior policy while every
-# opponent seat is frozen weight playing raw — the learner explores without
-# ever optimizing against noisy play.
-EXPLORE_ARMS: frozenset[str] = frozenset({"explore_self", "explore_historical"})
+TEMPERED_ARMS: frozenset[str] = frozenset(
+    {
+        "explore_self",
+        "explore_historical",
+        "tempered_self",
+        "tempered_historical",
+    }
+)
+CAPPED_ARMS: frozenset[str] = frozenset(
+    {"capped_self", "capped_historical"}
+)
+EPSILON_ARMS: frozenset[str] = frozenset(
+    {"epsilon_self", "epsilon_historical"}
+)
+# The legacy explore arms and the new capped/epsilon arms train only their
+# focal seat. Dedicated tempered self-play is deliberately different: every
+# current-controlled seat samples at T and contributes gradients.
+FOCAL_ONLY_ARMS: frozenset[str] = frozenset(
+    {
+        "explore_self",
+        "explore_historical",
+        *CAPPED_ARMS,
+        *EPSILON_ARMS,
+    }
+)
+# Noised arms are excluded from clean-policy diagnostics and league difficulty
+# updates regardless of how many current seats they train.
+EXPLORE_ARMS: frozenset[str] = frozenset(
+    TEMPERED_ARMS | CAPPED_ARMS | EPSILON_ARMS
+)
+SELF_PLAY_ARMS: frozenset[str] = frozenset(
+    {
+        "self",
+        "explore_self",
+        "tempered_self",
+        "capped_self",
+        "epsilon_self",
+    }
+)
+HISTORICAL_ARMS: frozenset[str] = frozenset(
+    {
+        "historical",
+        "explore_historical",
+        "tempered_historical",
+        "capped_historical",
+        "epsilon_historical",
+    }
+)
+ALL_OPPONENT_ARMS: frozenset[str] = frozenset(
+    {
+        "self",
+        "heuristic",
+        "mixed",
+        *EXPLORE_ARMS,
+        *HISTORICAL_ARMS,
+    }
+)
 TrainingMode = Literal["round", "game"]
 PositionKey = tuple[int, int, int]
+
+
+def _argmax_capped_probabilities(
+    masked_logits: Tensor,
+    cap: float,
+    alternative_temperature: float = 1.0,
+) -> Tensor:
+    """Cap argmax at ``cap`` and redistribute only when it exceeds the cap.
+
+    Rows whose raw top probability is already at or below the cap are returned
+    unchanged. Otherwise the top gets exactly ``cap`` and the remaining mass
+    is a temperature-scaled softmax over the other legal logits. Masked actions
+    stay at zero; a forced decision remains deterministic.
+    """
+
+    logits = masked_logits.float()
+    raw_probs = torch.softmax(logits, dim=-1)
+    # Infer legality from the explicit masked-logit sentinel, not probability
+    # mass.  A perfectly legal but extremely unlikely action can underflow to
+    # zero after softmax; treating it as illegal would make it impossible for
+    # an exploration transform to recover that action.
+    legal = logits > torch.finfo(logits.dtype).min / 2
+    top_indices = logits.argmax(dim=-1)
+    top = F.one_hot(top_indices, num_classes=logits.shape[-1]).bool()
+    alternatives = legal & ~top
+    alternative_logits = (logits / alternative_temperature).masked_fill(
+        ~alternatives,
+        -torch.inf,
+    )
+    alternative_probs = torch.softmax(alternative_logits, dim=-1)
+    alternative_probs = torch.nan_to_num(
+        alternative_probs,
+        nan=0.0,
+        posinf=0.0,
+        neginf=0.0,
+    )
+    top_probs = top.to(logits.dtype)
+    capped = cap * top_probs + (1.0 - cap) * alternative_probs
+    has_alternative = alternatives.any(dim=-1, keepdim=True)
+    raw_top = raw_probs.gather(-1, top_indices.unsqueeze(-1))
+    should_cap = (raw_top > cap) & has_alternative
+    return torch.where(should_cap, capped, raw_probs)
+
+
+def _non_argmax_uniform_probabilities(masked_logits: Tensor) -> Tensor:
+    """Uniform over legal non-argmax actions, or the sole legal action.
+
+    This is the exploration component for dedicated epsilon arms. The normal
+    policy component can still choose its argmax; only an activated epsilon
+    draw is forbidden from doing so when another legal action exists.
+    """
+
+    legal = masked_logits > torch.finfo(masked_logits.dtype).min / 2
+    top_indices = masked_logits.argmax(dim=-1)
+    top = F.one_hot(top_indices, num_classes=masked_logits.shape[-1]).bool()
+    alternatives = legal & ~top
+    alternative_count = alternatives.sum(dim=-1, keepdim=True)
+    alternative_uniform = alternatives.float() / alternative_count.clamp_min(1)
+    legal_uniform = legal.float() / legal.sum(dim=-1, keepdim=True).clamp_min(1)
+    return torch.where(
+        alternative_count > 0,
+        alternative_uniform,
+        legal_uniform,
+    )
+
+
+def _non_argmax_tempered_probabilities(
+    masked_logits: Tensor,
+    temperature: float,
+) -> Tensor:
+    """Policy-shaped distribution over legal non-argmax alternatives.
+
+    This is used for the single-deviation explorer.  It deliberately chooses
+    one alternative action, but preserves the model's ranking among the
+    alternatives instead of dithering uniformly over sensible and absurd
+    actions alike.  A forced decision remains deterministic.
+    """
+
+    if temperature <= 0.0:
+        raise ValueError("temperature must be positive.")
+    logits = masked_logits.float()
+    legal = logits > torch.finfo(logits.dtype).min / 2
+    top_indices = logits.argmax(dim=-1)
+    top = F.one_hot(top_indices, num_classes=logits.shape[-1]).bool()
+    alternatives = legal & ~top
+    alternative_logits = (logits / temperature).masked_fill(
+        ~alternatives,
+        -torch.inf,
+    )
+    alternative_probs = torch.softmax(alternative_logits, dim=-1)
+    alternative_probs = torch.nan_to_num(
+        alternative_probs,
+        nan=0.0,
+        posinf=0.0,
+        neginf=0.0,
+    )
+    legal_probs = legal.float() / legal.sum(dim=-1, keepdim=True).clamp_min(1)
+    return torch.where(
+        alternatives.any(dim=-1, keepdim=True),
+        alternative_probs,
+        legal_probs,
+    )
 
 
 @dataclass
@@ -138,7 +300,32 @@ class TrainingConfig:
     mmd_coef: float = 0.05
     mmd_magnet_decay: float = 0.995
     entropy_coef: float = 0.01
+    # Counterfactual branch collection keeps one raw-policy focal spine per
+    # dealt round, then evaluates alternative focal actions with complete
+    # terminal side rollouts.  Side rollouts are reduced to action-value
+    # targets and never enter the PPO buffer, so the branch compute budget is
+    # independent of update memory.
+    branch_rollouts: bool = False
+    branch_decision_budget_per_arm: int = 0
+    branch_update_decision_budget_per_arm: int = 2_400
+    branch_max_replicates: int = 4
+    branch_max_active: int = 768
+    # Recursive collection is exhaustive for card play. Bidding keeps only
+    # the highest-probability legal actions to prevent the tree frontier from
+    # being consumed by wide, low-value bid expansions. Zero means exhaustive.
+    branch_bid_max_actions: int = 4
+    # Legacy shaped-target knobs retained for checkpoint/config compatibility;
+    # direct counterfactual advantages do not use them.
+    branch_support_floor: float = 0.0
+    branch_target_temperature: float = 1.0
+    branch_advantage_clip: float = 4.0
+    branch_policy_coef: float = 1.0
+    branch_kl_cap: float = 0.005
     trick_coef: float = 0.1
+    # Train the final-trick-count and suit-presence stack only from its own
+    # supervised losses. Its input state is detached from the shared trunk,
+    # and its parameters live in a named optimizer group.
+    belief_head_only: bool = False
     owner_coef: float = 0.05
     # Iterations after the owner head first becomes active during which its
     # gradients are cut off from the trunk (head-only learning), so a
@@ -159,6 +346,23 @@ class TrainingConfig:
     # noisy opponents. Only the focal seat produces training samples.
     explore_self_fraction: float = 0.0
     explore_historical_fraction: float = 0.0
+    # Exact-temperature leagues. Unlike the legacy explore_self arm,
+    # tempered_self trains every current-controlled seat.
+    tempered_self_fraction: float = 0.0
+    tempered_historical_fraction: float = 0.0
+    # Dedicated focal-only exploration regimes. ``capped`` limits the
+    # highest-logit legal action to explore_argmax_cap probability when it
+    # would exceed that value and redistributes the remainder by softmax over
+    # the other legal logits.
+    # ``epsilon`` uses the per-arm epsilon mixture configured below; its
+    # exploration component excludes the raw-policy argmax whenever another
+    # legal action exists.
+    capped_self_fraction: float = 0.0
+    capped_historical_fraction: float = 0.0
+    epsilon_self_fraction: float = 0.0
+    epsilon_historical_fraction: float = 0.0
+    explore_argmax_cap: float = 1.0
+    explore_argmax_rest_temperature: float = 1.0
     # Behavior-policy exploration: with probability eps a rollout action is
     # drawn uniformly over LEGAL actions; old_logprob records the mixture
     # probability so PPO importance ratios stay correct.
@@ -179,12 +383,16 @@ class TrainingConfig:
     explore_temperature_bid: float = 1.0
     explore_temperature_play: float = 1.0
     explore_temperature_arms: tuple[str, ...] = ("self", "mixed")
-    # At most one uniform-random action per explore round: with this
+    # At most one policy-shaped alternative per explore round: with this
     # probability the focal seat gets exactly one decision — uniformly placed
-    # among its 1+hand_size decisions — sampled uniformly over legal actions.
-    # Every other decision stays tempered-only, so a round is one deliberate
+    # among its 1+hand_size decisions — sampled over legal non-argmax actions.
+    # Every other decision stays normal/tempered, so a round is one deliberate
     # deviation inside otherwise-plausible play, never a random walk.
     explore_uniform_round_probability: float = 0.0
+    # The one-deviation explorer samples a legal non-argmax action from the
+    # model-shaped distribution softmax(other_logits / T).  This is separate
+    # from the legacy per-decision epsilon arms, which remain uniform.
+    explore_single_deviation_temperature: float = 3.0
     # Scale explore noise down on longer rounds: the effective temperature
     # and the uniform-round probability shrink by (min_hand+1)/(hand+1), so
     # total per-round distortion stays roughly constant instead of
@@ -300,6 +508,15 @@ class RolloutSample:
     # Logprob under the raw policy (old_logprob is the behavior mixture when
     # explore_eps is active); None means they coincide.
     old_policy_logprob: float | None = None
+    # Raw collecting-policy probabilities are retained only when recursive
+    # counterfactual branches are enabled. Every legal bid/card is represented
+    # by its own exhaustive branch and terminal continuation.
+    old_policy_probabilities: list[float] | None = None
+    branch_candidate_action_indices: list[int] | None = None
+    branch_action_groups: list[list[int]] | None = None
+    branch_target_probabilities: list[float] | None = None
+    branch_action_values: list[float] | None = None
+    branch_prior_probabilities: list[float] | None = None
 
 
 @dataclass
@@ -357,12 +574,24 @@ class RolloutStats:
     historical_relative_reward: float
     explore_self_relative_reward: float
     explore_historical_relative_reward: float
+    tempered_self_relative_reward: float
+    tempered_historical_relative_reward: float
+    capped_self_relative_reward: float
+    capped_historical_relative_reward: float
+    epsilon_self_relative_reward: float
+    epsilon_historical_relative_reward: float
     self_play_rounds: int
     heuristic_rounds: int
     mixed_rounds: int
     historical_rounds: int
     explore_self_rounds: int
     explore_historical_rounds: int
+    tempered_self_rounds: int
+    tempered_historical_rounds: int
+    capped_self_rounds: int
+    capped_historical_rounds: int
+    epsilon_self_rounds: int
+    epsilon_historical_rounds: int
     return_mean: float
     return_std: float
     old_value_mean: float
@@ -444,6 +673,10 @@ class UpdateStats:
     suit_presence_loss: float
     approx_kl: float
     clip_fraction: float
+    branch_policy_loss: float
+    branch_kl: float
+    branch_target_entropy: float
+    branch_samples: int
     skipped_steps: int
     epochs_run: int
     samples: int
@@ -465,6 +698,15 @@ class CollectionStats:
     valid_event_tokens: int = 0
     processed_event_tokens: int = 0
     peak_device_memory_bytes: int = 0
+    branch_root_hands: int = 0
+    branch_roots_available: int = 0
+    branch_roots_expanded: int = 0
+    branch_bid_roots: int = 0
+    branch_play_roots: int = 0
+    branch_terminal_rollouts: int = 0
+    branch_self_decisions: int = 0
+    branch_historical_decisions: int = 0
+    branch_forward_sec: float = 0.0
 
 
 @dataclass
@@ -551,6 +793,66 @@ class _ActiveEpisode:
     samples: list[RolloutSample] = field(default_factory=list)
 
 
+@dataclass
+class _BranchRoot:
+    """A reached focal information state backed by the actual sampled deal."""
+
+    env: PlumpEnv
+    sample: RolloutSample
+    opponent_policies: dict[int, ActionPolicy | None]
+    focal_player: int
+    opponent_arm: OpponentArm
+    candidate_actions: tuple[BidAction | PlayCardAction, ...] = ()
+    returns_by_action: dict[int, list[float]] = field(
+        default_factory=lambda: defaultdict(list)
+    )
+
+
+@dataclass
+class _BranchTrajectory:
+    """One forced root action followed by a raw-policy terminal rollout."""
+
+    env: PlumpEnv
+    root: _BranchRoot
+    action_index: int
+    rng: random.Random
+
+
+@dataclass
+class _RecursiveTreeRoot:
+    episode: _ActiveEpisode
+    samples: list[RolloutSample] = field(default_factory=list)
+    decisions: list["_RecursiveBranchDecision"] = field(default_factory=list)
+    canonical_result: RoundResult | None = None
+    rollout_decisions: int = 0
+
+
+@dataclass
+class _RecursiveBranchDecision:
+    sample: RolloutSample
+    candidate_actions: tuple[BidAction | PlayCardAction, ...]
+    action_groups: tuple[tuple[int, ...], ...]
+    edge_probabilities: tuple[float, ...]
+    upstream: tuple["_RecursiveBranchDecision", int] | None
+    prefix_samples: list[RolloutSample]
+    on_policy_spine: bool
+    canonical_action_index: int | None
+    retain_target: bool
+    child_values: dict[int, float] = field(default_factory=dict)
+    child_results: dict[int, RoundResult] = field(default_factory=dict)
+
+
+@dataclass
+class _RecursiveTreePath:
+    env: PlumpEnv
+    root: _RecursiveTreeRoot
+    upstream: tuple[_RecursiveBranchDecision, int] | None
+    pending_spine_samples: list[RolloutSample]
+    on_policy_spine: bool
+    reach_probability: float
+    rng: random.Random
+
+
 class PPOTrainer:
     """Collect a balanced 24-cell curriculum and optimize a shared policy."""
 
@@ -566,7 +868,7 @@ class PPOTrainer:
         torch.manual_seed(self.config.seed)
         self.model = model or PlumpTransformerModel(self.config.model_config)
         self.model.to(self.device)
-        self.optimizer = optimizer or torch.optim.AdamW(self.model.parameters(), lr=self.config.learning_rate)
+        self.optimizer = optimizer or self._build_optimizer()
         self.rng = random.Random(self.config.seed)
         # Update owns its own RNG so a pipelined collector thread and the
         # minibatch shuffle never interleave draws on one generator.
@@ -598,6 +900,127 @@ class PPOTrainer:
             self._reset_rollout_model()
         # Optional multiprocess env stepping; owned by the caller (train loop).
         self.env_pool: EnvWorkerPool | None = None
+
+    def _belief_parameters(self) -> list[Tensor]:
+        modules = [
+            self.model.player_query_emb,
+            self.model.player_mlp,
+            self.model.trick_count_head,
+        ]
+        if hasattr(self.model, "suit_presence_head"):
+            modules.append(self.model.suit_presence_head)
+        return [parameter for module in modules for parameter in module.parameters()]
+
+    def _build_optimizer(self) -> torch.optim.Optimizer:
+        if not self.config.belief_head_only:
+            return torch.optim.AdamW(
+                self.model.parameters(),
+                lr=self.config.learning_rate,
+            )
+        belief_parameters = self._belief_parameters()
+        belief_ids = {id(parameter) for parameter in belief_parameters}
+        policy_value_parameters = [
+            parameter
+            for parameter in self.model.parameters()
+            if id(parameter) not in belief_ids
+        ]
+        if not belief_parameters or not policy_value_parameters:
+            raise RuntimeError("Belief optimizer split produced an empty parameter group.")
+        return torch.optim.AdamW(
+            [
+                {
+                    "params": policy_value_parameters,
+                    "name": "policy_value",
+                },
+                {
+                    "params": belief_parameters,
+                    "name": "belief_heads",
+                },
+            ],
+            lr=self.config.learning_rate,
+        )
+
+    def _load_optimizer_state_dict(
+        self,
+        saved_state_dict: dict[str, object],
+    ) -> bool:
+        """Load Adam state, splitting a legacy all-parameter group if needed.
+
+        Checkpoints written before ``belief_head_only`` contain one optimizer
+        group in model-parameter order. The split is only organizational: map
+        every saved per-parameter moment onto the same parameter in the two
+        new groups so resuming does not reset Adam's history.
+
+        Returns whether a one-group checkpoint was migrated.
+        """
+
+        saved_groups = saved_state_dict["param_groups"]
+        if len(saved_groups) == len(self.optimizer.param_groups):
+            self.optimizer.load_state_dict(saved_state_dict)
+            return False
+        if len(saved_groups) != 1 or len(self.optimizer.param_groups) != 2:
+            raise ValueError(
+                "Cannot migrate optimizer state from "
+                f"{len(saved_groups)} groups to "
+                f"{len(self.optimizer.param_groups)} groups."
+            )
+
+        saved_parameter_ids = saved_groups[0]["params"]
+        model_parameters = list(self.model.parameters())
+        if len(saved_parameter_ids) != len(model_parameters):
+            raise ValueError(
+                "Legacy optimizer parameter count does not match the model."
+            )
+        saved_id_by_parameter = {
+            id(parameter): saved_id
+            for parameter, saved_id in zip(
+                model_parameters,
+                saved_parameter_ids,
+                strict=True,
+            )
+        }
+
+        current_state_dict = self.optimizer.state_dict()
+        current_id_by_parameter: dict[int, int] = {}
+        for live_group, serialized_group in zip(
+            self.optimizer.param_groups,
+            current_state_dict["param_groups"],
+            strict=True,
+        ):
+            current_id_by_parameter.update(
+                {
+                    id(parameter): serialized_id
+                    for parameter, serialized_id in zip(
+                        live_group["params"],
+                        serialized_group["params"],
+                        strict=True,
+                    )
+                }
+            )
+
+        migrated_state = {
+            current_id_by_parameter[parameter_id]: saved_state_dict["state"][saved_id]
+            for parameter_id, saved_id in saved_id_by_parameter.items()
+            if saved_id in saved_state_dict["state"]
+        }
+        migrated_groups: list[dict[str, object]] = []
+        for current_group in current_state_dict["param_groups"]:
+            group = {
+                key: value
+                for key, value in saved_groups[0].items()
+                if key != "params"
+            }
+            group["params"] = current_group["params"]
+            if "name" in current_group:
+                group["name"] = current_group["name"]
+            migrated_groups.append(group)
+        self.optimizer.load_state_dict(
+            {
+                "state": migrated_state,
+                "param_groups": migrated_groups,
+            }
+        )
+        return True
 
     @property
     def historical_policies(self) -> list[ActionPolicy]:
@@ -653,6 +1076,58 @@ class PPOTrainer:
         return specs
 
     def balanced_round_schedule(self) -> list[tuple[RoundSpec, OpponentArm]]:
+        if self.config.branch_rollouts:
+            # The two arms receive the exact same multiset of hand sizes, so
+            # one focal seat contributes exactly the same number of raw PPO
+            # decisions to self and historical play.  Round-count equality
+            # alone is insufficient because an H-card round has H+1 focal
+            # decisions.
+            half = self.config.rounds_per_batch // 2
+            player_weights = dict(
+                zip(
+                    self.config.player_counts,
+                    self.config.player_count_weights,
+                )
+            ) or {count: 1.0 for count in self.config.player_counts}
+            hand_weights = dict(
+                zip(
+                    self.config.hand_sizes,
+                    self.config.hand_size_weights,
+                )
+            ) or {size: 1.0 for size in self.config.hand_sizes}
+            raw = {
+                spec: player_weights[spec.num_players]
+                * hand_weights[spec.hand_size]
+                for spec in self.config.specs
+            }
+            scale = half / sum(raw.values())
+            quotas = {
+                spec: int(math.floor(weight * scale))
+                for spec, weight in raw.items()
+            }
+            remainder = half - sum(quotas.values())
+            ranked = sorted(
+                raw,
+                key=lambda spec: (
+                    raw[spec] * scale - quotas[spec],
+                    raw[spec],
+                ),
+                reverse=True,
+            )
+            for spec in ranked[:remainder]:
+                quotas[spec] += 1
+            base_specs = [
+                spec
+                for spec, quota in quotas.items()
+                for _ in range(quota)
+            ]
+            schedule = [
+                (spec, arm)
+                for spec in base_specs
+                for arm in ("self", "historical")
+            ]
+            self.rng.shuffle(schedule)
+            return schedule
         fractions = self._effective_arm_fractions()
         quotas = self.config.spec_round_quotas()
         if quotas is None:
@@ -688,6 +1163,10 @@ class PPOTrainer:
         try:
             if self.config.training_mode == "game":
                 return self._collect_game_rollouts(iteration=iteration)
+            if self.config.branch_rollouts:
+                return self._collect_recursive_branch_rollouts(
+                    iteration=iteration
+                )
             if self.env_pool is not None:
                 return self._collect_round_rollouts_workers(iteration=iteration)
             return self._collect_round_rollouts(iteration=iteration)
@@ -706,11 +1185,694 @@ class PPOTrainer:
             self._active_collection_stats = None
             self._active_historical_policy_ids = None
 
+    def _collect_recursive_branch_rollouts(
+        self,
+        *,
+        iteration: int,
+    ) -> RolloutBuffer:
+        """Collect bounded recursive focal-action trees.
+
+        A matched self/history pair shares its complete initial deal.  Every
+        approved focal node expands atomically; descendants may expand again.
+        The exact minimum terminal-completion cost of every expansion is
+        reserved before it is admitted, so no spawned path is ever truncated
+        or replaced by a critic bootstrap.
+        """
+
+        if not self.historical_snapshots:
+            raise RuntimeError(
+                "Recursive branch collection requires historical snapshots."
+            )
+        self._collection_model().eval()
+        del iteration
+        buffer = RolloutBuffer()
+        budget = self.config.branch_decision_budget_per_arm
+        update_budget = self.config.branch_update_decision_budget_per_arm
+        spent: dict[OpponentArm, int] = {"self": 0, "historical": 0}
+        retained_reserved: dict[OpponentArm, int] = {
+            "self": 0,
+            "historical": 0,
+        }
+        rows_by_arm: dict[OpponentArm, list[RolloutSample]] = {
+            "self": [],
+            "historical": [],
+        }
+        baseline_updates: list[tuple[PositionKey, float]] = []
+        pair_id = 0
+
+        while True:
+            remaining = min(
+                budget - spent["self"],
+                budget - spent["historical"],
+            )
+            spec = self._draw_branch_root_spec(remaining)
+            if spec is None:
+                break
+            self_episode, historical_episode = (
+                self._new_matched_branch_episodes(spec, pair_id)
+            )
+            roots = self._collect_recursive_tree_pair(
+                (self_episode, historical_episode),
+                decision_budgets={
+                    "self": budget - spent["self"],
+                    "historical": budget - spent["historical"],
+                },
+                retain_slots={
+                    arm: max(update_budget - retained_reserved[arm], 0)
+                    for arm in ("self", "historical")
+                },
+            )
+            if self._active_collection_stats is not None:
+                self._active_collection_stats.branch_root_hands += len(roots)
+            for episode in (self_episode, historical_episode):
+                arm = episode.opponent_arm
+                root = roots[arm]
+                spent[arm] += root.rollout_decisions
+                retained_branch_rows = sum(
+                    sample.branch_action_values is not None
+                    for sample in root.samples
+                )
+                retained_reserved[arm] += retained_branch_rows
+                rows_by_arm[arm].extend(root.samples)
+                if root.canonical_result is None:
+                    raise RuntimeError(
+                        "Recursive tree completed without an on-policy spine."
+                    )
+                outcome = self._round_outcome_from_result(
+                    episode_id=episode.episode_id,
+                    num_players=episode.env.config.num_players,
+                    opponent_arm=arm,
+                    focal_player=episode.focal_player,
+                    opponent_snapshot_id=episode.opponent_snapshot_id,
+                    result=root.canonical_result,
+                )
+                buffer.round_outcomes.append(outcome)
+                focal_bid = next(
+                    bid
+                    for bid in root.canonical_result.bids
+                    if bid.player == episode.focal_player
+                )
+                baseline_updates.append(
+                    (
+                        (
+                            spec.num_players,
+                            spec.hand_size,
+                            focal_bid.position,
+                        ),
+                        float(outcome.focal_reward),
+                    )
+                )
+            pair_id += 1
+
+        if pair_id == 0:
+            raise RuntimeError(
+                "Branch decision budget is too small for one matched root pair."
+            )
+        keep_per_arm = min(
+            update_budget,
+            len(rows_by_arm["self"]),
+            len(rows_by_arm["historical"]),
+        )
+        if keep_per_arm < 1:
+            raise RuntimeError("Recursive branch collection produced no update rows.")
+        selected: list[RolloutSample] = []
+        for arm in ("self", "historical"):
+            rows = rows_by_arm[arm]
+            branch_rows = [
+                sample
+                for sample in rows
+                if sample.branch_action_values is not None
+            ]
+            spine_rows = [
+                sample
+                for sample in rows
+                if sample.branch_action_values is None
+            ]
+            self.rng.shuffle(branch_rows)
+            self.rng.shuffle(spine_rows)
+            chosen = branch_rows[:keep_per_arm]
+            chosen.extend(spine_rows[: keep_per_arm - len(chosen)])
+            weight = 0.5 / keep_per_arm
+            for sample in chosen:
+                sample.round_weight = weight
+            selected.extend(chosen)
+        self.rng.shuffle(selected)
+        buffer.samples = selected
+        self.position_baseline.update_many(baseline_updates)
+        self._update_league_ema(buffer.round_outcomes)
+        stats = self._active_collection_stats
+        if stats is not None:
+            stats.branch_self_decisions = spent["self"]
+            stats.branch_historical_decisions = spent["historical"]
+        return buffer
+
+    def _draw_branch_root_spec(self, remaining: int) -> RoundSpec | None:
+        eligible = [
+            spec
+            for spec in self.config.specs
+            if spec.num_players * (spec.hand_size + 1) <= remaining
+        ]
+        if not eligible:
+            return None
+        player_weights = dict(
+            zip(
+                self.config.player_counts,
+                self.config.player_count_weights,
+            )
+        ) or {count: 1.0 for count in self.config.player_counts}
+        hand_weights = dict(
+            zip(
+                self.config.hand_sizes,
+                self.config.hand_size_weights,
+            )
+        ) or {size: 1.0 for size in self.config.hand_sizes}
+        weights = [
+            player_weights[spec.num_players]
+            * hand_weights[spec.hand_size]
+            for spec in eligible
+        ]
+        return self.rng.choices(eligible, weights=weights, k=1)[0]
+
+    def _new_matched_branch_episodes(
+        self,
+        spec: RoundSpec,
+        pair_id: int,
+    ) -> tuple[_ActiveEpisode, _ActiveEpisode]:
+        start_player = self.rng.randrange(spec.num_players)
+        env = PlumpEnv(
+            round_game_config(spec, bidding_start_player=start_player),
+            seed=self.rng.randrange(2**31),
+        )
+        env.reset()
+        focal_player = pair_id % spec.num_players
+        episodes = []
+        for offset, arm in enumerate(("self", "historical")):
+            opponents, snapshot_id = self._opponent_policies(
+                spec.num_players,
+                focal_player,
+                arm,
+            )
+            episodes.append(
+                _ActiveEpisode(
+                    env=env.clone(),
+                    spec=spec,
+                    episode_id=pair_id * 2 + offset,
+                    opponent_arm=arm,
+                    trainable_players=frozenset({focal_player}),
+                    opponent_policies=opponents,
+                    focal_player=focal_player,
+                    opponent_snapshot_id=snapshot_id,
+                )
+            )
+        return episodes[0], episodes[1]
+
+    def _collect_recursive_tree_pair(
+        self,
+        episodes: tuple[_ActiveEpisode, _ActiveEpisode],
+        *,
+        decision_budgets: dict[OpponentArm, int],
+        retain_slots: dict[OpponentArm, int],
+    ) -> dict[OpponentArm, _RecursiveTreeRoot]:
+        """Run a matched self/history pair through one shared model frontier."""
+
+        roots = {
+            episode.opponent_arm: _RecursiveTreeRoot(episode=episode)
+            for episode in episodes
+        }
+        if set(roots) != {"self", "historical"}:
+            raise RuntimeError("Recursive collection requires one root per arm.")
+        committed: dict[OpponentArm, int] = {}
+        retained: dict[OpponentArm, int] = {
+            "self": 0,
+            "historical": 0,
+        }
+        active: list[_RecursiveTreePath] = []
+        for episode in episodes:
+            arm = episode.opponent_arm
+            initial_cost = self._remaining_round_decisions(episode.env)
+            if initial_cost > decision_budgets[arm]:
+                raise RuntimeError("Root tree does not fit its decision budget.")
+            committed[arm] = initial_cost
+            active.append(
+                _RecursiveTreePath(
+                    env=episode.env.clone(),
+                    root=roots[arm],
+                    upstream=None,
+                    pending_spine_samples=[],
+                    on_policy_spine=True,
+                    reach_probability=1.0,
+                    rng=random.Random(self.rng.randrange(2**31)),
+                )
+            )
+
+        while active:
+            current_rows: list[_RecursiveTreePath] = []
+            current_requests: list[DecisionRequest] = []
+            frozen_groups: dict[int, list[_RecursiveTreePath]] = defaultdict(list)
+            frozen_policies: dict[int, ActionPolicy] = {}
+            for path in active:
+                episode = path.root.episode
+                player = path.env.current_player()
+                frozen = (
+                    player != episode.focal_player
+                    and episode.opponent_policies.get(player) is not None
+                )
+                if frozen:
+                    policy = episode.opponent_policies[player]
+                    key = id(policy)
+                    frozen_groups[key].append(path)
+                    frozen_policies[key] = policy
+                    continue
+                collect = player == episode.focal_player
+                current_rows.append(path)
+                current_requests.append(
+                    build_decision_request(
+                        path.env,
+                        episode_id=id(path),
+                        opponent_arm=episode.opponent_arm,
+                        policy_ref="current",
+                        model_config=self.config.model_config,
+                        include_game_context=self.config.include_game_context,
+                        collect=collect,
+                    )
+                )
+
+            current_started = time.perf_counter()
+            current_results = (
+                self._forward_decision_rows(current_requests)
+                if current_requests
+                else []
+            )
+            if current_requests and self._active_collection_stats is not None:
+                self._active_collection_stats.branch_forward_sec += (
+                    time.perf_counter() - current_started
+                )
+            action_by_path: dict[
+                int,
+                tuple[RolloutSample | None, BidAction | PlayCardAction],
+            ] = {
+                id(path): (sample if request.collect else None, action)
+                for path, request, (sample, action) in zip(
+                    current_rows,
+                    current_requests,
+                    current_results,
+                )
+            }
+            for key, paths in frozen_groups.items():
+                policy = frozen_policies[key]
+                started = time.perf_counter()
+                if isinstance(policy, ModelPolicy):
+                    actions = policy.act_many(
+                        [path.env for path in paths],
+                        rngs=[path.rng for path in paths],
+                    )
+                else:
+                    actions = [
+                        policy.act(path.env, rng=path.rng)
+                        for path in paths
+                    ]
+                elapsed = time.perf_counter() - started
+                stats = self._active_collection_stats
+                if stats is not None and isinstance(policy, ModelPolicy):
+                    if self._active_historical_policy_ids is not None:
+                        self._active_historical_policy_ids.add(key)
+                        stats.historical_policy_count = len(
+                            self._active_historical_policy_ids
+                        )
+                    stats.historical_forward_sec += elapsed
+                    stats.historical_forward_calls += 1
+                    stats.historical_forward_rows += len(paths)
+                    stats.branch_forward_sec += elapsed
+                for path, action in zip(paths, actions):
+                    action_by_path[id(path)] = (None, action)
+
+            focal_candidates: list[
+                tuple[
+                    _RecursiveTreePath,
+                    RolloutSample,
+                    BidAction | PlayCardAction,
+                    tuple[BidAction | PlayCardAction, ...],
+                    tuple[float, ...],
+                    tuple[tuple[int, ...], ...],
+                ]
+            ] = []
+            for path in active:
+                sample, raw_action = action_by_path[id(path)]
+                if sample is None or len(path.env.legal_actions()) <= 1:
+                    continue
+                candidates, edge_probabilities, action_groups = (
+                    self._recursive_branch_candidates(
+                        path,
+                        sample,
+                        raw_action,
+                    )
+                )
+                # An expanded on-policy node must retain its actually sampled
+                # action as a child. If a rare sampled bid falls outside the
+                # top-K, continue it normally instead of replacing it or
+                # creating a fifth branch.
+                if path.on_policy_spine and raw_action not in candidates:
+                    continue
+                focal_candidates.append(
+                    (
+                        path,
+                        sample,
+                        raw_action,
+                        candidates,
+                        edge_probabilities,
+                        action_groups,
+                    )
+                )
+            self.rng.shuffle(focal_candidates)
+            stats = self._active_collection_stats
+            if stats is not None:
+                stats.branch_roots_available += len(focal_candidates)
+            approved: dict[int, tuple[tuple, tuple, tuple, bool]] = {}
+            projected_live = {
+                arm: sum(
+                    path.root.episode.opponent_arm == arm
+                    for path in active
+                )
+                for arm in ("self", "historical")
+            }
+            per_arm_active_cap = max(
+                1,
+                self.config.branch_max_active // 2,
+            )
+            for (
+                path,
+                sample,
+                raw_action,
+                candidates,
+                edge_probabilities,
+                action_groups,
+            ) in focal_candidates:
+                arm = path.root.episode.opponent_arm
+                remaining = self._remaining_round_decisions(path.env)
+                increment = (len(candidates) - 1) * remaining
+                if (
+                    committed[arm] + increment <= decision_budgets[arm]
+                    and projected_live[arm] + len(candidates) - 1
+                    <= per_arm_active_cap
+                ):
+                    keep = retained[arm] < retain_slots[arm]
+                    if keep:
+                        retained[arm] += 1
+                    approved[id(path)] = (
+                        candidates,
+                        edge_probabilities,
+                        action_groups,
+                        keep,
+                    )
+                    committed[arm] += increment
+                    projected_live[arm] += len(candidates) - 1
+                    if stats is not None:
+                        stats.branch_roots_expanded += 1
+                        if sample.phase == "bid":
+                            stats.branch_bid_roots += 1
+                        else:
+                            stats.branch_play_roots += 1
+
+            next_active: list[_RecursiveTreePath] = []
+            for path in active:
+                sample, raw_action = action_by_path[id(path)]
+                expansion = approved.get(id(path))
+                if expansion is None:
+                    if sample is not None and path.on_policy_spine:
+                        path.pending_spine_samples.append(sample)
+                    self._step_recursive_path(
+                        path,
+                        raw_action,
+                        next_active,
+                    )
+                    continue
+
+                candidates, edge_probabilities, action_groups, keep = expansion
+                if sample is None:
+                    raise RuntimeError("Approved branch has no focal sample.")
+                raw_index = _branch_action_index(raw_action)
+                decision = _RecursiveBranchDecision(
+                    sample=sample,
+                    candidate_actions=candidates,
+                    action_groups=action_groups,
+                    edge_probabilities=edge_probabilities,
+                    upstream=path.upstream,
+                    prefix_samples=list(path.pending_spine_samples),
+                    on_policy_spine=path.on_policy_spine,
+                    canonical_action_index=(
+                        raw_index if path.on_policy_spine else None
+                    ),
+                    retain_target=keep,
+                )
+                for action, edge_probability in zip(
+                    candidates,
+                    edge_probabilities,
+                ):
+                    action_index = _branch_action_index(action)
+                    child = _RecursiveTreePath(
+                        env=path.env.clone(),
+                        root=path.root,
+                        upstream=(decision, action_index),
+                        pending_spine_samples=[],
+                        on_policy_spine=(
+                            path.on_policy_spine
+                            and action_index == raw_index
+                        ),
+                        reach_probability=(
+                            path.reach_probability * edge_probability
+                        ),
+                        rng=random.Random(path.rng.getrandbits(63)),
+                    )
+                    self._step_recursive_path(
+                        child,
+                        action,
+                        next_active,
+                    )
+            active = next_active
+
+        for arm, root in roots.items():
+            if root.rollout_decisions != committed[arm]:
+                raise RuntimeError(
+                    "Recursive budget reservation mismatch: "
+                    f"arm={arm} committed={committed[arm]} "
+                    f"actual={root.rollout_decisions}."
+                )
+        return roots
+
+    def _recursive_branch_candidates(
+        self,
+        path: _RecursiveTreePath,
+        sample: RolloutSample,
+        raw_action: BidAction | PlayCardAction,
+    ) -> tuple[
+        tuple[BidAction | PlayCardAction, ...],
+        tuple[float, ...],
+        tuple[tuple[int, ...], ...],
+    ]:
+        del raw_action
+        legal = tuple(path.env.legal_actions())
+        probabilities = sample.old_policy_probabilities
+        if probabilities is None:
+            raise RuntimeError("Recursive branch sample is missing raw probabilities.")
+        if (
+            path.env.phase() == Phase.BIDDING
+            and self.config.branch_bid_max_actions > 0
+            and len(legal) > self.config.branch_bid_max_actions
+        ):
+            legal = tuple(
+                sorted(
+                    legal,
+                    key=lambda action: (
+                        -probabilities[_branch_action_index(action)],
+                        _branch_action_index(action),
+                    ),
+                )[: self.config.branch_bid_max_actions]
+            )
+        masses = tuple(
+            probabilities[_branch_action_index(action)]
+            for action in legal
+        )
+        total = sum(masses)
+        groups = tuple(
+            (_branch_action_index(action),)
+            for action in legal
+        )
+        return (
+            legal,
+            tuple(mass / total for mass in masses),
+            groups,
+        )
+
+    def _step_recursive_path(
+        self,
+        path: _RecursiveTreePath,
+        action: BidAction | PlayCardAction,
+        next_active: list[_RecursiveTreePath],
+    ) -> None:
+        started = time.perf_counter()
+        path.env.step(action)
+        path.root.rollout_decisions += 1
+        stats = self._active_collection_stats
+        if stats is not None:
+            stats.env_step_sec += time.perf_counter() - started
+        if path.env.is_done():
+            self._finish_recursive_path(path)
+        else:
+            next_active.append(path)
+
+    def _finish_recursive_path(self, path: _RecursiveTreePath) -> None:
+        result = RoundResult.from_round_state(path.env.state.current_round)
+        reward = compute_relative_rewards(result.round_scores)[
+            path.root.episode.focal_player
+        ]
+        if path.on_policy_spine:
+            path.root.canonical_result = result
+        self._complete_tree_samples(
+            path.pending_spine_samples,
+            reward,
+            result,
+            path.root,
+            supervised=True,
+        )
+        if path.upstream is not None:
+            self._resolve_recursive_edge(
+                path.upstream[0],
+                path.upstream[1],
+                reward,
+                result,
+                path.root,
+            )
+        if self._active_collection_stats is not None:
+            self._active_collection_stats.branch_terminal_rollouts += 1
+
+    def _resolve_recursive_edge(
+        self,
+        decision: _RecursiveBranchDecision,
+        action_index: int,
+        value: float,
+        result: RoundResult,
+        root: _RecursiveTreeRoot,
+    ) -> None:
+        decision.child_values[action_index] = value
+        decision.child_results[action_index] = result
+        if len(decision.child_values) < len(decision.candidate_actions):
+            return
+        indices = [
+            _branch_action_index(action)
+            for action in decision.candidate_actions
+        ]
+        backed_value = sum(
+            probability * decision.child_values[index]
+            for probability, index in zip(
+                decision.edge_probabilities,
+                indices,
+            )
+        )
+        canonical_result = (
+            decision.child_results[decision.canonical_action_index]
+            if decision.canonical_action_index is not None
+            else next(iter(decision.child_results.values()))
+        )
+        self._complete_tree_samples(
+            decision.prefix_samples,
+            backed_value,
+            canonical_result,
+            root,
+            supervised=decision.on_policy_spine,
+        )
+        sample = decision.sample
+        sample.ppo_policy_enabled = False
+        sample.branch_candidate_action_indices = indices
+        sample.branch_action_groups = [
+            list(group) for group in decision.action_groups
+        ]
+        sample.branch_prior_probabilities = list(decision.edge_probabilities)
+        sample.branch_action_values = [
+            decision.child_values[index]
+            for index in indices
+        ]
+        sample.return_target = backed_value
+        sample.value_target = backed_value - sample.position_intercept
+        sample.advantage_target = backed_value - sample.old_value
+        self._assign_tree_terminal_labels(
+            sample,
+            canonical_result,
+            root.episode.env.config.num_players,
+            supervised=decision.on_policy_spine,
+        )
+        if decision.retain_target:
+            root.samples.append(sample)
+            root.decisions.append(decision)
+        if decision.upstream is not None:
+            self._resolve_recursive_edge(
+                decision.upstream[0],
+                decision.upstream[1],
+                backed_value,
+                canonical_result,
+                root,
+            )
+
+    def _complete_tree_samples(
+        self,
+        samples: list[RolloutSample],
+        value: float,
+        result: RoundResult,
+        root: _RecursiveTreeRoot,
+        *,
+        supervised: bool,
+    ) -> None:
+        for sample in samples:
+            sample.return_target = value
+            sample.value_target = value - sample.position_intercept
+            sample.advantage_target = value - sample.old_value
+            self._assign_tree_terminal_labels(
+                sample,
+                result,
+                root.episode.env.config.num_players,
+                supervised=supervised,
+            )
+            root.samples.append(sample)
+
+    def _assign_tree_terminal_labels(
+        self,
+        sample: RolloutSample,
+        result: RoundResult,
+        num_players: int,
+        *,
+        supervised: bool,
+    ) -> None:
+        if supervised:
+            sample.final_trick_targets = _final_tricks_relative(
+                result.tricks_won,
+                sample.acting_player,
+                num_players,
+                self.config.model_config,
+            )
+            sample.final_bid_targets = _final_bids_relative(
+                result.bids,
+                sample.acting_player,
+                num_players,
+                self.config.model_config,
+            )
+            return
+        sample.final_trick_targets = [-100] * self.config.model_config.max_players
+        sample.final_bid_targets = [-100] * self.config.model_config.max_players
+        sample.owner_targets = [-100] * NUM_CARDS
+        sample.suit_presence_targets = [
+            [-100] * len(SUITS)
+            for _ in range(self.config.model_config.max_players)
+        ]
+
     def _collect_round_rollouts(self, *, iteration: int = 1) -> RolloutBuffer:
         buffer = RolloutBuffer()
         schedule = self.balanced_round_schedule()
+        if self.config.branch_rollouts and not self.historical_snapshots:
+            raise RuntimeError(
+                "Terminal branch collection requires at least one historical snapshot."
+            )
         next_episode_id = 0
         active: list[_ActiveEpisode] = []
+        branch_roots: list[_BranchRoot] = []
         pending_baseline_updates: list[tuple[PositionKey, float]] = []
 
         for _ in range(min(self.config.num_envs, len(schedule))):
@@ -756,6 +1918,22 @@ class PPOTrainer:
                         sample, action = sampled[episode.episode_id]
                         if acting_player in episode.trainable_players:
                             episode.samples.append(sample)
+                            if (
+                                self.config.branch_rollouts
+                                and acting_player == episode.focal_player
+                                and len(episode.env.legal_actions()) > 1
+                            ):
+                                branch_roots.append(
+                                    _BranchRoot(
+                                        env=episode.env.clone(),
+                                        sample=sample,
+                                        opponent_policies=dict(
+                                            episode.opponent_policies
+                                        ),
+                                        focal_player=episode.focal_player,
+                                        opponent_arm=episode.opponent_arm,
+                                    )
+                                )
                     else:
                         action = opponent_actions[episode.episode_id]
                     step_started = time.perf_counter()
@@ -788,12 +1966,352 @@ class PPOTrainer:
                         next_active.append(episode)
                 active = next_active
 
+        if self.config.branch_rollouts:
+            self._collect_terminal_branches(branch_roots, buffer)
+            decisions_by_arm = {
+                arm: sum(
+                    sample.opponent_arm == arm
+                    for sample in buffer.samples
+                )
+                for arm in ("self", "historical")
+            }
+            if decisions_by_arm["self"] != decisions_by_arm["historical"]:
+                raise RuntimeError(
+                    "Matched branch collection produced unequal focal "
+                    f"decision counts: {decisions_by_arm!r}."
+                )
         self._assign_round_weights(buffer)
         self.position_baseline.update_many(pending_baseline_updates)
         self._update_league_ema(buffer.round_outcomes)
         if len(buffer.round_outcomes) != self.config.rounds_per_batch:
             raise RuntimeError("Balanced collection did not complete the requested schedule.")
         return buffer
+
+    def _collect_terminal_branches(
+        self,
+        roots: list[_BranchRoot],
+        buffer: RolloutBuffer,
+    ) -> None:
+        """Evaluate focal alternatives with streamed raw-policy rollouts.
+
+        The reached environment contains the sampled hidden deal, but the
+        policy is still called only through ``get_observation``.  A side
+        rollout therefore cannot see hidden cards.  It is an intervention on
+        one action in a legitimate Monte Carlo deal, and its terminal focal
+        score estimates that action's information-state value across deals.
+        """
+
+        stats = self._active_collection_stats
+        if stats is not None:
+            stats.branch_roots_available = len(roots)
+        usable: dict[OpponentArm, list[_BranchRoot]] = {
+            "self": [],
+            "historical": [],
+        }
+        for root in roots:
+            candidates = self._branch_candidate_actions(root)
+            if len(candidates) <= 1:
+                continue
+            root.candidate_actions = tuple(candidates)
+            if root.opponent_arm in usable:
+                usable[root.opponent_arm].append(root)
+
+        scheduled: list[tuple[_BranchRoot, int, int]] = []
+        budget = self.config.branch_decision_budget_per_arm
+        for arm in ("self", "historical"):
+            rows = usable[arm]
+            spent = 0
+            for replicate in range(self.config.branch_max_replicates):
+                order = list(rows)
+                self.rng.shuffle(order)
+                added = False
+                for root in order:
+                    cost = (
+                        len(root.candidate_actions)
+                        * self._remaining_round_decisions(root.env)
+                    )
+                    if spent + cost > budget:
+                        continue
+                    seed = self.rng.randrange(2**31)
+                    scheduled.append((root, replicate, seed))
+                    spent += cost
+                    added = True
+                if not added or spent >= budget:
+                    break
+
+        trajectories: deque[_BranchTrajectory] = deque()
+        for root, _, seed in scheduled:
+            for action in root.candidate_actions:
+                env = root.env.clone()
+                started = time.perf_counter()
+                env.step(action)
+                if stats is not None:
+                    stats.env_step_sec += time.perf_counter() - started
+                    self._record_branch_decision(stats, root.opponent_arm)
+                trajectory = _BranchTrajectory(
+                    env=env,
+                    root=root,
+                    action_index=_branch_action_index(action),
+                    # Every sibling action in this replicate gets the same
+                    # random tape.  ModelPolicy consumes one uniform draw per
+                    # table decision, giving paired/common-random-number
+                    # continuation comparisons without changing marginals.
+                    rng=random.Random(seed),
+                )
+                if env.is_done():
+                    self._finish_branch_trajectory(trajectory)
+                else:
+                    trajectories.append(trajectory)
+
+        if trajectories:
+            self._run_branch_trajectories(trajectories)
+        self._attach_branch_targets(roots, buffer)
+
+    def _branch_candidate_actions(
+        self,
+        root: _BranchRoot,
+    ) -> list[BidAction | PlayCardAction]:
+        legal = root.env.legal_actions()
+        if root.env.phase() != Phase.BIDDING:
+            # Hand sizes are at most ten in this model; exhaustive legal-card
+            # branching is both tractable and removes proposal bias.
+            return legal
+        limit = min(self.config.branch_bid_max_actions, len(legal))
+        if len(legal) <= limit:
+            return legal
+        probabilities = root.sample.old_policy_probabilities
+        if probabilities is None:
+            raise RuntimeError("Branch root is missing raw policy probabilities.")
+        ranked = sorted(
+            legal,
+            key=lambda action: probabilities[_branch_action_index(action)],
+            reverse=True,
+        )
+        top_count = min(3, limit)
+        selected = ranked[:top_count]
+        remainder = ranked[top_count:]
+        if len(selected) < limit and remainder:
+            # The fourth bid is deliberately broad but still a legal action;
+            # no temperature or behavior mixture is involved.
+            selected.append(self.rng.choice(remainder))
+        return selected
+
+    @staticmethod
+    def _remaining_round_decisions(env: PlumpEnv) -> int:
+        round_state = env.state.current_round
+        players = env.config.num_players
+        if env.phase() == Phase.BIDDING:
+            return (
+                players - len(round_state.bids)
+                + players * round_state.hand_size
+            )
+        if env.phase() == Phase.PLAYING:
+            played = sum(len(trick.plays) for trick in round_state.tricks)
+            return players * round_state.hand_size - played
+        return 0
+
+    @staticmethod
+    def _record_branch_decision(
+        stats: CollectionStats,
+        arm: OpponentArm,
+    ) -> None:
+        if arm == "self":
+            stats.branch_self_decisions += 1
+        elif arm == "historical":
+            stats.branch_historical_decisions += 1
+
+    def _run_branch_trajectories(
+        self,
+        queued: deque[_BranchTrajectory],
+    ) -> None:
+        current_policy = ModelPolicy(
+            self._collection_model(),
+            device=self.device,
+            greedy=False,
+            include_game_context=self.config.include_game_context,
+            precision=self.config.precision,
+            event_length_buckets=self.config.event_length_buckets,
+            batch_packing=self.config.batch_packing,
+            lean_action_forward=self.config.lean_rollout_forward,
+            name="branch-current",
+        )
+        active: list[_BranchTrajectory] = []
+        max_active = self.config.branch_max_active
+        while queued or active:
+            while queued and len(active) < max_active:
+                active.append(queued.popleft())
+
+            grouped: dict[int, list[_BranchTrajectory]] = defaultdict(list)
+            policies: dict[int, ActionPolicy] = {}
+            current_policy_ids: set[int] = set()
+            for trajectory in active:
+                player = trajectory.env.current_player()
+                policy = (
+                    current_policy
+                    if (
+                        player == trajectory.root.focal_player
+                        or trajectory.root.opponent_policies.get(player) is None
+                    )
+                    else trajectory.root.opponent_policies[player]
+                )
+                key = id(policy)
+                grouped[key].append(trajectory)
+                policies[key] = policy
+                if policy is current_policy:
+                    current_policy_ids.add(key)
+
+            selected: dict[int, BidAction | PlayCardAction] = {}
+            for key, rows in grouped.items():
+                policy = policies[key]
+                started = time.perf_counter()
+                if isinstance(policy, ModelPolicy):
+                    actions = policy.act_many(
+                        [row.env for row in rows],
+                        rngs=[row.rng for row in rows],
+                    )
+                else:
+                    actions = [
+                        policy.act(row.env, rng=row.rng)
+                        for row in rows
+                    ]
+                elapsed = time.perf_counter() - started
+                stats = self._active_collection_stats
+                if stats is not None:
+                    stats.branch_forward_sec += elapsed
+                    if key in current_policy_ids:
+                        stats.current_forward_sec += elapsed
+                        stats.current_forward_calls += 1
+                        stats.current_forward_rows += len(rows)
+                    elif isinstance(policy, ModelPolicy):
+                        stats.historical_forward_sec += elapsed
+                        stats.historical_forward_calls += 1
+                        stats.historical_forward_rows += len(rows)
+                selected.update(
+                    (id(row), action)
+                    for row, action in zip(rows, actions)
+                )
+
+            remaining: list[_BranchTrajectory] = []
+            for trajectory in active:
+                step_started = time.perf_counter()
+                trajectory.env.step(selected[id(trajectory)])
+                stats = self._active_collection_stats
+                if stats is not None:
+                    stats.env_step_sec += time.perf_counter() - step_started
+                    self._record_branch_decision(
+                        stats,
+                        trajectory.root.opponent_arm,
+                    )
+                if trajectory.env.is_done():
+                    self._finish_branch_trajectory(trajectory)
+                else:
+                    remaining.append(trajectory)
+            active = remaining
+
+    def _finish_branch_trajectory(
+        self,
+        trajectory: _BranchTrajectory,
+    ) -> None:
+        rewards = compute_relative_rewards(
+            trajectory.env.state.current_round.round_scores
+        )
+        trajectory.root.returns_by_action[trajectory.action_index].append(
+            rewards[trajectory.root.focal_player]
+        )
+        if self._active_collection_stats is not None:
+            self._active_collection_stats.branch_terminal_rollouts += 1
+
+    def _attach_branch_targets(
+        self,
+        roots: list[_BranchRoot],
+        buffer: RolloutBuffer,
+    ) -> None:
+        rewards_by_cell: dict[tuple[RoundSpec, OpponentArm], list[float]] = (
+            defaultdict(list)
+        )
+        for outcome in buffer.round_outcomes:
+            if outcome.focal_reward is not None:
+                rewards_by_cell[(outcome.spec, outcome.opponent_arm)].append(
+                    float(outcome.focal_reward)
+                )
+
+        expanded = 0
+        bid_roots = 0
+        play_roots = 0
+        for root in roots:
+            if not root.candidate_actions:
+                continue
+            indices = [
+                _branch_action_index(action)
+                for action in root.candidate_actions
+            ]
+            if any(not root.returns_by_action[index] for index in indices):
+                continue
+            action_values = [
+                _mean(root.returns_by_action[index])
+                for index in indices
+            ]
+            probabilities = root.sample.old_policy_probabilities
+            if probabilities is None:
+                raise RuntimeError("Branch target is missing its policy prior.")
+            conditional_prior = [max(probabilities[index], 0.0) for index in indices]
+            prior_total = sum(conditional_prior)
+            if prior_total <= 1e-12:
+                conditional_prior = [1.0 / len(indices)] * len(indices)
+            else:
+                conditional_prior = [value / prior_total for value in conditional_prior]
+            baseline = sum(
+                probability * value
+                for probability, value in zip(
+                    conditional_prior,
+                    action_values,
+                )
+            )
+            cell_rewards = rewards_by_cell[(root.sample.spec, root.opponent_arm)]
+            scale = max(_std(cell_rewards), 1.0)
+            support = self.config.branch_support_floor
+            uniform = 1.0 / len(indices)
+            logits = []
+            for probability, value in zip(conditional_prior, action_values):
+                anchored = (1.0 - support) * probability + support * uniform
+                normalized_advantage = (value - baseline) / (
+                    self.config.branch_target_temperature * scale
+                )
+                normalized_advantage = max(
+                    -self.config.branch_advantage_clip,
+                    min(
+                        self.config.branch_advantage_clip,
+                        normalized_advantage,
+                    ),
+                )
+                logits.append(math.log(max(anchored, 1e-12)) + normalized_advantage)
+            peak = max(logits)
+            weights = [math.exp(value - peak) for value in logits]
+            total = sum(weights)
+            targets = [weight / total for weight in weights]
+
+            sample = root.sample
+            sample.branch_candidate_action_indices = indices
+            sample.branch_target_probabilities = targets
+            sample.branch_action_values = action_values
+            sample.ppo_policy_enabled = False
+            # A full legal-card sweep gives an on-policy expectation target
+            # for the critic.  Bid sweeps are intentionally partial, so they
+            # retain the ordinary raw-spine value target.
+            if sample.phase == "play":
+                sample.return_target = baseline
+                sample.value_target = baseline - sample.position_intercept
+                sample.advantage_target = baseline - sample.old_value
+            expanded += 1
+            if sample.phase == "bid":
+                bid_roots += 1
+            else:
+                play_roots += 1
+
+        if self._active_collection_stats is not None:
+            self._active_collection_stats.branch_roots_expanded = expanded
+            self._active_collection_stats.branch_bid_roots = bid_roots
+            self._active_collection_stats.branch_play_roots = play_roots
 
     def _collect_round_rollouts_workers(self, *, iteration: int = 1) -> RolloutBuffer:
         """Round collection with env stepping/encoding in worker processes.
@@ -837,7 +2355,9 @@ class PPOTrainer:
             for player, policy in opponent_policies.items():
                 if policy is None:
                     seat_policy_refs[player] = (
-                        "current-frozen" if arm in EXPLORE_ARMS else "current"
+                        "current-frozen"
+                        if arm in FOCAL_ONLY_ARMS
+                        else "current"
                     )
                 elif policy is self.heuristic_policy:
                     seat_policy_refs[player] = "heuristic"
@@ -1064,6 +2584,11 @@ class PPOTrainer:
             dtype=torch.float32,
             device=self.device,
         )
+        branch_enabled = torch.tensor(
+            [sample.branch_action_values is not None for sample in samples],
+            dtype=torch.float32,
+            device=self.device,
+        )
         enabled_advantages = raw_advantages[policy_enabled.bool()]
         if len(enabled_advantages) > 0:
             advantages = (
@@ -1077,6 +2602,55 @@ class PPOTrainer:
             event_length_buckets=self.config.event_length_buckets,
             packing=self.config.batch_packing,
         )
+        magnet_output: PolicyModelOutput | None = None
+        if self.magnet_model is not None:
+            # The magnet is frozen for the entire PPO update, while the same
+            # rollout states are reused for every epoch. Cache its small
+            # action-head output once instead of rerunning the transformer for
+            # every shuffled microbatch in every epoch.
+            magnet_bid_logits: list[Tensor] = []
+            magnet_card_logits: list[Tensor] = []
+            cache_batch_size = (
+                self.config.microbatch_size
+                or self.config.minibatch_size
+            )
+            with torch.no_grad(), model_autocast(
+                self.device,
+                self.config.precision,
+            ):
+                for cache_start in range(0, len(samples), cache_batch_size):
+                    cache_indices = torch.arange(
+                        cache_start,
+                        min(cache_start + cache_batch_size, len(samples)),
+                        dtype=torch.long,
+                        device=self.device,
+                    )
+                    cache_batch = index_model_batch(
+                        staged_batch,
+                        cache_indices,
+                    )
+                    cache_output = (
+                        self.magnet_model.forward_policy(cache_batch)
+                        if self.config.lean_rollout_forward
+                        else self.magnet_model(cache_batch, need_owner=False)
+                    )
+                    magnet_bid_logits.append(
+                        cache_output.masked_bid_logits.detach()
+                    )
+                    magnet_card_logits.append(
+                        cache_output.masked_card_logits.detach()
+                    )
+            magnet_output = PolicyModelOutput(
+                masked_bid_logits=torch.cat(magnet_bid_logits),
+                masked_card_logits=torch.cat(magnet_card_logits),
+            )
+            del (
+                cache_batch,
+                cache_indices,
+                cache_output,
+                magnet_bid_logits,
+                magnet_card_logits,
+            )
         old_logprobs = torch.tensor(
             [sample.old_logprob for sample in samples],
             dtype=torch.float32,
@@ -1136,6 +2710,7 @@ class PPOTrainer:
         try:
             for epoch_index in range(self.config.ppo_epochs):
                 epoch_kl_values: list[Tensor] = []
+                epoch_branch_kl_values: list[Tensor] = []
                 self._update_rng.shuffle(indices)
                 for start in range(0, len(indices), self.config.minibatch_size):
                     logical_selected = indices[start : start + self.config.minibatch_size]
@@ -1176,6 +2751,10 @@ class PPOTrainer:
                         mb_old_policy_logprobs = old_policy_logprobs.index_select(0, selected_tensor)
                         weights = round_weights.index_select(0, selected_tensor)
                         mb_policy_enabled = policy_enabled.index_select(0, selected_tensor)
+                        mb_branch_enabled = branch_enabled.index_select(
+                            0,
+                            selected_tensor,
+                        )
                         batch = index_model_batch(staged_batch, selected_tensor)
                         mb_owner_targets = owner_targets.index_select(0, selected_tensor)
                         with model_autocast(self.device, self.config.precision):
@@ -1183,6 +2762,7 @@ class PPOTrainer:
                                 batch,
                                 need_owner=train_owner,
                                 detach_owner_trunk=detach_owner_trunk,
+                                detach_belief_trunk=self.config.belief_head_only,
                                 privileged_owner_targets=(
                                     mb_owner_targets
                                     if self.config.oracle_critic
@@ -1190,16 +2770,24 @@ class PPOTrainer:
                                 ),
                             )
                         new_logprobs, entropy_by_sample = self._logprobs_and_entropy(output, mb_samples)
-                        if self.magnet_model is not None:
-                            with torch.no_grad(), model_autocast(self.device, self.config.precision):
-                                magnet_output = (
-                                    self.magnet_model.forward_policy(batch)
-                                    if self.config.lean_rollout_forward
-                                    else self.magnet_model(batch, need_owner=False)
-                                )
+                        if magnet_output is not None:
+                            selected_magnet_output = PolicyModelOutput(
+                                masked_bid_logits=(
+                                    magnet_output.masked_bid_logits.index_select(
+                                        0,
+                                        selected_tensor,
+                                    )
+                                ),
+                                masked_card_logits=(
+                                    magnet_output.masked_card_logits.index_select(
+                                        0,
+                                        selected_tensor,
+                                    )
+                                ),
+                            )
                             magnet_kl_by_sample = self._magnet_kl_terms(
                                 output,
-                                magnet_output,
+                                selected_magnet_output,
                                 mb_samples,
                             )
                         else:
@@ -1241,6 +2829,15 @@ class PPOTrainer:
                         policy_scale = objective_scale * mb_policy_enabled
                         policy_loss = (policy_scale * policy_terms).sum() / logical_count
                         entropy = (policy_scale * entropy_by_sample).sum() / logical_count
+                        (
+                            branch_terms,
+                            branch_kl_by_sample,
+                            branch_target_entropy_by_sample,
+                        ) = self._branch_policy_terms(output, mb_samples)
+                        branch_scale = objective_scale * mb_branch_enabled
+                        branch_policy_loss = (
+                            branch_scale * branch_terms
+                        ).sum() / logical_count
                         if magnet_kl_by_sample is not None:
                             magnet_kl = (
                                 (policy_scale * magnet_kl_by_sample).sum() / logical_count
@@ -1335,6 +2932,8 @@ class PPOTrainer:
                         )
                         total_loss = (
                             policy_loss
+                            + self.config.branch_policy_coef
+                            * branch_policy_loss
                             + self.config.value_coef * value_loss
                             + self.config.oracle_value_coef * oracle_value_loss
                             + self.config.mmd_coef * magnet_kl
@@ -1372,6 +2971,7 @@ class PPOTrainer:
                             ).sum()
                             clip_fraction = (
                                 mb_policy_enabled
+                                * policy_sampling_weight
                                 * (
                                     (
                                         policy_log_ratio_grad
@@ -1387,6 +2987,15 @@ class PPOTrainer:
                             "enabled_count": mb_policy_enabled.sum(),
                             "total_loss": total_loss,
                             "policy_loss": policy_loss,
+                            "branch_policy_loss": branch_policy_loss,
+                            "branch_kl": (
+                                mb_branch_enabled * branch_kl_by_sample
+                            ).sum(),
+                            "branch_target_entropy": (
+                                mb_branch_enabled
+                                * branch_target_entropy_by_sample
+                            ).sum(),
+                            "branch_enabled_count": mb_branch_enabled.sum(),
                             "value_loss": value_loss,
                             "oracle_value_loss": oracle_value_loss,
                             "magnet_kl": magnet_kl,
@@ -1417,9 +3026,21 @@ class PPOTrainer:
                         skipped_steps += 1
 
                     enabled_total = step_values.pop("enabled_count").clamp_min(1.0)
+                    branch_enabled_total = step_values.pop(
+                        "branch_enabled_count"
+                    ).clamp_min(1.0)
                     step_values["approx_kl"] = step_values["approx_kl"] / enabled_total
                     step_values["clip_fraction"] = step_values["clip_fraction"] / enabled_total
+                    step_values["branch_kl"] = (
+                        step_values["branch_kl"] / branch_enabled_total
+                    )
+                    step_values["branch_target_entropy"] = (
+                        step_values["branch_target_entropy"]
+                        / branch_enabled_total
+                    )
                     epoch_kl_values.append(step_values["approx_kl"])
+                    if float(branch_enabled_total) > 1.0:
+                        epoch_branch_kl_values.append(step_values["branch_kl"])
                     for key, value in step_values.items():
                         metric_values[key].append(value)
 
@@ -1428,6 +3049,12 @@ class PPOTrainer:
                     self.config.target_kl is not None
                     and epoch_kl_values
                     and float(torch.stack(epoch_kl_values).mean()) > self.config.target_kl
+                ):
+                    break
+                if (
+                    epoch_branch_kl_values
+                    and float(torch.stack(epoch_branch_kl_values).mean())
+                    > self.config.branch_kl_cap
                 ):
                     break
         finally:
@@ -1442,6 +3069,10 @@ class PPOTrainer:
         return UpdateStats(
             total_loss=totals["total_loss"],
             policy_loss=totals["policy_loss"],
+            branch_policy_loss=totals["branch_policy_loss"],
+            branch_kl=totals["branch_kl"],
+            branch_target_entropy=totals["branch_target_entropy"],
+            branch_samples=int(branch_enabled.sum().item()),
             value_loss=totals["value_loss"],
             oracle_value_loss=totals["oracle_value_loss"],
             magnet_kl=totals["magnet_kl"],
@@ -1550,12 +3181,26 @@ class PPOTrainer:
             historical_relative_reward=arm_reward("historical"),
             explore_self_relative_reward=arm_reward("explore_self"),
             explore_historical_relative_reward=arm_reward("explore_historical"),
+            tempered_self_relative_reward=arm_reward("tempered_self"),
+            tempered_historical_relative_reward=arm_reward(
+                "tempered_historical"
+            ),
+            capped_self_relative_reward=arm_reward("capped_self"),
+            capped_historical_relative_reward=arm_reward("capped_historical"),
+            epsilon_self_relative_reward=arm_reward("epsilon_self"),
+            epsilon_historical_relative_reward=arm_reward("epsilon_historical"),
             self_play_rounds=arm_rounds("self"),
             heuristic_rounds=arm_rounds("heuristic"),
             mixed_rounds=arm_rounds("mixed"),
             historical_rounds=arm_rounds("historical"),
             explore_self_rounds=arm_rounds("explore_self"),
             explore_historical_rounds=arm_rounds("explore_historical"),
+            tempered_self_rounds=arm_rounds("tempered_self"),
+            tempered_historical_rounds=arm_rounds("tempered_historical"),
+            capped_self_rounds=arm_rounds("capped_self"),
+            capped_historical_rounds=arm_rounds("capped_historical"),
+            epsilon_self_rounds=arm_rounds("epsilon_self"),
+            epsilon_historical_rounds=arm_rounds("epsilon_historical"),
             return_mean=_mean(returns),
             return_std=_std(returns),
             old_value_mean=_mean(old_values),
@@ -2011,8 +3656,11 @@ class PPOTrainer:
         stored_owner_active = payload.get("owner_active_since")
         if stored_owner_active is not None:
             self.owner_active_since = int(stored_owner_active)
+        optimizer_group_migrated = False
         if load_optimizer:
-            self.optimizer.load_state_dict(payload["optimizer_state_dict"])
+            optimizer_group_migrated = self._load_optimizer_state_dict(
+                payload["optimizer_state_dict"]
+            )
         league = payload.get("league", {})
         # Restore payoff cells before snapshots are re-added so admission-time
         # payoff fills skip every already-known pair instead of re-evaluating.
@@ -2052,6 +3700,7 @@ class PPOTrainer:
             "path": str(path),
             "iteration": payload.get("iteration"),
             "optimizer_loaded": load_optimizer,
+            "optimizer_group_migrated": optimizer_group_migrated,
             "schema_version": payload["schema_version"],
             "league_snapshots_loaded": len(self.historical_snapshots),
             "league_snapshots_missing": missing_snapshots,
@@ -2514,12 +4163,23 @@ class PPOTrainer:
             "historical": self.config.historical_fraction,
             "explore_self": self.config.explore_self_fraction,
             "explore_historical": self.config.explore_historical_fraction,
+            "tempered_self": self.config.tempered_self_fraction,
+            "tempered_historical": self.config.tempered_historical_fraction,
+            "capped_self": self.config.capped_self_fraction,
+            "capped_historical": self.config.capped_historical_fraction,
+            "epsilon_self": self.config.epsilon_self_fraction,
+            "epsilon_historical": self.config.epsilon_historical_fraction,
         }
         if not self.historical_policies:
-            fractions["self"] += fractions["historical"]
-            fractions["historical"] = 0.0
-            fractions["explore_self"] += fractions["explore_historical"]
-            fractions["explore_historical"] = 0.0
+            for self_arm, historical_arm in (
+                ("self", "historical"),
+                ("explore_self", "explore_historical"),
+                ("tempered_self", "tempered_historical"),
+                ("capped_self", "capped_historical"),
+                ("epsilon_self", "epsilon_historical"),
+            ):
+                fractions[self_arm] += fractions[historical_arm]
+                fractions[historical_arm] = 0.0
         return fractions
 
     def _allocate_opponent_arms(
@@ -2555,10 +4215,14 @@ class PPOTrainer:
             spec=spec,
             episode_id=episode_id,
             opponent_arm=arm,
-            trainable_players=_trainable_players(
-                focal_player,
-                arm,
-                opponent_policies,
+            trainable_players=(
+                frozenset({focal_player})
+                if self.config.branch_rollouts
+                else _trainable_players(
+                    focal_player,
+                    arm,
+                    opponent_policies,
+                )
             ),
             opponent_policies=opponent_policies,
             focal_player=focal_player,
@@ -2637,20 +4301,20 @@ class PPOTrainer:
         # the round outcome attributes cleanly to that snapshot's league EMA.
         episode_snapshot: LeagueSnapshot | None = (
             self._draw_historical_snapshot()
-            if arm in ("historical", "explore_historical")
+            if arm in HISTORICAL_ARMS
             else None
         )
         for player in range(num_players):
             if player == focal_player:
                 continue
-            if arm in ("self", "explore_self"):
-                # None = current weights. On explore_self tables the caller
-                # marks these seats non-trainable, so they act as frozen raw
-                # copies of the current policy.
+            if arm in SELF_PLAY_ARMS:
+                # None = current weights. On exploration tables the caller
+                # marks non-focal seats non-trainable, so they act as frozen
+                # raw copies of the current policy.
                 policy = None
             elif arm == "heuristic":
                 policy = self.heuristic_policy
-            elif arm in ("historical", "explore_historical"):
+            elif arm in HISTORICAL_ARMS:
                 policy = episode_snapshot.policy
             else:
                 # Mixed tables seat current policy and historical snapshots
@@ -2796,7 +4460,7 @@ class PPOTrainer:
         # Arm check precedes any rng draw so non-explore rounds consume the
         # same number of draws on both collection paths.
         probability = self.config.explore_uniform_round_probability
-        if probability <= 0.0 or arm not in EXPLORE_ARMS:
+        if probability <= 0.0 or arm not in TEMPERED_ARMS:
             return None
         if self.rng.random() >= probability * self._hand_noise_scale(hand_size):
             return None
@@ -2823,6 +4487,14 @@ class PPOTrainer:
             else self.config.explore_temperature_play
         )
         return 1.0 + (base - 1.0) * self._hand_noise_scale(request.hand_size)
+
+    def _request_explore_argmax_cap(
+        self,
+        request: DecisionRequest,
+    ) -> float:
+        if not request.collect or request.opponent_arm not in CAPPED_ARMS:
+            return 1.0
+        return self.config.explore_argmax_cap
 
     def _forward_decision_rows(
         self,
@@ -2888,17 +4560,27 @@ class PPOTrainer:
         temperature_values = [
             self._request_explore_temperature(request) for request in requests
         ]
+        argmax_cap_values = [
+            self._request_explore_argmax_cap(request) for request in requests
+        ]
         tempered_any = any(value != 1.0 for value in temperature_values)
-        if tempered_any or any(eps > 0.0 for eps in eps_values):
-            # Behavior policy = (1-eps)*softmax(logits/T) + eps*uniform-over-
-            # legal. The temperature flattens the current policy on designated
-            # rounds so rollouts visit more diverse trajectories; eps keeps
-            # rare strategies (e.g. extreme bids) at a guaranteed trial rate
-            # even once the policy is sharp. Sampling AND old_logprob both use
-            # this behavior distribution, which keeps the PPO ratio
-            # importance-correct — the update itself stays standard. Both
-            # knobs are per request (opponent arm x phase x round flag), so
-            # rows from different exploration regimes share one forward batch.
+        capped_any = any(value < 1.0 for value in argmax_cap_values)
+        if (
+            tempered_any
+            or capped_any
+            or any(eps > 0.0 for eps in eps_values)
+        ):
+            # Behavior policy = (1-eps)*softmax(logits/T) + eps*exploration,
+            # optionally replacing the base on capped-arm rows with
+            # cap*argmax + (1-cap)*softmax(other legal logits / rest_T).
+            # Dedicated epsilon arms explore uniformly over legal NON-argmax
+            # actions.  A round's one deliberately selected deviation instead
+            # samples NON-argmax alternatives according to their tempered
+            # policy logits, avoiding a uniform jump to nonsensical tail
+            # actions. Legacy epsilon knobs retain uniform-over-all-legal
+            # behavior. Sampling AND old_logprob both use this exact mixture,
+            # keeping PPO importance correction valid while all regimes share
+            # one forward batch.
             if tempered_any:
                 temperature_column = torch.tensor(
                     temperature_values,
@@ -2910,15 +4592,54 @@ class PPOTrainer:
                 ).probs
             else:
                 base_probs = distribution.probs
+            if capped_any:
+                capped_rows = torch.tensor(
+                    [value < 1.0 for value in argmax_cap_values],
+                    dtype=torch.bool,
+                    device=masked_logits.device,
+                ).unsqueeze(-1)
+                capped_probs = _argmax_capped_probabilities(
+                    masked_logits,
+                    self.config.explore_argmax_cap,
+                    self.config.explore_argmax_rest_temperature,
+                )
+                base_probs = torch.where(
+                    capped_rows,
+                    capped_probs,
+                    base_probs,
+                )
             legal = masked_logits > torch.finfo(masked_logits.dtype).min / 2
             uniform = legal.float() / legal.sum(dim=-1, keepdim=True).clamp_min(1)
+            epsilon_arm_rows = torch.tensor(
+                [request.opponent_arm in EPSILON_ARMS for request in requests],
+                dtype=torch.bool,
+                device=masked_logits.device,
+            ).unsqueeze(-1)
+            single_deviation_rows = torch.tensor(
+                [request.explore_uniform for request in requests],
+                dtype=torch.bool,
+                device=masked_logits.device,
+            ).unsqueeze(-1)
+            epsilon_exploration = torch.where(
+                single_deviation_rows,
+                _non_argmax_tempered_probabilities(
+                    masked_logits,
+                    self.config.explore_single_deviation_temperature,
+                ),
+                torch.where(
+                    epsilon_arm_rows,
+                    _non_argmax_uniform_probabilities(masked_logits),
+                    uniform,
+                ),
+            )
             eps_column = torch.tensor(
                 eps_values,
                 dtype=torch.float32,
                 device=masked_logits.device,
             ).unsqueeze(-1)
             behavior = Categorical(
-                probs=(1.0 - eps_column) * base_probs + eps_column * uniform,
+                probs=(1.0 - eps_column) * base_probs
+                + eps_column * epsilon_exploration,
             )
             action_indices = behavior.sample()
             sample_logprobs = behavior.log_prob(action_indices)
@@ -2946,6 +4667,11 @@ class PPOTrainer:
             ),
             dim=-1,
         ).cpu().tolist()
+        policy_probability_rows = (
+            distribution.probs.float().cpu().tolist()
+            if self.config.branch_rollouts
+            else [None] * len(requests)
+        )
         results: list[tuple[RolloutSample, BidAction | PlayCardAction]] = []
         for index, request in enumerate(requests):
             (
@@ -2994,6 +4720,7 @@ class PPOTrainer:
                 observation=request.observation,
                 trick_position=request.trick_position,
                 round_progress=request.round_progress,
+                old_policy_probabilities=policy_probability_rows[index],
             )
             results.append((sample, action))
         stats = self._active_collection_stats
@@ -3258,6 +4985,112 @@ class PPOTrainer:
             entropies[indices] = distribution.entropy()
         return logprobs, entropies
 
+    def _branch_policy_terms(
+        self,
+        output,
+        samples: list[RolloutSample],
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        """Full-information clipped PPO over counterfactual action values.
+
+        Every expanded node supplies Q(s, a) for each action group and the
+        collecting policy's group masses.  Centering those values under the
+        old policy gives the direct counterfactual advantage
+
+            A(s, a) = Q(s, a) - sum_b pi_old(b|s) Q(s, b).
+
+        The old masses integrate the PPO surrogate over every evaluated
+        action instead of inventing a temperature-shaped target policy.
+        """
+
+        losses: list[Tensor] = []
+        divergences: list[Tensor] = []
+        unused_target_entropies: list[Tensor] = []
+        for row, sample in enumerate(samples):
+            logits = (
+                output.masked_bid_logits[row].float()
+                if sample.phase == "bid"
+                else output.masked_card_logits[row].float()
+            )
+            indices = sample.branch_candidate_action_indices
+            values = sample.branch_action_values
+            prior = sample.branch_prior_probabilities
+            if indices is None or values is None or prior is None:
+                zero = torch.zeros((), dtype=torch.float32, device=logits.device)
+                losses.append(zero)
+                divergences.append(zero)
+                unused_target_entropies.append(zero)
+                continue
+            groups = sample.branch_action_groups or [
+                [index] for index in indices
+            ]
+            grouped_logits = []
+            for group in groups:
+                group_indices = torch.tensor(
+                    group,
+                    dtype=torch.long,
+                    device=logits.device,
+                )
+                grouped_logits.append(
+                    torch.logsumexp(
+                        logits.index_select(0, group_indices),
+                        dim=0,
+                    )
+                )
+            candidate_logprobs = torch.log_softmax(
+                torch.stack(grouped_logits),
+                dim=-1,
+            )
+            old = torch.tensor(
+                prior,
+                dtype=torch.float32,
+                device=logits.device,
+            )
+            old = old / old.sum().clamp_min(1e-12)
+            action_values = torch.tensor(
+                values,
+                dtype=torch.float32,
+                device=logits.device,
+            )
+            baseline = (old * action_values).sum()
+            advantages = action_values - baseline
+            new = candidate_logprobs.exp()
+            log_ratio = (
+                candidate_logprobs
+                - torch.log(old.clamp_min(1e-12))
+            )
+            clipped_ratio = torch.exp(
+                log_ratio.clamp(-20.0, 20.0)
+            ).clamp(
+                1.0 - self.config.ppo_clip_eps,
+                1.0 + self.config.ppo_clip_eps,
+            )
+            # old * (new / old) is exactly new.  Computing the unclipped
+            # branch that way avoids 0 * inf if an old group mass underflows.
+            losses.append(
+                -torch.minimum(
+                    new * advantages,
+                    old * clipped_ratio * advantages,
+                ).sum()
+            )
+            divergences.append(
+                (
+                    old
+                    * (
+                        torch.log(old.clamp_min(1e-12))
+                        - candidate_logprobs
+                    )
+                ).sum()
+            )
+            # Kept as a zero-valued compatibility field in metrics. There is
+            # no longer a constructed target distribution whose entropy could
+            # be reported.
+            unused_target_entropies.append(torch.zeros_like(baseline))
+        return (
+            torch.stack(losses),
+            torch.stack(divergences),
+            torch.stack(unused_target_entropies),
+        )
+
     def _magnet_kl_terms(
         self,
         output,
@@ -3343,19 +5176,18 @@ class PPOTrainer:
             raise ValueError(
                 "explore_uniform_round_probability must be in [0, 1]."
             )
+        if self.config.explore_single_deviation_temperature <= 0.0:
+            raise ValueError(
+                "explore_single_deviation_temperature must be positive."
+            )
         if (
             self.config.explore_temperature_bid < 1.0
             or self.config.explore_temperature_play < 1.0
         ):
             raise ValueError("explore temperatures must be at least 1.0.")
-        unknown_temperature_arms = set(self.config.explore_temperature_arms) - {
-            "self",
-            "heuristic",
-            "mixed",
-            "historical",
-            "explore_self",
-            "explore_historical",
-        }
+        unknown_temperature_arms = (
+            set(self.config.explore_temperature_arms) - ALL_OPPONENT_ARMS
+        )
         if unknown_temperature_arms:
             raise ValueError(
                 f"explore_temperature_arms has unknown arms {sorted(unknown_temperature_arms)!r}."
@@ -3370,6 +5202,121 @@ class PPOTrainer:
             raise ValueError("game_gae_lambda must be in [0, 1].")
         if self.config.gae_gamma <= 0.0:
             raise ValueError("gae_gamma must be positive.")
+        if self.config.branch_rollouts:
+            if self.config.training_mode != "round":
+                raise ValueError("branch_rollouts require round training mode.")
+            if self.config.env_workers > 0:
+                raise ValueError("branch_rollouts do not support env_workers.")
+            if self.config.pipeline_rollouts:
+                raise ValueError("branch_rollouts do not support pipelined collection.")
+            if (
+                not math.isclose(
+                    self.config.entropy_coef,
+                    0.0,
+                    abs_tol=1e-12,
+                )
+                or self.config.mmd_enabled
+                or not math.isclose(
+                    self.config.explore_temperature_fraction,
+                    0.0,
+                    abs_tol=1e-12,
+                )
+                or not math.isclose(
+                    self.config.explore_uniform_round_probability,
+                    0.0,
+                    abs_tol=1e-12,
+                )
+            ):
+                raise ValueError(
+                    "Recursive branch collection uses branching as its only "
+                    "exploration: entropy bonus, MMD, temperature, and "
+                    "single-deviation exploration must be disabled."
+                )
+            branch_fractions = {
+                "self": self.config.self_play_fraction,
+                "historical": self.config.historical_fraction,
+            }
+            if not (
+                math.isclose(branch_fractions["self"], 0.5, abs_tol=1e-9)
+                and math.isclose(
+                    branch_fractions["historical"],
+                    0.5,
+                    abs_tol=1e-9,
+                )
+                and all(
+                    math.isclose(value, 0.0, abs_tol=1e-9)
+                    for value in (
+                        self.config.heuristic_fraction,
+                        self.config.mixed_fraction,
+                        self.config.explore_self_fraction,
+                        self.config.explore_historical_fraction,
+                        self.config.tempered_self_fraction,
+                        self.config.tempered_historical_fraction,
+                        self.config.capped_self_fraction,
+                        self.config.capped_historical_fraction,
+                        self.config.epsilon_self_fraction,
+                        self.config.epsilon_historical_fraction,
+                    )
+                )
+            ):
+                raise ValueError(
+                    "branch_rollouts require exactly 0.5 self and 0.5 "
+                    "historical with every other arm disabled."
+                )
+            if self.config.rounds_per_batch % 2:
+                raise ValueError(
+                    "branch_rollouts require an even rounds_per_batch."
+                )
+            if self.config.branch_decision_budget_per_arm < 1:
+                raise ValueError(
+                    "branch_decision_budget_per_arm must be positive."
+                )
+            if self.config.branch_update_decision_budget_per_arm < 1:
+                raise ValueError(
+                    "branch_update_decision_budget_per_arm must be positive."
+                )
+            if self.config.branch_max_replicates < 1:
+                raise ValueError("branch_max_replicates must be positive.")
+            if self.config.branch_max_active < 1:
+                raise ValueError("branch_max_active must be positive.")
+            if self.config.branch_bid_max_actions < 0:
+                raise ValueError(
+                    "branch_bid_max_actions must be nonnegative "
+                    "(zero means all legal bids)."
+                )
+            for arm in ("self", "historical"):
+                effective_eps = self.config.explore_eps_by_arm.get(
+                    arm,
+                    (
+                        self.config.explore_eps_bid,
+                        self.config.explore_eps_play,
+                    ),
+                )
+                if any(
+                    not math.isclose(value, 0.0, abs_tol=1e-12)
+                    for value in effective_eps
+                ):
+                    raise ValueError(
+                        "Recursive branch collection requires raw-policy "
+                        f"sampling for the {arm} arm (epsilon must be zero)."
+                    )
+            if not math.isclose(
+                self.config.branch_support_floor,
+                0.0,
+                abs_tol=1e-12,
+            ):
+                raise ValueError(
+                    "Direct counterfactual advantages require "
+                    "branch_support_floor=0."
+                )
+            if self.config.branch_target_temperature <= 0.0:
+                raise ValueError("branch_target_temperature must be positive.")
+            if self.config.branch_advantage_clip <= 0.0:
+                raise ValueError("branch_advantage_clip must be positive.")
+            if self.config.branch_policy_coef < 0.0:
+                raise ValueError("branch_policy_coef must be nonnegative.")
+            if self.config.branch_kl_cap <= 0.0:
+                raise ValueError("branch_kl_cap must be positive.")
         if self.config.training_mode == "game":
             game_schedule = self.config.resolved_game_schedule
             if len(game_schedule) > self.config.model_config.max_rounds:
@@ -3397,14 +5344,7 @@ class PPOTrainer:
             raise ValueError("league_probe_fraction must be in [0, 1].")
         eps_values = [self.config.explore_eps_bid, self.config.explore_eps_play]
         for arm, arm_eps in self.config.explore_eps_by_arm.items():
-            if arm not in {
-                "self",
-                "heuristic",
-                "mixed",
-                "historical",
-                "explore_self",
-                "explore_historical",
-            }:
+            if arm not in ALL_OPPONENT_ARMS:
                 raise ValueError(f"explore_eps_by_arm has unknown arm {arm!r}.")
             if len(arm_eps) != 2:
                 raise ValueError("explore_eps_by_arm values must be (bid, play).")
@@ -3412,6 +5352,12 @@ class PPOTrainer:
         for eps in eps_values:
             if not 0.0 <= eps <= 1.0:
                 raise ValueError("explore_eps values must be in [0, 1].")
+        if not 0.0 < self.config.explore_argmax_cap <= 1.0:
+            raise ValueError("explore_argmax_cap must be in (0, 1].")
+        if self.config.explore_argmax_rest_temperature <= 0.0:
+            raise ValueError(
+                "explore_argmax_rest_temperature must be positive."
+            )
         if self.config.microbatch_size is not None and self.config.microbatch_size < 1:
             raise ValueError("microbatch_size must be positive when set.")
         fractions = (
@@ -3421,6 +5367,12 @@ class PPOTrainer:
             self.config.historical_fraction,
             self.config.explore_self_fraction,
             self.config.explore_historical_fraction,
+            self.config.tempered_self_fraction,
+            self.config.tempered_historical_fraction,
+            self.config.capped_self_fraction,
+            self.config.capped_historical_fraction,
+            self.config.epsilon_self_fraction,
+            self.config.epsilon_historical_fraction,
         )
         if any(not 0.0 <= fraction <= 1.0 for fraction in fractions):
             raise ValueError("Opponent-arm fractions must be in [0, 1].")
@@ -3429,6 +5381,12 @@ class PPOTrainer:
         if self.config.training_mode == "game" and (
             self.config.explore_self_fraction > 0.0
             or self.config.explore_historical_fraction > 0.0
+            or self.config.tempered_self_fraction > 0.0
+            or self.config.tempered_historical_fraction > 0.0
+            or self.config.capped_self_fraction > 0.0
+            or self.config.capped_historical_fraction > 0.0
+            or self.config.epsilon_self_fraction > 0.0
+            or self.config.epsilon_historical_fraction > 0.0
         ):
             raise ValueError("Explore arms are only supported in round mode.")
         if self.config.owner_warmup_iterations < 0:
@@ -3510,24 +5468,41 @@ def build_decision_request(
         include_game_context=include_game_context,
     )
     current_round = env.state.current_round
+    owner_targets = (
+        _owner_targets_relative(
+            env,
+            player,
+            encoded.owner_valid_mask,
+            model_config,
+        )
+        if collect
+        else [-100] * NUM_CARDS
+    )
+    suit_presence_targets = (
+        _suit_presence_targets_relative(
+            env,
+            player,
+            model_config,
+        )
+        if collect
+        else [
+            [-100] * len(SUITS)
+            for _ in range(model_config.max_players)
+        ]
+    )
     return DecisionRequest(
         episode_id=episode_id,
         player=player,
         phase="bid" if env.phase() == Phase.BIDDING else "play",
         policy_ref=policy_ref,
         encoded=encoded,
-        owner_targets=_owner_targets_relative(
-            env,
-            player,
-            encoded.owner_valid_mask,
-            model_config,
+        owner_targets=owner_targets,
+        suit_presence_targets=suit_presence_targets,
+        observation=(
+            _snapshot_observation(observation)
+            if collect
+            else None
         ),
-        suit_presence_targets=_suit_presence_targets_relative(
-            env,
-            player,
-            model_config,
-        ),
-        observation=_snapshot_observation(observation),
         round_index=current_round.round_index,
         num_players=env.config.num_players,
         hand_size=current_round.hand_size,
@@ -3588,12 +5563,13 @@ def _trainable_players(
 ) -> frozenset[int]:
     """Seats that produce training samples for this arm.
 
-    Explore arms train only the focal seat: current-weight opponents on
-    explore_self tables are frozen copies that sample raw and yield no
-    samples, so the noised learner never optimizes against noisy play.
+    Focal-only arms train one affected seat: current-weight opponents on those
+    self-play tables are frozen copies that sample raw and yield no samples.
+    Dedicated tempered self-play is not focal-only; all current seats sample
+    at the configured temperature and contribute trajectories.
     """
 
-    if arm in EXPLORE_ARMS:
+    if arm in FOCAL_ONLY_ARMS:
         return frozenset({focal_player})
     return _current_policy_players(focal_player, opponent_policies)
 
@@ -3689,6 +5665,10 @@ def _percentile_abs(values: list[float], quantile: float) -> float:
     return ordered[index]
 
 
+def _branch_action_index(action: BidAction | PlayCardAction) -> int:
+    return action.bid if isinstance(action, BidAction) else card_id(action.card)
+
+
 def _mae(values: list[float], targets: list[float]) -> float:
     return _mean([abs(value - target) for value, target in zip(values, targets)])
 
@@ -3721,6 +5701,9 @@ def format_update_stats(stats: UpdateStats) -> str:
         "configs": stats.configurations,
         "loss": stats.total_loss,
         "policy": stats.policy_loss,
+        "branch": stats.branch_policy_loss,
+        "branch_kl": stats.branch_kl,
+        "branch_n": stats.branch_samples,
         "value": stats.value_loss,
         "oracle": stats.oracle_value_loss,
         "magnet_kl": stats.magnet_kl,

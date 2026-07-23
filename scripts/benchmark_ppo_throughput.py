@@ -30,9 +30,32 @@ from plump.training import PPOTrainer, TrainingConfig
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("checkpoint", type=Path)
-    parser.add_argument("--mode", choices=("baseline", "optimized"), required=True)
+    parser.add_argument(
+        "--mode",
+        choices=("baseline", "optimized", "recursive"),
+        required=True,
+    )
+    parser.add_argument(
+        "--phase",
+        choices=("full", "collect"),
+        default="full",
+    )
     parser.add_argument("--packing", choices=("torch", "numpy"), default="numpy")
+    parser.add_argument("--rounds-per-configuration", type=int, default=16)
+    parser.add_argument("--num-envs", type=int, default=384)
+    parser.add_argument("--env-workers", type=int, default=0)
+    parser.add_argument("--ppo-epochs", type=int, default=4)
+    parser.add_argument("--minibatch-size", type=int, default=1440)
     parser.add_argument("--microbatch-size", type=int, default=480)
+    parser.add_argument("--branch-decision-budget-per-arm", type=int, default=20_000)
+    parser.add_argument("--branch-update-decisions-per-arm", type=int, default=2_400)
+    parser.add_argument("--branch-max-active", type=int, default=768)
+    parser.add_argument("--self-play-fraction", type=float)
+    parser.add_argument("--heuristic-fraction", type=float)
+    parser.add_argument("--mixed-fraction", type=float)
+    parser.add_argument("--historical-fraction", type=float)
+    parser.add_argument("--explore-self-fraction", type=float)
+    parser.add_argument("--explore-historical-fraction", type=float)
     parser.add_argument("--warmup", type=int, default=1)
     parser.add_argument("--measured", type=int, default=5)
     parser.add_argument("--seed", type=int, default=1)
@@ -106,23 +129,23 @@ def checkpoint_config(
         for field in fields(TrainingConfig)
         if field.name != "model_config"
     }
-    optimized = args.mode == "optimized"
+    optimized = args.mode in {"optimized", "recursive"}
     values.update(
         {
             "player_counts": (3, 4, 5),
             "hand_sizes": tuple(range(3, 11)),
-            "rounds_per_configuration": 16,
-            "num_envs": 384,
-            "ppo_epochs": 4,
+            "rounds_per_configuration": args.rounds_per_configuration,
+            "num_envs": args.num_envs,
+            "ppo_epochs": args.ppo_epochs,
             "target_kl": 0.02,
             "pipeline_rollouts": False,
-            "env_workers": 0,
+            "env_workers": args.env_workers,
             "event_length_buckets": (8, 16, 32, 64) if optimized else (),
             "batch_packing": args.packing if optimized else "torch",
             "lean_rollout_forward": optimized,
             "batched_league_sampling": optimized,
             "league_probe_fraction": 0.10,
-            "minibatch_size": 1440,
+            "minibatch_size": args.minibatch_size,
             "microbatch_size": args.microbatch_size,
             "league_eval_every": 0,
             "seed": args.seed,
@@ -130,6 +153,55 @@ def checkpoint_config(
             "model_config": model_config,
         }
     )
+    for name in (
+        "self_play_fraction",
+        "heuristic_fraction",
+        "mixed_fraction",
+        "historical_fraction",
+        "explore_self_fraction",
+        "explore_historical_fraction",
+    ):
+        override = getattr(args, name)
+        if override is not None:
+            values[name] = override
+    if args.mode == "recursive":
+        values.update(
+            {
+                "self_play_fraction": 0.5,
+                "heuristic_fraction": 0.0,
+                "mixed_fraction": 0.0,
+                "historical_fraction": 0.5,
+                "explore_self_fraction": 0.0,
+                "explore_historical_fraction": 0.0,
+                "tempered_self_fraction": 0.0,
+                "tempered_historical_fraction": 0.0,
+                "capped_self_fraction": 0.0,
+                "capped_historical_fraction": 0.0,
+                "epsilon_self_fraction": 0.0,
+                "epsilon_historical_fraction": 0.0,
+                "explore_eps_bid": 0.0,
+                "explore_eps_play": 0.0,
+                "explore_eps_by_arm": {},
+                "explore_temperature_fraction": 0.0,
+                "explore_uniform_round_probability": 0.0,
+                "entropy_coef": 0.0,
+                "mmd_enabled": False,
+                "branch_rollouts": True,
+                "branch_decision_budget_per_arm": (
+                    args.branch_decision_budget_per_arm
+                ),
+                "branch_update_decision_budget_per_arm": (
+                    args.branch_update_decisions_per_arm
+                ),
+                "branch_max_active": args.branch_max_active,
+                "branch_bid_max_actions": 4,
+                "branch_support_floor": 0.0,
+                "branch_target_temperature": 1.0,
+                "branch_advantage_clip": 4.0,
+                "branch_policy_coef": 1.0,
+                "branch_kl_cap": 0.005,
+            }
+        )
     del payload
     return model_config, TrainingConfig(**values)
 
@@ -149,6 +221,15 @@ def main() -> None:
         PlumpTransformerModel(model_config),
         training_config,
     )
+    if args.env_workers > 0:
+        from plump.training.env_workers import EnvWorkerPool
+
+        trainer.env_pool = EnvWorkerPool(
+            num_workers=args.env_workers,
+            model_config=model_config,
+            include_game_context=training_config.include_game_context,
+            num_envs=training_config.num_envs,
+        )
     resume = trainer.load_checkpoint(args.checkpoint, load_optimizer=True)
     if not resume["optimizer_loaded"]:
         raise RuntimeError("Optimizer state did not resume.")
@@ -170,7 +251,11 @@ def main() -> None:
             started = time.perf_counter()
             buffer = trainer.collect_rollouts(iteration=iteration)
             collect_sec = trainer.last_collect_sec
-            update = trainer.update(buffer)
+            update = (
+                trainer.update(buffer)
+                if args.phase == "full"
+                else None
+            )
             synchronize(device)
             wall_sec = time.perf_counter() - started
             memory.sample()
@@ -183,16 +268,39 @@ def main() -> None:
                 "update_sec": wall_sec - collect_sec,
                 "rollout_rounds": len(buffer.round_outcomes),
                 "samples": len(buffer.ready_samples()),
-                "finite": finite_update(update),
-                "skipped_steps": update.skipped_steps,
-                "epochs_run": update.epochs_run,
-                "approx_kl": update.approx_kl,
-                "total_loss": update.total_loss,
+                "finite": (
+                    finite_update(update)
+                    if update is not None
+                    else True
+                ),
+                "skipped_steps": (
+                    update.skipped_steps
+                    if update is not None
+                    else 0
+                ),
+                "epochs_run": (
+                    update.epochs_run
+                    if update is not None
+                    else 0
+                ),
+                "approx_kl": (
+                    update.approx_kl
+                    if update is not None
+                    else 0.0
+                ),
+                "total_loss": (
+                    update.total_loss
+                    if update is not None
+                    else 0.0
+                ),
                 "collection": asdict(trainer.last_collection_stats),
                 "peak_current_memory_bytes": memory.peak_current,
                 "peak_driver_memory_bytes": memory.peak_driver,
             }
-            if row["rollout_rounds"] != training_config.rounds_per_batch:
+            if (
+                not training_config.branch_rollouts
+                and row["rollout_rounds"] != training_config.rounds_per_batch
+            ):
                 raise RuntimeError(
                     "Rollout count changed: "
                     f"{row['rollout_rounds']} != {training_config.rounds_per_batch}"
@@ -213,6 +321,7 @@ def main() -> None:
         "checkpoint": str(args.checkpoint),
         "resume": resume,
         "mode": args.mode,
+        "phase": args.phase,
         "packing": training_config.batch_packing,
         "microbatch_size": args.microbatch_size,
         "warmup_cycles": args.warmup,
@@ -240,6 +349,8 @@ def main() -> None:
     if args.output is not None:
         args.output.parent.mkdir(parents=True, exist_ok=True)
         args.output.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n")
+    if trainer.env_pool is not None:
+        trainer.env_pool.close()
     if args.require_memory_watermark and not result["under_memory_watermark"]:
         raise SystemExit(2)
 

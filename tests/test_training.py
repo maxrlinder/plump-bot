@@ -28,7 +28,10 @@ from plump.training import (
     training_config_snapshot,
 )
 from plump.training.ppo import (
+    _argmax_capped_probabilities,
     _explained_variance,
+    _non_argmax_tempered_probabilities,
+    _non_argmax_uniform_probabilities,
     _trick_implied_relative_values,
     solve_meta_mixture,
 )
@@ -625,6 +628,62 @@ class TrainingTest(unittest.TestCase):
                     else:
                         self.assertEqual(expected_value, actual_value)
 
+    def test_single_optimizer_group_migrates_to_belief_split(self):
+        trainer = self._trainer()
+        trainer.update(trainer.collect_rollouts())
+        with tempfile.TemporaryDirectory() as tmp:
+            checkpoint = Path(tmp) / "resume.pt"
+            trainer.save_checkpoint(checkpoint, iteration=9)
+            saved = trainer.optimizer.state_dict()
+
+            restored = self._trainer(belief_head_only=True)
+            info = restored.load_checkpoint(checkpoint, load_optimizer=True)
+            actual = restored.optimizer.state_dict()
+
+            self.assertTrue(info["optimizer_group_migrated"])
+            self.assertEqual(
+                [group["name"] for group in actual["param_groups"]],
+                ["policy_value", "belief_heads"],
+            )
+            self.assertEqual(len(saved["state"]), len(actual["state"]))
+
+            saved_ids = saved["param_groups"][0]["params"]
+            saved_id_by_parameter = {
+                id(parameter): saved_id
+                for parameter, saved_id in zip(
+                    restored.model.parameters(),
+                    saved_ids,
+                    strict=True,
+                )
+            }
+            actual_id_by_parameter = {}
+            for live_group, serialized_group in zip(
+                restored.optimizer.param_groups,
+                actual["param_groups"],
+                strict=True,
+            ):
+                actual_id_by_parameter.update(
+                    {
+                        id(parameter): serialized_id
+                        for parameter, serialized_id in zip(
+                            live_group["params"],
+                            serialized_group["params"],
+                            strict=True,
+                        )
+                    }
+                )
+            for parameter in (
+                restored.model.bid_head.weight,
+                restored.model.trick_count_head.weight,
+            ):
+                saved_state = saved["state"][saved_id_by_parameter[id(parameter)]]
+                actual_state = actual["state"][actual_id_by_parameter[id(parameter)]]
+                for name in saved_state:
+                    if isinstance(saved_state[name], torch.Tensor):
+                        self.assertTrue(torch.equal(saved_state[name], actual_state[name]))
+                    else:
+                        self.assertEqual(saved_state[name], actual_state[name])
+
     def test_logger_uses_only_v4_metrics(self):
         trainer = self._trainer()
         buffer = trainer.collect_rollouts()
@@ -1216,6 +1275,26 @@ class OracleLeagueMmdTest(unittest.TestCase):
         )
         self.assertLess(distance_to_model, initial_distance_to_model)
 
+    def test_mmd_magnet_logits_are_cached_across_ppo_epochs(self):
+        trainer = self._trainer(
+            mmd_enabled=True,
+            lean_rollout_forward=True,
+            ppo_epochs=3,
+            minibatch_size=4,
+            microbatch_size=2,
+        )
+        buffer = trainer.collect_rollouts()
+        expected_cache_forwards = math.ceil(len(buffer.samples) / 2)
+
+        with patch.object(
+            trainer.magnet_model,
+            "forward_policy",
+            wraps=trainer.magnet_model.forward_policy,
+        ) as forward:
+            trainer.update(buffer)
+
+        self.assertEqual(forward.call_count, expected_cache_forwards)
+
     def test_suit_presence_targets_label_only_opponents(self):
         trainer = self._trainer(suit_presence_head_model=True)
         buffer = trainer.collect_rollouts()
@@ -1623,6 +1702,205 @@ class CleanExploreArmsTest(unittest.TestCase):
             explore_noise_hand_normalized=True,
         )
 
+    def test_argmax_cap_triggers_only_above_eighty_percent(self):
+        minimum = torch.finfo(torch.float32).min
+        logits = torch.tensor(
+            [
+                [6.0, 2.0, 0.0, minimum],
+                [1.0, 1.0, 1.0, minimum],
+                [minimum, 1.0, minimum, minimum],
+            ]
+        )
+
+        probabilities = _argmax_capped_probabilities(
+            logits,
+            0.8,
+            alternative_temperature=4.0,
+        )
+
+        alternative = torch.softmax(torch.tensor([2.0, 0.0]) / 4.0, dim=0) * 0.2
+        self.assertAlmostEqual(probabilities[0, 0].item(), 0.8, places=6)
+        self.assertAlmostEqual(
+            probabilities[0, 1].item(),
+            alternative[0].item(),
+            places=6,
+        )
+        self.assertAlmostEqual(
+            probabilities[0, 2].item(),
+            alternative[1].item(),
+            places=6,
+        )
+        self.assertEqual(probabilities[0, 3].item(), 0.0)
+        self.assertTrue(
+            torch.allclose(
+                probabilities[1],
+                torch.tensor([1.0 / 3.0] * 3 + [0.0]),
+            )
+        )
+        self.assertEqual(probabilities[2].tolist(), [0.0, 1.0, 0.0, 0.0])
+        self.assertTrue(
+            torch.allclose(
+                probabilities.sum(dim=-1),
+                torch.ones(3),
+            )
+        )
+
+    def test_non_argmax_uniform_excludes_top_unless_forced(self):
+        minimum = torch.finfo(torch.float32).min
+        logits = torch.tensor(
+            [
+                [6.0, 2.0, 0.0, minimum],
+                [1.0, 1.0, 1.0, minimum],
+                [minimum, 1.0, minimum, minimum],
+            ]
+        )
+
+        probabilities = _non_argmax_uniform_probabilities(logits)
+
+        self.assertEqual(probabilities[0].tolist(), [0.0, 0.5, 0.5, 0.0])
+        self.assertEqual(probabilities[1].tolist(), [0.0, 0.5, 0.5, 0.0])
+        self.assertEqual(probabilities[2].tolist(), [0.0, 1.0, 0.0, 0.0])
+        self.assertTrue(
+            torch.allclose(probabilities.sum(dim=-1), torch.ones(3))
+        )
+
+    def test_single_deviation_preserves_alternative_logit_ranking(self):
+        minimum = torch.finfo(torch.float32).min
+        logits = torch.tensor(
+            [
+                [8.0, 4.0, 1.0, minimum],
+                [minimum, 2.0, minimum, minimum],
+            ]
+        )
+
+        probabilities = _non_argmax_tempered_probabilities(
+            logits,
+            temperature=3.0,
+        )
+
+        expected_alternatives = torch.softmax(
+            torch.tensor([4.0, 1.0]) / 3.0,
+            dim=0,
+        )
+        self.assertEqual(probabilities[0, 0].item(), 0.0)
+        self.assertAlmostEqual(
+            probabilities[0, 1].item(),
+            expected_alternatives[0].item(),
+            places=6,
+        )
+        self.assertAlmostEqual(
+            probabilities[0, 2].item(),
+            expected_alternatives[1].item(),
+            places=6,
+        )
+        self.assertEqual(probabilities[0, 3].item(), 0.0)
+        self.assertEqual(probabilities[1].tolist(), [0.0, 1.0, 0.0, 0.0])
+        self.assertTrue(
+            torch.allclose(probabilities.sum(dim=-1), torch.ones(2))
+        )
+
+    def test_six_equal_arms_and_focal_only_exploration(self):
+        sixth = 1.0 / 6.0
+        fractions = dict(
+            self_play_fraction=sixth,
+            historical_fraction=sixth,
+            tempered_self_fraction=0.0,
+            tempered_historical_fraction=0.0,
+            capped_self_fraction=sixth,
+            capped_historical_fraction=sixth,
+            epsilon_self_fraction=sixth,
+            epsilon_historical_fraction=sixth,
+        )
+        trainer = self._trainer(
+            rounds_per_configuration=6,
+            num_envs=6,
+            explore_argmax_cap=0.8,
+            explore_argmax_rest_temperature=4.0,
+            explore_eps_by_arm={
+                "epsilon_self": (0.15, 0.30),
+                "epsilon_historical": (0.15, 0.30),
+            },
+            **fractions,
+        )
+        trainer.add_historical_policy(RandomPolicy(11))
+
+        buffer = trainer.collect_rollouts()
+        counts: dict[str, int] = {}
+        arm_by_episode = {}
+        for outcome in buffer.round_outcomes:
+            counts[outcome.opponent_arm] = (
+                counts.get(outcome.opponent_arm, 0) + 1
+            )
+            arm_by_episode[outcome.episode_id] = outcome.opponent_arm
+
+        expected_arms = {
+            "self",
+            "historical",
+            "capped_self",
+            "capped_historical",
+            "epsilon_self",
+            "epsilon_historical",
+        }
+        self.assertEqual(counts, {arm: 1 for arm in expected_arms})
+
+        players_by_episode: dict[int, set[int]] = {}
+        for sample in buffer.samples:
+            players_by_episode.setdefault(sample.episode_id, set()).add(
+                sample.acting_player
+            )
+        for episode_id, arm in arm_by_episode.items():
+            if arm in {
+                "historical",
+                "capped_self",
+                "capped_historical",
+                "epsilon_self",
+                "epsilon_historical",
+            }:
+                self.assertEqual(len(players_by_episode[episode_id]), 1)
+        self_episode = next(
+            episode_id
+            for episode_id, arm in arm_by_episode.items()
+            if arm == "self"
+        )
+        self.assertEqual(
+            len(players_by_episode[self_episode]),
+            3,
+        )
+
+        for arm in {
+            "epsilon_self",
+            "epsilon_historical",
+        }:
+            differences = [
+                abs(sample.old_logprob - sample.old_policy_logprob)
+                for sample in buffer.samples
+                if sample.opponent_arm == arm
+                and sample.old_policy_logprob is not None
+            ]
+            self.assertTrue(differences)
+            self.assertGreater(max(differences), 1e-6)
+
+        rollout_stats = trainer.summarize_rollout(buffer)
+        update_stats = trainer.update(buffer)
+        self.assertTrue(math.isfinite(update_stats.total_loss))
+        self.assertEqual(
+            sum(
+                (
+                    rollout_stats.self_play_rounds,
+                    rollout_stats.historical_rounds,
+                    rollout_stats.tempered_self_rounds,
+                    rollout_stats.tempered_historical_rounds,
+                    rollout_stats.capped_self_rounds,
+                    rollout_stats.capped_historical_rounds,
+                    rollout_stats.epsilon_self_rounds,
+                    rollout_stats.epsilon_historical_rounds,
+                )
+            ),
+            6,
+        )
+        self.assertEqual(rollout_stats.tempered_self_rounds, 0)
+        self.assertEqual(rollout_stats.tempered_historical_rounds, 0)
+
     def test_explore_fractions_fold_without_history(self):
         trainer = self._trainer(
             self_play_fraction=0.30,
@@ -1753,9 +2031,9 @@ class CleanExploreArmsTest(unittest.TestCase):
                 and abs(sample.old_logprob - sample.old_policy_logprob) > 1e-6
             ):
                 diverged_by_episode[sample.episode_id] += 1
-        # probability 1.0 and no tempering: at most one uniform-injected
-        # (behavior != policy) decision per round — zero only when the
-        # injection lands on a forced play (single legal card).
+        # Probability 1.0 and no round tempering: at most one policy-shaped
+        # non-argmax (behavior != policy) decision per round — zero only when
+        # the selected decision has one legal action.
         self.assertTrue(set(diverged_by_episode.values()) <= {0, 1})
         self.assertIn(1, diverged_by_episode.values())
 
@@ -1793,6 +2071,11 @@ class CleanExploreArmsTest(unittest.TestCase):
                 self_play_fraction=1.0,
                 explore_uniform_round_probability=1.5,
             )
+        with self.assertRaises(ValueError):
+            self._trainer(
+                self_play_fraction=1.0,
+                explore_single_deviation_temperature=0.0,
+            )
 
     def test_owner_warmup_detaches_trunk_gradients(self):
         trainer = self._trainer(self_play_fraction=1.0, owner_coef=0.05)
@@ -1824,6 +2107,45 @@ class CleanExploreArmsTest(unittest.TestCase):
                 self.assertTrue(
                     trunk_grad is None or float(trunk_grad.abs().sum()) == 0.0
                 )
+
+    def test_belief_head_only_detaches_trunk_gradients(self):
+        trainer = self._trainer(self_play_fraction=1.0, belief_head_only=True)
+        model = trainer.model
+        env = PlumpEnv(
+            round_game_config(RoundSpec(3, 3), bidding_start_player=0),
+            seed=5,
+        )
+        env.reset()
+        observation = env.get_observation(env.current_player())
+        encoded = encode_observation(observation, model.config)
+        batch = encoded_observations_to_batch(
+            [encoded],
+            device=torch.device("cpu"),
+        )
+        for detach, expect_trunk_grad in ((True, False), (False, True)):
+            model.zero_grad(set_to_none=True)
+            output = model(batch, detach_belief_trunk=detach)
+            loss = output.trick_count_logits.pow(2).sum()
+            loss.backward()
+            belief_grad = model.trick_count_head.weight.grad
+            self.assertIsNotNone(belief_grad)
+            self.assertGreater(float(belief_grad.abs().sum()), 0.0)
+            trunk_grad = model.final_norm.weight.grad
+            if expect_trunk_grad:
+                self.assertIsNotNone(trunk_grad)
+                self.assertGreater(float(trunk_grad.abs().sum()), 0.0)
+            else:
+                self.assertTrue(
+                    trunk_grad is None or float(trunk_grad.abs().sum()) == 0.0
+                )
+
+        group_names = [group["name"] for group in trainer.optimizer.param_groups]
+        self.assertEqual(group_names, ["policy_value", "belief_heads"])
+        belief_ids = {id(parameter) for parameter in trainer._belief_parameters()}
+        self.assertEqual(
+            {id(parameter) for parameter in trainer.optimizer.param_groups[1]["params"]},
+            belief_ids,
+        )
 
     def test_owner_active_since_persists_across_checkpoints(self):
         trainer = self._trainer(

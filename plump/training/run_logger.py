@@ -72,6 +72,15 @@ METRIC_FIELDS = [
     "collect_valid_event_tokens",
     "collect_processed_event_tokens",
     "collect_peak_device_memory_bytes",
+    "collect_branch_root_hands",
+    "collect_branch_roots_available",
+    "collect_branch_roots_expanded",
+    "collect_branch_bid_roots",
+    "collect_branch_play_roots",
+    "collect_branch_terminal_rollouts",
+    "collect_branch_self_decisions",
+    "collect_branch_historical_decisions",
+    "collect_branch_forward_sec",
     "update_sec",
     "diagnostics_sec",
     "eval_sec",
@@ -95,16 +104,32 @@ METRIC_FIELDS = [
     "rollout_historical_relative_reward",
     "rollout_explore_self_relative_reward",
     "rollout_explore_historical_relative_reward",
+    "rollout_tempered_self_relative_reward",
+    "rollout_tempered_historical_relative_reward",
+    "rollout_capped_self_relative_reward",
+    "rollout_capped_historical_relative_reward",
+    "rollout_epsilon_self_relative_reward",
+    "rollout_epsilon_historical_relative_reward",
     "rollout_self_play_rounds",
     "rollout_heuristic_rounds",
     "rollout_mixed_rounds",
     "rollout_historical_rounds",
     "rollout_explore_self_rounds",
     "rollout_explore_historical_rounds",
+    "rollout_tempered_self_rounds",
+    "rollout_tempered_historical_rounds",
+    "rollout_capped_self_rounds",
+    "rollout_capped_historical_rounds",
+    "rollout_epsilon_self_rounds",
+    "rollout_epsilon_historical_rounds",
     "league_meta_entropy",
     "league_current_vs_mixture",
     "loss_total",
     "loss_policy",
+    "loss_branch_policy",
+    "branch_kl",
+    "branch_target_entropy",
+    "branch_samples",
     "loss_value",
     "loss_oracle_value",
     "magnet_kl",
@@ -399,14 +424,46 @@ class TrainingRunLogger:
             "rollout_explore_historical_relative_reward": (
                 rollout.explore_historical_relative_reward
             ),
+            "rollout_tempered_self_relative_reward": (
+                rollout.tempered_self_relative_reward
+            ),
+            "rollout_tempered_historical_relative_reward": (
+                rollout.tempered_historical_relative_reward
+            ),
+            "rollout_capped_self_relative_reward": (
+                rollout.capped_self_relative_reward
+            ),
+            "rollout_capped_historical_relative_reward": (
+                rollout.capped_historical_relative_reward
+            ),
+            "rollout_epsilon_self_relative_reward": (
+                rollout.epsilon_self_relative_reward
+            ),
+            "rollout_epsilon_historical_relative_reward": (
+                rollout.epsilon_historical_relative_reward
+            ),
             "rollout_self_play_rounds": rollout.self_play_rounds,
             "rollout_heuristic_rounds": rollout.heuristic_rounds,
             "rollout_mixed_rounds": rollout.mixed_rounds,
             "rollout_historical_rounds": rollout.historical_rounds,
             "rollout_explore_self_rounds": rollout.explore_self_rounds,
             "rollout_explore_historical_rounds": rollout.explore_historical_rounds,
+            "rollout_tempered_self_rounds": rollout.tempered_self_rounds,
+            "rollout_tempered_historical_rounds": (
+                rollout.tempered_historical_rounds
+            ),
+            "rollout_capped_self_rounds": rollout.capped_self_rounds,
+            "rollout_capped_historical_rounds": rollout.capped_historical_rounds,
+            "rollout_epsilon_self_rounds": rollout.epsilon_self_rounds,
+            "rollout_epsilon_historical_rounds": (
+                rollout.epsilon_historical_rounds
+            ),
             "loss_total": update.total_loss,
             "loss_policy": update.policy_loss,
+            "loss_branch_policy": update.branch_policy_loss,
+            "branch_kl": update.branch_kl,
+            "branch_target_entropy": update.branch_target_entropy,
+            "branch_samples": update.branch_samples,
             "loss_value": update.value_loss,
             "loss_oracle_value": update.oracle_value_loss,
             "magnet_kl": update.magnet_kl,
@@ -452,6 +509,15 @@ class TrainingRunLogger:
                     "collect_valid_event_tokens": collection.valid_event_tokens,
                     "collect_processed_event_tokens": collection.processed_event_tokens,
                     "collect_peak_device_memory_bytes": collection.peak_device_memory_bytes,
+                    "collect_branch_root_hands": collection.branch_root_hands,
+                    "collect_branch_roots_available": collection.branch_roots_available,
+                    "collect_branch_roots_expanded": collection.branch_roots_expanded,
+                    "collect_branch_bid_roots": collection.branch_bid_roots,
+                    "collect_branch_play_roots": collection.branch_play_roots,
+                    "collect_branch_terminal_rollouts": collection.branch_terminal_rollouts,
+                    "collect_branch_self_decisions": collection.branch_self_decisions,
+                    "collect_branch_historical_decisions": collection.branch_historical_decisions,
+                    "collect_branch_forward_sec": collection.branch_forward_sec,
                 }
             )
         if prediction is not None:

@@ -188,6 +188,63 @@ class SearchTest(unittest.TestCase):
                     places=8,
                 )
 
+    def test_same_policy_batched_continuations_match_serial_roles(self):
+        torch.manual_seed(19)
+        model_config = ModelConfig(
+            max_seq_len=32,
+            d_model=32,
+            n_layers=1,
+            n_heads=4,
+            d_ff=64,
+            context_hidden_dim=64,
+            game_hidden_dim=32,
+            schedule_heads=4,
+        )
+        model = PlumpTransformerModel(model_config)
+        config = SearchConfig(
+            min_determinizations=2,
+            max_determinizations=2,
+            exact_tricks_remaining=0,
+            use_owner_beliefs=False,
+        )
+        shared_policy = ModelPolicy(
+            copy.deepcopy(model),
+            device="cpu",
+            greedy=False,
+        )
+        batched = RootSearchPolicy(
+            shared_policy,
+            shared_policy,
+            config=config,
+        )
+        serial = RootSearchPolicy(
+            ModelPolicy(copy.deepcopy(model), device="cpu", greedy=False),
+            ModelPolicy(copy.deepcopy(model), device="cpu", greedy=False),
+            config=config,
+        )
+        env = _manual_env(False)
+
+        batched_decision = batched.search(
+            env.get_observation(0),
+            legal_actions=env.legal_actions(),
+            rng=random.Random(29),
+        )
+        serial_decision = serial.search(
+            env.get_observation(0),
+            legal_actions=env.legal_actions(),
+            rng=random.Random(29),
+        )
+
+        self.assertEqual(batched_decision.action, serial_decision.action)
+        self.assertEqual(
+            batched_decision.action_values,
+            serial_decision.action_values,
+        )
+        self.assertEqual(
+            batched_decision.prior_probabilities,
+            serial_decision.prior_probabilities,
+        )
+
     def test_forced_actions_skip_search(self):
         env = _manual_env()
         env.step(BidAction(0, 1))

@@ -614,15 +614,27 @@ class ModelPolicy:
         if self.greedy:
             selected_indices = logits.argmax(dim=-1).cpu().tolist()
         else:
-            probabilities = torch.softmax(logits, dim=-1).cpu().tolist()
-            selected_indices = [
-                rng.choices(
-                    range(len(row)),
-                    weights=row,
-                    k=1,
-                )[0]
-                for row, rng in zip(probabilities, rngs)
-            ]
+            # One device transfer and vectorized CPU sampling is materially
+            # cheaper than materializing nested Python probability lists and
+            # calling random.choices once per historical-policy row.
+            logit_rows = logits.float().cpu().numpy()
+            stable = logit_rows - logit_rows.max(axis=1, keepdims=True)
+            probabilities = np.exp(stable)
+            probabilities /= probabilities.sum(axis=1, keepdims=True)
+            cumulative = np.cumsum(probabilities, axis=1)
+            uniforms = np.fromiter(
+                (rng.random() for rng in rngs),
+                dtype=np.float64,
+                count=len(rngs),
+            )
+            selected = (cumulative < uniforms[:, None]).sum(axis=1)
+            last_legal = (
+                (probabilities > 0).cumsum(axis=1).argmax(axis=1)
+            )
+            selected_indices = np.minimum(
+                selected,
+                last_legal,
+            ).tolist()
         actions: list[BidAction | PlayCardAction] = []
         for player, phase, action_index in zip(players, phases, selected_indices):
             if phase == Phase.BIDDING:
@@ -638,8 +650,11 @@ class ModelPolicy:
         encoded, output = self.predict_observation(env.get_observation(player))
         return player, encoded, output
 
-    def predict_observation(self, observation):
-        encoded, output = self.predict_observations([observation])
+    def predict_observation(self, observation, *, need_owner: bool = True):
+        encoded, output = self.predict_observations(
+            [observation],
+            need_owner=need_owner,
+        )
         return encoded[0], output
 
     def predict_observations(self, observations, *, need_owner: bool = True):

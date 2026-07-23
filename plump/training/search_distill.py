@@ -18,7 +18,7 @@ from plump.modeling.torch_model import (
     best_torch_device,
     encoded_observations_to_batch,
 )
-from plump.policies import HeuristicPolicy, ModelPolicy
+from plump.policies import ModelPolicy
 from plump.rounds import RoundSpec, rules_fingerprint
 from plump.search import RootSearchPolicy, SearchConfig, SearchDecision
 from plump.state import BidAction, Observation, PlayCardAction
@@ -103,8 +103,16 @@ class CounterfactualSearchRouter:
         minimum_iteration: int = 250,
         explained_variance_threshold: float = 0.30,
         states_per_phase: int = 24,
+        bid_states_per_iteration: int | None = None,
+        play_states_per_iteration: int | None = None,
         replay_capacity: int = 50_000,
         replay_max_age: int = 250,
+        search_config: SearchConfig | None = None,
+        opponent_arms: tuple[str, ...] = (),
+        assume_value_ready: bool = False,
+        event_length_buckets: tuple[int, ...] = (),
+        batch_packing: Literal["torch", "numpy"] = "torch",
+        lean_action_forward: bool = False,
         seed: int = 1,
     ) -> None:
         self.model = model
@@ -116,7 +124,25 @@ class CounterfactualSearchRouter:
         self.precision = precision
         self.minimum_iteration = minimum_iteration
         self.explained_variance_threshold = explained_variance_threshold
-        self.states_per_phase = states_per_phase
+        self.states_per_phase: dict[DistillPhase, int] = {
+            "bid": (
+                states_per_phase
+                if bid_states_per_iteration is None
+                else bid_states_per_iteration
+            ),
+            "play": (
+                states_per_phase
+                if play_states_per_iteration is None
+                else play_states_per_iteration
+            ),
+        }
+        if any(value < 0 for value in self.states_per_phase.values()):
+            raise ValueError("search states per iteration must be nonnegative.")
+        self.search_config = search_config or SearchConfig()
+        self.opponent_arms = frozenset(opponent_arms)
+        self.event_length_buckets = event_length_buckets
+        self.batch_packing = batch_packing
+        self.lean_action_forward = lean_action_forward
         self.rng = random.Random(seed)
         self.replay = StratifiedReplayWindow(
             replay_capacity,
@@ -138,6 +164,10 @@ class CounterfactualSearchRouter:
             "bid": deque(maxlen=3),
             "play": deque(maxlen=3),
         }
+        if assume_value_ready:
+            seeded_ev = max(self.explained_variance_threshold, 0.0)
+            for phase in ("bid", "play"):
+                self.ev_history[phase].extend([seeded_ev] * 3)
 
     def update_diagnostics(
         self,
@@ -161,26 +191,39 @@ class CounterfactualSearchRouter:
             greedy=False,
             include_game_context=False,
             precision=self.precision,
+            event_length_buckets=self.event_length_buckets,
+            batch_packing=self.batch_packing,
+            lean_action_forward=self.lean_action_forward,
             name="search-current",
         )
+        # Search evaluates every root action against the same raw current
+        # policy that generated the self-play data.  Using a hand-written
+        # heuristic here teaches heuristic-specific exploits and can move a
+        # mature policy away from its actual league objective.  Sharing the
+        # wrapper also enables batched continuation waves in RootSearchPolicy.
         search = RootSearchPolicy(
             base,
-            HeuristicPolicy(),
-            config=SearchConfig(seed=self.rng.randrange(2**31)),
+            base,
+            config=self.search_config,
         )
         for phase in ("bid", "play"):
-            eligible = self._eligible(phase, iteration)
+            state_count = self.states_per_phase[phase]
+            eligible = state_count > 0 and self._eligible(phase, iteration)
             candidates = [
                 sample
                 for sample in buffer.samples
                 if sample.phase == phase
                 and sample.observation is not None
                 and len(_legal_actions(sample)) > 1
+                and (
+                    not self.opponent_arms
+                    or sample.opponent_arm in self.opponent_arms
+                )
             ]
             selected = (
-                _stratified_rollout_samples(
+                _targeted_rollout_samples(
                     candidates,
-                    self.states_per_phase,
+                    state_count,
                     self.rng,
                 )
                 if eligible
@@ -372,6 +415,8 @@ class SearchTrustRegionUpdater:
         minibatch_size: int = 256,
         max_grad_norm: float = 1.0,
         entropy_floor_coef: float = 0.002,
+        kl_cap_start: float = 0.005,
+        kl_cap_end: float = 0.003,
         seed: int = 1,
     ) -> None:
         self.model = model
@@ -384,6 +429,10 @@ class SearchTrustRegionUpdater:
         self.minibatch_size = minibatch_size
         self.max_grad_norm = max_grad_norm
         self.entropy_floor_coef = entropy_floor_coef
+        if kl_cap_start <= 0.0 or kl_cap_end <= 0.0:
+            raise ValueError("search KL caps must be positive.")
+        self.kl_cap_start = kl_cap_start
+        self.kl_cap_end = kl_cap_end
         self.rng = random.Random(seed)
 
     def update(
@@ -400,7 +449,9 @@ class SearchTrustRegionUpdater:
             phase=phase,
             max_samples=self.minibatch_size,
         )
-        cap = 0.010 + (0.003 - 0.010) * (
+        cap = self.kl_cap_start + (
+            self.kl_cap_end - self.kl_cap_start
+        ) * (
             regret_matching_fraction / 0.5
             if regret_matching_fraction > 0.0
             else 0.0
@@ -732,6 +783,53 @@ def _stratified_rollout_samples(
             if queue:
                 remaining.append(queue)
         queues = remaining
+    return selected
+
+
+def _targeted_rollout_samples(
+    samples: list["RolloutSample"],
+    count: int,
+    rng: random.Random,
+) -> list["RolloutSample"]:
+    """Split search budget between confident blind spots and broad coverage.
+
+    Half of each probe is spent on the lowest normalized raw-policy entropy
+    states (the failure mode we are trying to challenge).  The other half is
+    stratified across player count, hand size, position, and opponent arm so
+    search does not overfit one narrow corner of the game.  Forced decisions
+    have already been removed by the caller.
+    """
+
+    if count <= 0 or not samples:
+        return []
+    challenge_count = min((count + 1) // 2, len(samples))
+
+    def normalized_entropy(sample: "RolloutSample") -> float:
+        legal_mask = (
+            sample.encoded.legal_bid_mask
+            if sample.phase == "bid"
+            else sample.encoded.legal_card_mask
+        )
+        legal_count = sum(bool(value) for value in legal_mask)
+        denominator = math.log(max(legal_count, 2))
+        return float(sample.old_entropy) / denominator
+
+    # Random tie-breaks keep equal-entropy masked states from always selecting
+    # the same deterministic ordering.
+    ranked = sorted(
+        ((normalized_entropy(sample), rng.random(), sample) for sample in samples),
+        key=lambda row: (row[0], row[1]),
+    )
+    challenged = [row[2] for row in ranked[:challenge_count]]
+    challenged_ids = {id(sample) for sample in challenged}
+    remainder = [sample for sample in samples if id(sample) not in challenged_ids]
+    covered = _stratified_rollout_samples(
+        remainder,
+        min(count - len(challenged), len(remainder)),
+        rng,
+    )
+    selected = [*challenged, *covered]
+    rng.shuffle(selected)
     return selected
 
 

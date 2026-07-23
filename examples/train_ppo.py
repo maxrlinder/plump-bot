@@ -20,10 +20,12 @@ from plump.evaluation import DealBank, evaluate_policy
 from plump.modeling import ModelConfig
 from plump.modeling.torch_model import PlumpTransformerModel
 from plump.policies import HeuristicPolicy, ModelPolicy, RandomPolicy
+from plump.search import SearchConfig
 from plump.training import (
     CounterfactualSearchRouter,
     PPOTrainer,
     SearchTrustRegionUpdater,
+    StratifiedReplayWindow,
     TrainingConfig,
     TrainingRunLogger,
     format_update_stats,
@@ -63,7 +65,50 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ppo-clip-eps", type=float, default=0.2)
     parser.add_argument("--value-coef", type=float, default=0.5)
     parser.add_argument("--entropy-coef", type=float, default=0.01)
+    parser.add_argument(
+        "--branch-rollouts",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Collect bounded recursive focal-action trees; every admitted "
+            "branch finishes at a terminal round result."
+        ),
+    )
+    parser.add_argument(
+        "--branch-decision-budget-per-arm",
+        type=int,
+        default=0,
+        help="Terminal environment-decision budget for each of self/history.",
+    )
+    parser.add_argument(
+        "--branch-update-decisions-per-arm",
+        type=int,
+        default=2400,
+        help="Maximum retained focal update rows per arm after tree reduction.",
+    )
+    parser.add_argument("--branch-max-replicates", type=int, default=4)
+    parser.add_argument("--branch-max-active", type=int, default=768)
+    parser.add_argument(
+        "--branch-bid-max-actions",
+        type=int,
+        default=4,
+        help="Maximum top-probability legal bid branches; 0 means exhaustive.",
+    )
+    parser.add_argument("--branch-support-floor", type=float, default=0.0)
+    parser.add_argument("--branch-target-temperature", type=float, default=1.0)
+    parser.add_argument("--branch-advantage-clip", type=float, default=4.0)
+    parser.add_argument("--branch-policy-coef", type=float, default=1.0)
+    parser.add_argument("--branch-kl-cap", type=float, default=0.005)
     parser.add_argument("--trick-coef", type=float, default=0.1)
+    parser.add_argument(
+        "--belief-head-only",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Detach suit/final-trick belief supervision from the shared trunk "
+            "and place the belief stack in its own optimizer group."
+        ),
+    )
     parser.add_argument("--owner-coef", type=float, default=0.05)
     # Head-only warmup after owner activation: iterations during which owner
     # gradients are detached from the trunk (persists across resumes).
@@ -86,6 +131,30 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--explore-eps-historical", default=None)
     parser.add_argument("--explore-eps-explore-self", default=None)
     parser.add_argument("--explore-eps-explore-historical", default=None)
+    parser.add_argument("--explore-eps-tempered-self", default=None)
+    parser.add_argument("--explore-eps-tempered-historical", default=None)
+    parser.add_argument("--explore-eps-capped-self", default=None)
+    parser.add_argument("--explore-eps-capped-historical", default=None)
+    parser.add_argument("--explore-eps-epsilon-self", default=None)
+    parser.add_argument("--explore-eps-epsilon-historical", default=None)
+    parser.add_argument(
+        "--explore-argmax-cap",
+        type=float,
+        default=1.0,
+        help=(
+            "On capped arms, maximum probability allowed for the highest-logit "
+            "legal action; probabilities already below it stay unchanged."
+        ),
+    )
+    parser.add_argument(
+        "--explore-argmax-rest-temp",
+        type=float,
+        default=1.0,
+        help=(
+            "Temperature for redistributing capped probability across legal "
+            "non-argmax actions."
+        ),
+    )
     # Trajectory-diversity temperatures: this fraction of rounds in
     # --explore-temp-arms sample the current policy from softmax(logits/T)
     # (behavior-policy only; PPO stays importance-correct via the recorded
@@ -94,9 +163,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--explore-temp-bid", type=float, default=1.0)
     parser.add_argument("--explore-temp-play", type=float, default=1.0)
     parser.add_argument("--explore-temp-arms", default="self,mixed")
-    # At most one uniform-random focal action per explore round, injected
-    # with this probability; placement uniform over the round's decisions.
+    # At most one policy-shaped non-argmax focal action per explore round,
+    # injected with this probability; placement is uniform over decisions.
     parser.add_argument("--explore-uniform-round-prob", type=float, default=0.0)
+    parser.add_argument(
+        "--explore-single-deviation-temp",
+        type=float,
+        default=3.0,
+        help=(
+            "Temperature over legal non-argmax logits for the at-most-one "
+            "deliberate deviation selected by --explore-uniform-round-prob."
+        ),
+    )
     # Shrink explore temperature + uniform probability on longer rounds by
     # (min_hand+1)/(hand+1) so per-round distortion stays roughly constant.
     parser.add_argument(
@@ -116,6 +194,12 @@ def parse_args() -> argparse.Namespace:
     # weights / league snapshots); only the focal seat produces samples.
     parser.add_argument("--explore-self-fraction", type=float, default=0.0)
     parser.add_argument("--explore-historical-fraction", type=float, default=0.0)
+    parser.add_argument("--tempered-self-fraction", type=float, default=0.0)
+    parser.add_argument("--tempered-historical-fraction", type=float, default=0.0)
+    parser.add_argument("--capped-self-fraction", type=float, default=0.0)
+    parser.add_argument("--capped-historical-fraction", type=float, default=0.0)
+    parser.add_argument("--epsilon-self-fraction", type=float, default=0.0)
+    parser.add_argument("--epsilon-historical-fraction", type=float, default=0.0)
     parser.add_argument("--historical-checkpoint", action="append", default=[])
     parser.add_argument("--historical-max-snapshots", type=int, default=4)
     parser.add_argument("--league-temperature", type=float, default=2.0)
@@ -139,6 +223,24 @@ def parse_args() -> argparse.Namespace:
             "Uniform league: on every checkpoint save, resample the whole "
             "historical pool uniformly from saved checkpoints at or after "
             "this iteration (pool size = --historical-max-snapshots)."
+        ),
+    )
+    parser.add_argument(
+        "--league-archive-dir",
+        type=Path,
+        default=None,
+        help=(
+            "Optional immutable checkpoint archive included in uniform-league "
+            "draws. New checkpoints still come from --checkpoint-dir."
+        ),
+    )
+    parser.add_argument(
+        "--league-resample-every",
+        type=int,
+        default=0,
+        help=(
+            "When positive, refresh a uniform league every N training "
+            "iterations instead of coupling refreshes to checkpoint writes."
         ),
     )
     parser.add_argument("--league-eval-every", type=int, default=50)
@@ -182,11 +284,44 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--search-min-iteration", type=int, default=250)
     parser.add_argument("--search-ev-threshold", type=float, default=0.30)
     parser.add_argument("--search-states-per-phase", type=int, default=24)
+    parser.add_argument("--search-bid-states", type=int, default=None)
+    parser.add_argument("--search-play-states", type=int, default=None)
+    parser.add_argument(
+        "--search-opponent-arms",
+        default="",
+        help="Optional comma-separated rollout arms eligible for search probes.",
+    )
+    parser.add_argument(
+        "--search-assume-value-ready",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Seed the value-readiness history for a mature resumed policy; "
+            "search's own stability and improvement gates still apply."
+        ),
+    )
+    parser.add_argument(
+        "--search-every",
+        type=int,
+        default=1,
+        help="Run search and its distillation update every N iterations.",
+    )
+    parser.add_argument("--search-min-determinizations", type=int, default=4)
+    parser.add_argument("--search-max-determinizations", type=int, default=32)
+    parser.add_argument("--search-forward-pass-budget", type=int, default=2_000)
+    parser.add_argument("--search-exact-tricks-remaining", type=int, default=3)
+    parser.add_argument(
+        "--search-use-owner-beliefs",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
     parser.add_argument("--search-replay-capacity", type=int, default=50_000)
     parser.add_argument("--search-replay-max-age", type=int, default=250)
     parser.add_argument("--search-lr", type=float, default=1e-4)
     parser.add_argument("--search-minibatch-size", type=int, default=256)
     parser.add_argument("--search-entropy-floor-coef", type=float, default=0.002)
+    parser.add_argument("--search-kl-cap-start", type=float, default=0.005)
+    parser.add_argument("--search-kl-cap-end", type=float, default=0.003)
     parser.add_argument("--eval-every", type=int, default=25)
     parser.add_argument("--eval-deals-per-configuration", type=int, default=4)
     parser.add_argument("--eval-bootstrap-samples", type=int, default=500)
@@ -217,18 +352,28 @@ def _uniform_league_draw(
     min_iteration: int,
     pool_size: int,
     seed: int,
+    archive_dir: Path | None = None,
 ) -> list[Path]:
-    """Uniform pool draw over all saved checkpoints at/after min_iteration.
+    """Uniform draw over archived and newly saved eligible checkpoints.
 
     Seeded by (run seed, current iteration) so a resumed run redraws the same
     pool at the same point, but every refresh is an independent sample.
     """
 
-    candidates = sorted(
-        path
-        for path in checkpoint_dir.glob("plump_v4_iter_*.pt")
-        if int(path.stem.rsplit("_", 1)[1]) >= min_iteration
-    )
+    candidates_by_iteration: dict[int, Path] = {}
+    for directory in (archive_dir, checkpoint_dir):
+        if directory is None:
+            continue
+        for path in directory.glob("plump_v4_iter_*.pt"):
+            iteration = int(path.stem.rsplit("_", 1)[1])
+            if iteration >= min_iteration:
+                # Prefer a newly written run checkpoint when an archive
+                # contains the same iteration.
+                candidates_by_iteration[iteration] = path
+    candidates = [
+        candidates_by_iteration[iteration]
+        for iteration in sorted(candidates_by_iteration)
+    ]
     if len(candidates) <= pool_size:
         return candidates
     return random.Random(seed).sample(candidates, pool_size)
@@ -262,6 +407,16 @@ def main() -> None:
         args.counterfactual_search
         and args.training_mode == "round"
     )
+    if args.search_every < 1:
+        raise ValueError("--search-every must be positive.")
+    if args.search_min_determinizations < 1:
+        raise ValueError("--search-min-determinizations must be positive.")
+    if args.search_max_determinizations < args.search_min_determinizations:
+        raise ValueError(
+            "--search-max-determinizations must be at least the minimum."
+        )
+    if args.search_forward_pass_budget < 1:
+        raise ValueError("--search-forward-pass-budget must be positive.")
     model_config = ModelConfig(
         max_seq_len=args.max_seq_len,
         d_model=args.d_model,
@@ -293,7 +448,23 @@ def main() -> None:
         ppo_clip_eps=args.ppo_clip_eps,
         value_coef=args.value_coef,
         entropy_coef=args.entropy_coef,
+        branch_rollouts=args.branch_rollouts,
+        branch_decision_budget_per_arm=(
+            args.branch_decision_budget_per_arm
+        ),
+        branch_update_decision_budget_per_arm=(
+            args.branch_update_decisions_per_arm
+        ),
+        branch_max_replicates=args.branch_max_replicates,
+        branch_max_active=args.branch_max_active,
+        branch_bid_max_actions=args.branch_bid_max_actions,
+        branch_support_floor=args.branch_support_floor,
+        branch_target_temperature=args.branch_target_temperature,
+        branch_advantage_clip=args.branch_advantage_clip,
+        branch_policy_coef=args.branch_policy_coef,
+        branch_kl_cap=args.branch_kl_cap,
         trick_coef=args.trick_coef,
+        belief_head_only=args.belief_head_only,
         owner_coef=args.owner_coef,
         owner_warmup_iterations=args.owner_warmup_iters,
         owner_capacity_coef=args.owner_capacity_coef,
@@ -310,9 +481,17 @@ def main() -> None:
                 ("historical", args.explore_eps_historical),
                 ("explore_self", args.explore_eps_explore_self),
                 ("explore_historical", args.explore_eps_explore_historical),
+                ("tempered_self", args.explore_eps_tempered_self),
+                ("tempered_historical", args.explore_eps_tempered_historical),
+                ("capped_self", args.explore_eps_capped_self),
+                ("capped_historical", args.explore_eps_capped_historical),
+                ("epsilon_self", args.explore_eps_epsilon_self),
+                ("epsilon_historical", args.explore_eps_epsilon_historical),
             )
             if override
         },
+        explore_argmax_cap=args.explore_argmax_cap,
+        explore_argmax_rest_temperature=args.explore_argmax_rest_temp,
         explore_temperature_fraction=args.explore_temp_fraction,
         explore_temperature_bid=args.explore_temp_bid,
         explore_temperature_play=args.explore_temp_play,
@@ -322,6 +501,9 @@ def main() -> None:
             if arm.strip()
         ),
         explore_uniform_round_probability=args.explore_uniform_round_prob,
+        explore_single_deviation_temperature=(
+            args.explore_single_deviation_temp
+        ),
         explore_noise_hand_normalized=args.explore_noise_hand_normalized,
         player_count_weights=_csv_floats(args.player_count_weights),
         hand_size_weights=_csv_floats(args.hand_size_weights),
@@ -332,6 +514,12 @@ def main() -> None:
         historical_fraction=args.historical_fraction,
         explore_self_fraction=args.explore_self_fraction,
         explore_historical_fraction=args.explore_historical_fraction,
+        tempered_self_fraction=args.tempered_self_fraction,
+        tempered_historical_fraction=args.tempered_historical_fraction,
+        capped_self_fraction=args.capped_self_fraction,
+        capped_historical_fraction=args.capped_historical_fraction,
+        epsilon_self_fraction=args.epsilon_self_fraction,
+        epsilon_historical_fraction=args.epsilon_historical_fraction,
         historical_checkpoint_paths=tuple(args.historical_checkpoint),
         historical_max_snapshots=args.historical_max_snapshots,
         league_temperature=args.league_temperature,
@@ -379,6 +567,16 @@ def main() -> None:
         )
 
     args.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    if (
+        args.league_archive_dir is not None
+        and not args.league_archive_dir.is_dir()
+    ):
+        raise ValueError(
+            f"League archive directory does not exist: "
+            f"{args.league_archive_dir}"
+        )
+    if args.league_resample_every < 0:
+        raise ValueError("--league-resample-every must be nonnegative.")
     if args.league_uniform_min_iteration is not None:
         # Replace whatever pool the checkpoint restored (e.g. an old
         # sliding-window league) with a uniform draw before the first
@@ -388,6 +586,7 @@ def main() -> None:
             args.league_uniform_min_iteration,
             args.historical_max_snapshots,
             args.seed * 1_000_003 + start_iteration,
+            args.league_archive_dir,
         )
         if initial_pool:
             trainer.replace_historical_snapshots(initial_pool)
@@ -401,8 +600,27 @@ def main() -> None:
             minimum_iteration=args.search_min_iteration,
             explained_variance_threshold=args.search_ev_threshold,
             states_per_phase=args.search_states_per_phase,
+            bid_states_per_iteration=args.search_bid_states,
+            play_states_per_iteration=args.search_play_states,
             replay_capacity=args.search_replay_capacity,
             replay_max_age=args.search_replay_max_age,
+            search_config=SearchConfig(
+                min_determinizations=args.search_min_determinizations,
+                max_determinizations=args.search_max_determinizations,
+                forward_pass_budget=args.search_forward_pass_budget,
+                exact_tricks_remaining=args.search_exact_tricks_remaining,
+                use_owner_beliefs=args.search_use_owner_beliefs,
+                seed=args.seed + 45_000,
+            ),
+            opponent_arms=tuple(
+                arm.strip()
+                for arm in args.search_opponent_arms.split(",")
+                if arm.strip()
+            ),
+            assume_value_ready=args.search_assume_value_ready,
+            event_length_buckets=event_length_buckets,
+            batch_packing=args.batch_packing,
+            lean_action_forward=args.lean_rollout_forward,
             seed=args.seed + 40_000,
         )
         if search_enabled
@@ -416,11 +634,20 @@ def main() -> None:
             minibatch_size=args.search_minibatch_size,
             max_grad_norm=args.max_grad_norm,
             entropy_floor_coef=args.search_entropy_floor_coef,
+            kl_cap_start=args.search_kl_cap_start,
+            kl_cap_end=args.search_kl_cap_end,
             seed=args.seed + 50_000,
         )
         if search_enabled
         else None
     )
+    search_replay_path = args.checkpoint_dir / "search_replay.pt"
+    if search_router is not None and search_replay_path.is_file():
+        search_router.replay = StratifiedReplayWindow.load(search_replay_path)
+        print(
+            f"loaded search replay rows={len(search_router.replay)} "
+            f"strata={search_router.replay.strata}"
+        )
     if args.env_workers > 0 and args.training_mode == "round":
         from plump.training.env_workers import EnvWorkerPool
 
@@ -492,16 +719,25 @@ def main() -> None:
             )
         rollout_stats = trainer.summarize_rollout(buffer)
 
+        search_due = (
+            search_router is not None
+            and (iteration - start_iteration) % args.search_every == 0
+        )
         search_routing = (
             search_router.route(buffer, iteration=iteration)
-            if search_router is not None
+            if search_due and search_router is not None
             else []
         )
         update_start = time.perf_counter()
         update_stats = trainer.update(buffer)
         search_updates = []
-        if search_router is not None and search_updater is not None:
-            for phase in ("bid", "play"):
+        if search_due and search_router is not None and search_updater is not None:
+            enabled_search_phases = (
+                phase
+                for phase in ("bid", "play")
+                if search_router.states_per_phase[phase] > 0
+            )
+            for phase in enabled_search_phases:
                 search_updates.append(
                     search_updater.update(
                         search_router.replay,
@@ -536,9 +772,20 @@ def main() -> None:
                 )
             diagnostics_sec = time.perf_counter() - diagnostics_start
 
+        branch_collection = ""
+        if args.branch_rollouts:
+            collection = trainer.last_collection_stats
+            branch_collection = (
+                f" roots={collection.branch_root_hands} "
+                f"leaves={collection.branch_terminal_rollouts} "
+                f"branch_decisions="
+                f"{collection.branch_self_decisions}/"
+                f"{collection.branch_historical_decisions} "
+                f"collect_s={collect_sec:.2f}"
+            )
         print(
             f"iter={iteration} bid_hit={rollout_stats.bid_hit_rate:.4f} "
-            f"{format_update_stats(update_stats)}"
+            f"{format_update_stats(update_stats)}{branch_collection}"
         )
         for routing in search_routing:
             if routing.eligible or routing.gate_passed:
@@ -599,7 +846,7 @@ def main() -> None:
             trainer.save_checkpoint(checkpoint_path, iteration=iteration, extra={"evaluation": evaluation})
             if search_router is not None:
                 search_router.replay.save(
-                    args.checkpoint_dir / "search_replay.pt",
+                    search_replay_path,
                     gate_report_path=logger.events_path,
                 )
             checkpoint_sec = time.perf_counter() - checkpoint_start
@@ -611,21 +858,40 @@ def main() -> None:
         if pending_collection is not None:
             next_buffer = pending_collection.result()
             pending_collection = None
-        if checkpoint_path is not None:
-            if args.league_uniform_min_iteration is not None:
-                pool = _uniform_league_draw(
-                    args.checkpoint_dir,
-                    args.league_uniform_min_iteration,
-                    args.historical_max_snapshots,
-                    args.seed * 1_000_003 + iteration,
+        uniform_resample_due = (
+            args.league_uniform_min_iteration is not None
+            and (
+                (
+                    args.league_resample_every <= 0
+                    and checkpoint_path is not None
                 )
-                if pool:
-                    trainer.replace_historical_snapshots(pool)
-            elif args.historical_current_snapshots:
-                trainer.add_historical_checkpoint(
-                    checkpoint_path,
-                    mirrors_current=True,
+                or (
+                    args.league_resample_every > 0
+                    and (iteration - start_iteration)
+                    % args.league_resample_every
+                    == 0
                 )
+            )
+        )
+        if uniform_resample_due:
+            pool = _uniform_league_draw(
+                args.checkpoint_dir,
+                args.league_uniform_min_iteration,
+                args.historical_max_snapshots,
+                args.seed * 1_000_003 + iteration,
+                args.league_archive_dir,
+            )
+            if pool:
+                trainer.replace_historical_snapshots(pool)
+        elif (
+            checkpoint_path is not None
+            and args.league_uniform_min_iteration is None
+            and args.historical_current_snapshots
+        ):
+            trainer.add_historical_checkpoint(
+                checkpoint_path,
+                mirrors_current=True,
+            )
         trainer.refresh_league_payoffs(iteration=iteration)
         trainer.sync_rollout_model()
 
