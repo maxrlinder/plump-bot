@@ -117,6 +117,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--branch-neurd-kl-coef", type=float, default=1.0)
     parser.add_argument("--branch-kl-cap", type=float, default=0.005)
     parser.add_argument(
+        "--branch-exhaustive-hand-schedule",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Deal one matched self/history root for every configured hand "
+            "size, sample player count and focal seat, and expand every "
+            "focal action without rollout or update-row truncation."
+        ),
+    )
+    parser.add_argument(
         "--branch-tree-decision-budget-per-arm",
         type=int,
         default=0,
@@ -501,6 +511,9 @@ def main() -> None:
         branch_neurd_regret_coef=args.branch_neurd_regret_coef,
         branch_neurd_kl_coef=args.branch_neurd_kl_coef,
         branch_kl_cap=args.branch_kl_cap,
+        branch_exhaustive_hand_schedule=(
+            args.branch_exhaustive_hand_schedule
+        ),
         branch_tree_decision_budget_per_arm=(
             args.branch_tree_decision_budget_per_arm
         ),

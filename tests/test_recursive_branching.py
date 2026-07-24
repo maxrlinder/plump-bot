@@ -225,6 +225,58 @@ def test_collection_stops_once_both_direct_caps_are_full() -> None:
     ) == 2
 
 
+def test_exhaustive_schedule_deals_each_hand_size_and_retains_every_branch() -> None:
+    trainer = _tiny_branch_trainer(
+        player_counts=(3, 4),
+        player_count_weights=(0.0, 1.0),
+        hand_sizes=(3, 4),
+        branch_exhaustive_hand_schedule=True,
+        branch_decision_budget_per_arm=0,
+        branch_update_decision_budget_per_arm=0,
+        branch_max_active=8,
+        branch_bid_max_actions=0,
+    )
+    buffer = trainer.collect_rollouts()
+    stats = trainer.last_collection_stats
+    outcomes = Counter(
+        (outcome.spec, outcome.opponent_arm)
+        for outcome in buffer.round_outcomes
+    )
+
+    assert outcomes == {
+        (RoundSpec(4, 3), "self"): 1,
+        (RoundSpec(4, 3), "historical"): 1,
+        (RoundSpec(4, 4), "self"): 1,
+        (RoundSpec(4, 4), "historical"): 1,
+    }
+    assert stats.branch_root_hands == 4
+    assert stats.branch_roots_available == stats.branch_roots_expanded
+    assert stats.branch_roots_expanded == sum(
+        sample.branch_action_values is not None
+        for sample in buffer.samples
+    )
+    for arm in ("self", "historical"):
+        for hand_size in (3, 4):
+            assert sum(
+                sample.round_weight
+                for sample in buffer.samples
+                if sample.opponent_arm == arm
+                and sample.spec.hand_size == hand_size
+            ) == pytest.approx(0.25)
+    assert all(
+        0 <= sample.acting_player < sample.spec.num_players
+        for sample in buffer.samples
+    )
+
+
+def test_exhaustive_schedule_requires_uncapped_bidding() -> None:
+    with pytest.raises(ValueError, match="branch_bid_max_actions=0"):
+        _tiny_branch_trainer(
+            branch_exhaustive_hand_schedule=True,
+            branch_bid_max_actions=4,
+        )
+
+
 def test_remaining_budget_excludes_only_each_players_final_card(
     collected_branch_batch,
 ) -> None:

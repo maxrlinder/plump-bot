@@ -42,6 +42,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--packing", choices=("torch", "numpy"), default="numpy")
     parser.add_argument("--rounds-per-configuration", type=int, default=16)
+    parser.add_argument("--player-counts", default="3,4,5")
+    parser.add_argument("--hand-sizes", default="3,4,5,6,7,8,9,10")
     parser.add_argument("--num-envs", type=int, default=384)
     parser.add_argument("--env-workers", type=int, default=0)
     parser.add_argument("--ppo-epochs", type=int, default=4)
@@ -50,6 +52,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--branch-decision-budget-per-arm", type=int, default=30_000)
     parser.add_argument("--branch-update-decisions-per-arm", type=int, default=2_400)
     parser.add_argument("--branch-max-active", type=int, default=768)
+    parser.add_argument(
+        "--branch-exhaustive-hand-schedule",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
     parser.add_argument(
         "--branch-policy-objective",
         choices=("ppo", "neurd"),
@@ -147,10 +154,36 @@ def checkpoint_config(
         if field.name != "model_config"
     }
     optimized = args.mode in {"optimized", "recursive"}
+    player_counts = tuple(
+        int(value) for value in args.player_counts.split(",") if value
+    )
+    hand_sizes = tuple(
+        int(value) for value in args.hand_sizes.split(",") if value
+    )
+    stored_player_counts = tuple(values.get("player_counts", ()))
+    stored_player_weights = tuple(values.get("player_count_weights", ()))
+    player_weight_map = dict(
+        zip(stored_player_counts, stored_player_weights)
+    )
+    stored_hand_sizes = tuple(values.get("hand_sizes", ()))
+    stored_hand_weights = tuple(values.get("hand_size_weights", ()))
+    hand_weight_map = dict(zip(stored_hand_sizes, stored_hand_weights))
     values.update(
         {
-            "player_counts": (3, 4, 5),
-            "hand_sizes": tuple(range(3, 11)),
+            "player_counts": player_counts,
+            "hand_sizes": hand_sizes,
+            "player_count_weights": (
+                tuple(player_weight_map[value] for value in player_counts)
+                if player_weight_map
+                and all(value in player_weight_map for value in player_counts)
+                else ()
+            ),
+            "hand_size_weights": (
+                tuple(hand_weight_map[value] for value in hand_sizes)
+                if hand_weight_map
+                and all(value in hand_weight_map for value in hand_sizes)
+                else ()
+            ),
             "rounds_per_configuration": args.rounds_per_configuration,
             "num_envs": args.num_envs,
             "ppo_epochs": args.ppo_epochs,
@@ -211,7 +244,12 @@ def checkpoint_config(
                     args.branch_update_decisions_per_arm
                 ),
                 "branch_max_active": args.branch_max_active,
-                "branch_bid_max_actions": 4,
+                "branch_bid_max_actions": (
+                    0 if args.branch_exhaustive_hand_schedule else 4
+                ),
+                "branch_exhaustive_hand_schedule": (
+                    args.branch_exhaustive_hand_schedule
+                ),
                 "branch_support_floor": 0.0,
                 "branch_target_temperature": 1.0,
                 "branch_advantage_clip": 4.0,

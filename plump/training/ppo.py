@@ -332,6 +332,12 @@ class TrainingConfig:
     branch_neurd_regret_coef: float = 1.0
     branch_neurd_kl_coef: float = 1.0
     branch_kl_cap: float = 0.005
+    # Deal exactly one matched self/history root for every configured hand
+    # size. Player count is sampled from player_count_weights and the focal
+    # seat is uniform. Every genuine focal decision is expanded, with no
+    # rollout or retained-row truncation; branch_max_active becomes only the
+    # maximum inference frontier processed at once.
+    branch_exhaustive_hand_schedule: bool = False
     # Optional per-matched-deal caps. They keep one determinization from
     # consuming the whole collection/update budget, while the global budgets
     # still control the total rollout work and optimizer memory.
@@ -1263,6 +1269,8 @@ class PPOTrainer:
             raise RuntimeError(
                 "Recursive branch collection requires historical snapshots."
             )
+        if self.config.branch_exhaustive_hand_schedule:
+            return self._collect_exhaustive_hand_schedule(iteration=iteration)
         self._collection_model().eval()
         del iteration
         buffer = RolloutBuffer()
@@ -1474,6 +1482,122 @@ class PPOTrainer:
                 )
         return buffer
 
+    def _collect_exhaustive_hand_schedule(
+        self,
+        *,
+        iteration: int,
+    ) -> RolloutBuffer:
+        """Collect one fully expanded matched deal per configured hand size."""
+
+        del iteration
+        self._collection_model().eval()
+        buffer = RolloutBuffer()
+        selected: list[RolloutSample] = []
+        baseline_updates: list[tuple[PositionKey, float]] = []
+        spent: dict[OpponentArm, int] = {"self": 0, "historical": 0}
+        player_weights = (
+            self.config.player_count_weights
+            if self.config.player_count_weights
+            else tuple(1.0 for _ in self.config.player_counts)
+        )
+        hand_count = len(self.config.hand_sizes)
+
+        for pair_id, hand_size in enumerate(self.config.hand_sizes):
+            num_players = self.rng.choices(
+                self.config.player_counts,
+                weights=player_weights,
+                k=1,
+            )[0]
+            spec = RoundSpec(num_players, hand_size)
+            focal_player = self.rng.randrange(num_players)
+            episodes = self._new_matched_branch_episodes(
+                spec,
+                pair_id,
+                focal_player=focal_player,
+            )
+            roots = self._collect_recursive_tree_pair(
+                episodes,
+                decision_budgets=None,
+                retain_slots=None,
+                exhaustive=True,
+            )
+            stats = self._active_collection_stats
+            if stats is not None:
+                stats.branch_root_hands += len(roots)
+
+            for episode in episodes:
+                arm = episode.opponent_arm
+                root = roots[arm]
+                spent[arm] += root.rollout_decisions
+                if not root.samples:
+                    raise RuntimeError(
+                        "An exhaustive recursive tree produced no update rows."
+                    )
+                # Each hand size and opponent arm owns equal total objective
+                # mass. Without per-tree normalization, the factorially
+                # larger long-hand trees would drown out sizes 3--9.
+                tree_weight = 0.5 / (hand_count * len(root.samples))
+                for sample in root.samples:
+                    sample.round_weight = tree_weight
+                selected.extend(root.samples)
+
+                if root.canonical_result is None:
+                    raise RuntimeError(
+                        "Exhaustive recursive tree completed without a "
+                        "canonical policy path."
+                    )
+                outcome = self._round_outcome_from_result(
+                    episode_id=episode.episode_id,
+                    num_players=episode.env.config.num_players,
+                    opponent_arm=arm,
+                    focal_player=episode.focal_player,
+                    opponent_snapshot_id=episode.opponent_snapshot_id,
+                    result=root.canonical_result,
+                )
+                buffer.round_outcomes.append(outcome)
+                focal_bid = next(
+                    bid
+                    for bid in root.canonical_result.bids
+                    if bid.player == episode.focal_player
+                )
+                baseline_updates.append(
+                    (
+                        (
+                            spec.num_players,
+                            spec.hand_size,
+                            focal_bid.position,
+                        ),
+                        float(outcome.focal_reward),
+                    )
+                )
+
+        self.rng.shuffle(selected)
+        buffer.samples = selected
+        self.position_baseline.update_many(baseline_updates)
+        self._update_league_ema(buffer.round_outcomes)
+        stats = self._active_collection_stats
+        if stats is not None:
+            stats.branch_self_decisions = spent["self"]
+            stats.branch_historical_decisions = spent["historical"]
+            direct_rows = sum(
+                sample.branch_action_values is not None
+                for sample in selected
+            )
+            if direct_rows != stats.branch_roots_expanded:
+                raise RuntimeError(
+                    "Every exhaustive focal expansion must reach the update "
+                    "buffer exactly once: "
+                    f"expanded={stats.branch_roots_expanded} "
+                    f"direct_rows={direct_rows}."
+                )
+            if stats.branch_roots_available != stats.branch_roots_expanded:
+                raise RuntimeError(
+                    "Exhaustive collection left focal decisions unexpanded: "
+                    f"available={stats.branch_roots_available} "
+                    f"expanded={stats.branch_roots_expanded}."
+                )
+        return buffer
+
     def _draw_branch_root_spec(self, remaining: int) -> RoundSpec | None:
         eligible = [
             spec
@@ -1506,6 +1630,8 @@ class PPOTrainer:
         self,
         spec: RoundSpec,
         pair_id: int,
+        *,
+        focal_player: int | None = None,
     ) -> tuple[_ActiveEpisode, _ActiveEpisode]:
         start_player = self.rng.randrange(spec.num_players)
         env = PlumpEnv(
@@ -1513,7 +1639,8 @@ class PPOTrainer:
             seed=self.rng.randrange(2**31),
         )
         env.reset()
-        focal_player = pair_id % spec.num_players
+        if focal_player is None:
+            focal_player = pair_id % spec.num_players
         episodes = []
         for offset, arm in enumerate(("self", "historical")):
             opponents, snapshot_id = self._opponent_policies(
@@ -1539,8 +1666,9 @@ class PPOTrainer:
         self,
         episodes: tuple[_ActiveEpisode, _ActiveEpisode],
         *,
-        decision_budgets: dict[OpponentArm, int],
-        retain_slots: dict[OpponentArm, int],
+        decision_budgets: dict[OpponentArm, int] | None,
+        retain_slots: dict[OpponentArm, int] | None,
+        exhaustive: bool = False,
     ) -> dict[OpponentArm, _RecursiveTreeRoot]:
         """Run a matched self/history pair through one shared model frontier."""
 
@@ -1559,7 +1687,10 @@ class PPOTrainer:
         for episode in episodes:
             arm = episode.opponent_arm
             initial_cost = self._remaining_round_decisions(episode.env)
-            if initial_cost > decision_budgets[arm]:
+            if (
+                decision_budgets is not None
+                and initial_cost > decision_budgets[arm]
+            ):
                 raise RuntimeError("Root tree does not fit its decision budget.")
             committed[arm] = initial_cost
             active.append(
@@ -1579,11 +1710,25 @@ class PPOTrainer:
             )
 
         while active:
+            if exhaustive:
+                # Process a LIFO slice. This keeps model inference bounded and
+                # makes traversal depth-first enough that complete expansion
+                # does not require materializing the entire live leaf frontier
+                # at once.
+                frontier_size = min(
+                    len(active),
+                    self.config.branch_max_active,
+                )
+                frontier = active[-frontier_size:]
+                del active[-frontier_size:]
+            else:
+                frontier = active
+                active = []
             current_rows: list[_RecursiveTreePath] = []
             current_requests: list[DecisionRequest] = []
             frozen_groups: dict[int, list[_RecursiveTreePath]] = defaultdict(list)
             frozen_policies: dict[int, ActionPolicy] = {}
-            for path in active:
+            for path in frontier:
                 episode = path.root.episode
                 player = path.env.current_player()
                 frozen = (
@@ -1621,11 +1766,15 @@ class PPOTrainer:
                         minimum_increment = (
                             max(candidate_count - 1, 0) * remaining
                         )
-                        collect = (
-                            candidate_count > 1
-                            and retained[arm] < retain_slots[arm]
-                            and committed[arm] + minimum_increment
-                            <= decision_budgets[arm]
+                        collect = candidate_count > 1 and (
+                            exhaustive
+                            or (
+                                retain_slots is not None
+                                and decision_budgets is not None
+                                and retained[arm] < retain_slots[arm]
+                                and committed[arm] + minimum_increment
+                                <= decision_budgets[arm]
+                            )
                         )
                 current_rows.append(path)
                 current_requests.append(
@@ -1705,7 +1854,7 @@ class PPOTrainer:
                     tuple[tuple[int, ...], ...],
                 ]
             ] = []
-            for path in active:
+            for path in frontier:
                 sample, raw_action = action_by_path[id(path)]
                 if sample is None or len(path.env.legal_actions()) <= 1:
                     continue
@@ -1743,7 +1892,7 @@ class PPOTrainer:
             projected_live = {
                 arm: sum(
                     path.root.episode.opponent_arm == arm
-                    for path in active
+                    for path in frontier
                 )
                 for arm in ("self", "historical")
             }
@@ -1762,12 +1911,15 @@ class PPOTrainer:
                 arm = path.root.episode.opponent_arm
                 remaining = self._remaining_round_decisions(path.env)
                 increment = (len(candidates) - 1) * remaining
-                if (
-                    retained[arm] < retain_slots[arm]
+                bounded_approval = (
+                    retain_slots is not None
+                    and decision_budgets is not None
+                    and retained[arm] < retain_slots[arm]
                     and committed[arm] + increment <= decision_budgets[arm]
                     and projected_live[arm] + len(candidates) - 1
                     <= per_arm_active_cap
-                ):
+                )
+                if exhaustive or bounded_approval:
                     retained[arm] += 1
                     approved[id(path)] = (
                         candidates,
@@ -1784,7 +1936,7 @@ class PPOTrainer:
                             stats.branch_play_roots += 1
 
             next_active: list[_RecursiveTreePath] = []
-            for path in active:
+            for path in frontier:
                 sample, raw_action = action_by_path[id(path)]
                 expansion = approved.get(id(path))
                 if expansion is None:
@@ -1866,7 +2018,10 @@ class PPOTrainer:
                         action,
                         next_active,
                     )
-            active = next_active
+            if exhaustive:
+                active.extend(next_active)
+            else:
+                active = next_active
 
         for arm, root in roots.items():
             if root.rollout_decisions != committed[arm]:
@@ -1885,7 +2040,7 @@ class PPOTrainer:
                     f"arm={arm} reserved={retained[arm]} "
                     f"direct_rows={direct_rows}."
                 )
-            if direct_rows > retain_slots[arm]:
+            if retain_slots is not None and direct_rows > retain_slots[arm]:
                 raise RuntimeError(
                     "Per-tree direct rows exceeded their update cap: "
                     f"arm={arm} rows={direct_rows} "
@@ -6115,14 +6270,16 @@ class PPOTrainer:
                 raise ValueError(
                     "branch_rollouts require an even rounds_per_batch."
                 )
-            if self.config.branch_decision_budget_per_arm < 1:
-                raise ValueError(
-                    "branch_decision_budget_per_arm must be positive."
-                )
-            if self.config.branch_update_decision_budget_per_arm < 1:
-                raise ValueError(
-                    "branch_update_decision_budget_per_arm must be positive."
-                )
+            if not self.config.branch_exhaustive_hand_schedule:
+                if self.config.branch_decision_budget_per_arm < 1:
+                    raise ValueError(
+                        "branch_decision_budget_per_arm must be positive."
+                    )
+                if self.config.branch_update_decision_budget_per_arm < 1:
+                    raise ValueError(
+                        "branch_update_decision_budget_per_arm must be "
+                        "positive."
+                    )
             if self.config.branch_max_replicates < 1:
                 raise ValueError("branch_max_replicates must be positive.")
             if self.config.branch_max_active < 1:
@@ -6131,6 +6288,22 @@ class PPOTrainer:
                 raise ValueError(
                     "branch_bid_max_actions must be nonnegative "
                     "(zero means all legal bids)."
+                )
+            if (
+                self.config.branch_exhaustive_hand_schedule
+                and self.config.branch_bid_max_actions != 0
+            ):
+                raise ValueError(
+                    "branch_exhaustive_hand_schedule requires "
+                    "branch_bid_max_actions=0 so bidding is exhaustive too."
+                )
+            if (
+                self.config.branch_exhaustive_hand_schedule
+                and len(set(self.config.hand_sizes))
+                != len(self.config.hand_sizes)
+            ):
+                raise ValueError(
+                    "Exhaustive hand schedules require unique hand sizes."
                 )
             for arm in ("self", "historical"):
                 effective_eps = self.config.explore_eps_by_arm.get(
