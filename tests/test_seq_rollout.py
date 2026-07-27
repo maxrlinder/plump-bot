@@ -16,6 +16,9 @@ from plump.seq.config import (
     BranchBudgetConfig,
     BranchRuleConfig,
     GameScheduleCell,
+    SLOT_REL_PLAYER,
+    SLOT_TYPE,
+    TOKEN_BID,
     RolloutOptions,
     SeqModelConfig,
     SeqTrainingConfig,
@@ -393,9 +396,10 @@ def options_collector(
     branch_rate: float = 1.0,
     play_mode="all_legal",
     seed=0,
+    model_config: SeqModelConfig = MODEL_CONFIG,
 ):
     torch.manual_seed(seed)
-    model = SeqPlumpModel(MODEL_CONFIG).eval()
+    model = SeqPlumpModel(model_config).eval()
     train = SeqTrainingConfig(
         schedule_cells=tuple(cells),
         branch_rule=BranchRuleConfig(bid_top_k=4, play_mode=play_mode),
@@ -481,6 +485,39 @@ def test_bid_split_matches_unsplit_tree():
         return owners[0].value_targets()[0]
 
     assert root_target(b) == pytest.approx(root_target(a))
+
+
+@pytest.mark.parametrize("turn_token", ["off", "bid", "all"])
+def test_bid_split_starts_at_the_focal_bid_under_every_schema(turn_token):
+    """The split boundary is a token position, so the schema flags move it."""
+
+    config = replace(MODEL_CONFIG, turn_token=turn_token)
+    cells = [GameScheduleCell(hand_size=4, num_players=3)]
+    collector = options_collector(
+        cells=cells,
+        options=RolloutOptions(bid_split_groups=2),
+        model_config=config,
+    )
+    tree = collect_trees(collector, seed=8)[0]
+    bid_index = (tree.focal - tree.bidding_start_player) % tree.num_players
+    boundary = config.bid_token_position(tree.hand_size, bid_index)
+    # Later passes replay the shared prefix and own nothing before the focal's
+    # own bid; branch children own from their own (later) split point, so the
+    # focal bid is the earliest owned position after the shared prefix.
+    owned = {leaf.owned_from for leaf in tree.leaves}
+    assert 0 in owned
+    assert min(position for position in owned if position) == boundary
+    tokens = build_seat_tokens(
+        config,
+        tree.leaves[0].env.state.event_log,
+        tree.focal,
+        tree.num_players,
+        tree.hand_size,
+        tree.initial_hands[tree.focal],
+        tree.bidding_start_player,
+    )
+    assert tokens[boundary, SLOT_TYPE] == TOKEN_BID
+    assert tokens[boundary, SLOT_REL_PLAYER] == 0
 
 
 def test_bid_split_owns_each_position_exactly_once():

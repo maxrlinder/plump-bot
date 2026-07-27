@@ -48,6 +48,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--n-heads", type=int, default=8)
     parser.add_argument("--n-kv-heads", type=int, default=None)
     parser.add_argument("--d-ff", type=int, default=768)
+    parser.add_argument(
+        "--no-trick-win-token",
+        action="store_true",
+        help="drop the per-trick winner token; the winner is derivable from "
+        "the plays and is already named by the last play's next-actor slot",
+    )
+    parser.add_argument(
+        "--turn-token",
+        choices=["off", "bid", "all"],
+        default="off",
+        help="insert a contentless pause token before actions: never, before "
+        "bids only, or before every decision",
+    )
 
     parser.add_argument("--hand-sizes", default="3,4,5,6,7,8,9,10")
     parser.add_argument("--player-counts", default="3,4,5")
@@ -174,6 +187,8 @@ def main() -> None:
         n_heads=args.n_heads,
         n_kv_heads=args.n_kv_heads,
         d_ff=args.d_ff,
+        trick_win_token=not args.no_trick_win_token,
+        turn_token=args.turn_token,
     )
     hand_sizes = _csv_ints(args.hand_sizes)
     player_counts = _csv_ints(args.player_counts)
@@ -268,7 +283,9 @@ def main() -> None:
         f"Training seq v6 on {device}: dims {args.d_model}x{args.n_layers}, "
         f"{sum(cell.games for cell in cells)} deals/update over {len(cells)} "
         f"shapes, branch rate {args.reference_rate} at 10 cards "
-        f"cache cap {args.max_cache_rows} rows"
+        f"cache cap {args.max_cache_rows} rows | schema: trick_win="
+        f"{model_config.trick_win_token} turn={model_config.turn_token} "
+        f"(max_seq_len {model_config.max_seq_len})"
     )
     for iteration in range(trainer.iteration + 1, args.iterations + 1):
         trainer.iteration = iteration

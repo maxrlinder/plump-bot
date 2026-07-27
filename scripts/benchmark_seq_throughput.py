@@ -74,6 +74,10 @@ def parse_args() -> argparse.Namespace:
         help="derive the per-shape branch rate table from this rate at 10 cards",
     )
     parser.add_argument("--exhaustive-until", type=int, default=7)
+    parser.add_argument("--no-trick-win-token", action="store_true")
+    parser.add_argument(
+        "--turn-token", choices=["off", "bid", "all"], default="off"
+    )
     parser.add_argument("--max-cache-rows", type=int, default=None)
     return parser.parse_args()
 
@@ -96,6 +100,8 @@ def main() -> None:
         n_heads=args.n_heads,
         n_kv_heads=args.n_kv_heads,
         d_ff=args.d_ff,
+        trick_win_token=not args.no_trick_win_token,
+        turn_token=args.turn_token,
     )
     if args.balanced:
         schedule = build_position_balanced_schedule(
