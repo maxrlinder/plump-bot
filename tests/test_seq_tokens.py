@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import random
+from dataclasses import replace
 
 import numpy as np
 import pytest
@@ -30,6 +31,7 @@ from plump.seq.config import (
     TOKEN_HAND,
     TOKEN_PLAY,
     TOKEN_TRICK_WIN,
+    TOKEN_TURN,
     SeqModelConfig,
     seq_len,
 )
@@ -71,10 +73,10 @@ def play_random_round(num_players, hand_size, seed, observer):
     return env, oracles, start
 
 
-def replay_arrays_for(env, observer, start, label_from=0):
+def replay_arrays_for(env, observer, start, label_from=0, config=None):
     round_state = env.state.current_round
     return seq_tokens.build_replay_arrays(
-        CONFIG,
+        config or CONFIG,
         round_state.initial_hands,
         env.state.event_log,
         observer,
@@ -285,3 +287,68 @@ def test_incomplete_round_raises():
             5,
             0,
         )
+
+
+SCHEMAS = [
+    (trick_win, turn)
+    for trick_win in (True, False)
+    for turn in ("off", "bid", "all")
+]
+
+
+@pytest.mark.parametrize("trick_win_token,turn_token", SCHEMAS)
+@pytest.mark.parametrize("num_players,hand_size,seed", CASES)
+def test_schema_flags_keep_the_stream_and_the_labels_aligned(
+    trick_win_token, turn_token, num_players, hand_size, seed
+):
+    """seq_len, the token stream and the decision positions must agree.
+
+    The flags move every token after the first bid, so an off-by-one between
+    the layout the stream is built from and the one the labeller walks would
+    hand the policy head a row belonging to a different position.
+    """
+
+    config = replace(
+        CONFIG, trick_win_token=trick_win_token, turn_token=turn_token
+    )
+    env, _, start = play_random_round(num_players, hand_size, seed, observer=0)
+    for observer in range(num_players):
+        arrays = replay_arrays_for(env, observer, start, config=config)
+        tokens = arrays.tokens
+        length = config.seq_len(num_players, hand_size)
+        assert tokens.shape == (length, seq_tokens.TOKEN_WIDTH)
+
+        vocab = config.slot_vocab_sizes
+        for slot in range(seq_tokens.TOKEN_WIDTH):
+            assert tokens[:, slot].min() >= 0
+            assert tokens[:, slot].max() < vocab[slot]
+
+        types = tokens[:, SLOT_TYPE]
+        assert (types == TOKEN_TRICK_WIN).sum() == (
+            hand_size if trick_win_token else 0
+        )
+        expected_turns = {
+            "off": 0, "bid": num_players, "all": num_players * (hand_size + 1)
+        }[turn_token]
+        assert (types == TOKEN_TURN).sum() == expected_turns
+
+        # The observer decides once per bid and once per trick, and each
+        # decision is read off the token immediately before its action.
+        assert len(arrays.decision_positions) == hand_size + 1
+        for position, target, phase in zip(
+            arrays.decision_positions,
+            arrays.action_targets,
+            arrays.decision_phases,
+        ):
+            action = tokens[position + 1]
+            assert action[SLOT_REL_PLAYER] == 0
+            if phase == NEXT_BID:
+                assert action[SLOT_TYPE] == TOKEN_BID
+                assert action[SLOT_BID] == target
+            else:
+                assert action[SLOT_TYPE] == TOKEN_PLAY
+                assert action[SLOT_CARD] == target
+            if turn_token == "all" or (turn_token == "bid" and phase == NEXT_BID):
+                assert tokens[position, SLOT_TYPE] == TOKEN_TURN
+                assert tokens[position, SLOT_REL_PLAYER] == 0
+        assert (tokens[arrays.decision_positions, SLOT_NEXT_ACTOR] == 0).all()

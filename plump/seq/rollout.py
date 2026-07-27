@@ -40,7 +40,6 @@ from .config import (
     GameScheduleCell,
     SeqModelConfig,
     SeqTrainingConfig,
-    seq_len,
 )
 from .kv import KVCache
 from .model import SeqPlumpModel
@@ -49,8 +48,11 @@ from .tokens import (
     TOKEN_WIDTH,
     card_from_id,
     card_id,
+    emits_token,
     event_token,
     prefix_tokens,
+    turn_token,
+    turn_token_for_phase,
 )
 
 CURRENT = "current"
@@ -513,7 +515,7 @@ class SeqRolloutCollector:
         trees = [tree for tree, _, _ in unit]
         num_players = trees[0].num_players
         hand_size = trees[0].hand_size
-        prefix_len = 1 + hand_size
+        prefix_len = self.model_config.prefix_len(hand_size)
         self._split_plan = (split_group, split_total) if split_total > 1 else None
         self._split_done = set()
 
@@ -644,12 +646,11 @@ class SeqRolloutCollector:
             cache.reset()
         self._split_plan = None
 
-    @staticmethod
-    def _split_position(tree: SeqTree) -> int:
+    def _split_position(self, tree: SeqTree) -> int:
         """Token position of the focal's own bid: where a split pass starts."""
 
         bid_index = (tree.focal - tree.bidding_start_player) % tree.num_players
-        return 1 + tree.hand_size + bid_index
+        return self.model_config.bid_token_position(tree.hand_size, bid_index)
 
     def _policy_for_seat(self, arm: str, focal: int, seat: int) -> str:
         if seat == focal or arm == "self":
@@ -1289,7 +1290,9 @@ class SeqRolloutCollector:
         # Positions past the last appended token (forced run-out tail, or a
         # child terminating right after its branch action) still belong to
         # this leaf's terminal segment.
-        total_len = seq_len(leaf.tree.num_players, leaf.tree.hand_size)
+        total_len = self.model_config.seq_len(
+            leaf.tree.num_players, leaf.tree.hand_size
+        )
         leaf.open_positions.extend(range(leaf.covered_until, total_len))
         leaf.covered_until = total_len
         leaf.segments.append((leaf.open_positions, None))
@@ -1316,7 +1319,9 @@ class SeqRolloutCollector:
                 leaf.history = np.zeros(
                     (
                         tree.num_players,
-                        seq_len(tree.num_players, tree.hand_size),
+                        self.model_config.seq_len(
+                            tree.num_players, tree.hand_size
+                        ),
                         TOKEN_WIDTH,
                     ),
                     dtype=np.int64,
@@ -1362,6 +1367,68 @@ class SeqRolloutCollector:
                         value=float(values[row]),
                     )
 
+    @staticmethod
+    def _next_play_slot(events: list[GameEvent]) -> tuple[int, int]:
+        """(trick index, position in trick) of the play that follows a wave."""
+
+        for event in reversed(events):
+            if event.type == EventType.TRICK_WIN:
+                return event.trick_index + 1, 0
+            if event.type == EventType.PLAY:
+                return event.trick_index, event.position_in_trick + 1
+        return 0, 0  # the wave was a bid; play opens at the first trick
+
+    def _wave_blocks(
+        self, leaf: SeqLeaf, events: list[GameEvent]
+    ) -> list[np.ndarray]:
+        """Per-seat token rows this wave appends: one [P, WIDTH] block each.
+
+        A wave is one action plus whatever it implied (the TRICK_WIN closing a
+        trick), then the next actor's TURN token when TURN tokens are on. Every
+        seat gets a token at every one of these positions -- only the
+        observer-relative fields differ -- which is what keeps every cache row
+        the same length and the loop's single scalar ``position`` valid. A
+        TURN token appended to the acting seat alone would be ~1/P the tokens
+        but would desynchronise the rows by one, and the dense zero-copy cache
+        read that makes the wave loop fast needs a single row length.
+        """
+
+        config = self.model_config
+        tree = leaf.tree
+        num_players = tree.num_players
+        hand_size = tree.hand_size
+        seats = np.arange(num_players)
+
+        def tile(row: list[int], reference_player: int) -> np.ndarray:
+            block = np.tile(np.asarray(row, dtype=np.int64), (num_players, 1))
+            block[:, SLOT_REL_PLAYER] = (reference_player - seats) % num_players
+            return block
+
+        blocks = [
+            tile(
+                event_token(config, event, 0, num_players, hand_size),
+                event.player,
+            )
+            for event in events
+            if emits_token(config, event)
+        ]
+        next_actor = leaf.env.state.current_player
+        bidding = leaf.env.phase() == Phase.BIDDING
+        next_phase = NEXT_BID if bidding else NEXT_PLAY
+        if turn_token_for_phase(config, next_phase):
+            trick, pos = (None, None) if bidding else self._next_play_slot(events)
+            blocks.append(
+                tile(
+                    turn_token(
+                        config, num_players, hand_size, 0, next_phase, trick, pos
+                    ),
+                    next_actor,
+                )
+            )
+        blocks[-1][:, SLOT_NEXT_ACTOR] = (next_actor - seats) % num_players
+        blocks[-1][:, SLOT_NEXT_PHASE] = next_phase
+        return blocks
+
     def _append_wave(
         self,
         appends: list[tuple[SeqLeaf, list[GameEvent]]],
@@ -1369,13 +1436,16 @@ class SeqRolloutCollector:
         position: int,
         row_counters: dict[str, int],
     ) -> int:
-        event_count = len(appends[0][1])
-        if any(len(events) != event_count for _, events in appends):
-            raise AssertionError("Wave-synchronized leaves diverged in event count.")
-        # Only the last event of a wave produces a readout -- a trick's
+        blocks_by_leaf = [
+            (leaf, self._wave_blocks(leaf, events)) for leaf, events in appends
+        ]
+        event_count = len(blocks_by_leaf[0][1])
+        if any(len(blocks) != event_count for _, blocks in blocks_by_leaf):
+            raise AssertionError("Wave-synchronized leaves diverged in token count.")
+        # Only the last token of a wave produces a readout -- a trick's
         # completing play is appended together with its TRICK_WIN token, and
         # nobody acts in between. So the cached path appends the whole run in
-        # one forward instead of one per event; the earlier events exist purely
+        # one forward instead of one per token; the earlier ones exist purely
         # to advance the cache. The cache-free path cannot merge: it re-encodes
         # the prefix from scratch, so every offset has a different length.
         runs = [(0, event_count)] if self.use_cache else [
@@ -1394,32 +1464,13 @@ class SeqRolloutCollector:
             } if self.use_cache else {}
             token_blocks: dict[str, list[np.ndarray]] = {}
             captures: dict[str, list[tuple[int, int, SeqLeaf]]] = {}
-            for leaf, events in appends:
-                tree = leaf.tree
-                num_players = tree.num_players
-                seats = np.arange(num_players)
+            for leaf, blocks in blocks_by_leaf:
+                num_players = leaf.tree.num_players
                 for step in range(run_len):
                     offset = run_start + step
                     last = offset == event_count - 1
-                    event = events[offset]
-                    base = np.asarray(
-                        event_token(
-                            self.model_config, event, 0, num_players, tree.hand_size
-                        ),
-                        dtype=np.int64,
-                    )
-                    block = np.tile(base, (num_players, 1))
-                    block[:, SLOT_REL_PLAYER] = (event.player - seats) % num_players
+                    block = blocks[offset]
                     next_actor = leaf.env.state.current_player if last else None
-                    if next_actor is not None:
-                        block[:, SLOT_NEXT_ACTOR] = (
-                            next_actor - seats
-                        ) % num_players
-                        block[:, SLOT_NEXT_PHASE] = (
-                            NEXT_BID
-                            if leaf.env.phase() == Phase.BIDDING
-                            else NEXT_PLAY
-                        )
                     if leaf.history is not None:
                         leaf.history[:, position + offset] = block
                     for seat in range(num_players):

@@ -42,9 +42,9 @@ from .config import (
     TOKEN_HAND,
     TOKEN_PLAY,
     TOKEN_TRICK_WIN,
+    TOKEN_TURN,
     TOKEN_WIDTH,
     SeqModelConfig,
-    seq_len,
 )
 
 SUITS: tuple[Suit, ...] = (Suit.SPADES, Suit.HEARTS, Suit.DIAMONDS, Suit.CLUBS)
@@ -110,6 +110,60 @@ def hand_token(
     return token
 
 
+def turn_token(
+    config: SeqModelConfig,
+    num_players: int,
+    hand_size: int,
+    rel_actor: int,
+    phase: int,
+    trick_index: int | None = None,
+    pos_in_trick: int | None = None,
+) -> list[int]:
+    """A pause token announcing whose turn it is. ``rel_actor == 0`` is "mine".
+
+    Deliberately near-empty: rank/suit/card/bid stay NA so the only thing this
+    position contributes to the residual stream is "an action is due, from this
+    seat, at this point of the game". Everything else has to come through
+    attention, which is the point -- the head reads a state summary rather than
+    a state summary tangled up with the last event's card.
+    """
+
+    token = _base_token(config, num_players, hand_size)
+    token[SLOT_TYPE] = TOKEN_TURN
+    token[SLOT_REL_PLAYER] = rel_actor
+    if trick_index is not None:
+        token[SLOT_TRICK] = trick_index
+    if pos_in_trick is not None:
+        token[SLOT_POS_IN_TRICK] = pos_in_trick
+    token[SLOT_NEXT_ACTOR] = rel_actor
+    token[SLOT_NEXT_PHASE] = phase
+    return token
+
+
+def turn_token_for_phase(config: SeqModelConfig, phase: int) -> bool:
+    """Does an upcoming action in ``phase`` (NEXT_BID/NEXT_PLAY) get a TURN?"""
+
+    if config.turn_token == "off" or phase == NEXT_NONE:
+        return False
+    return phase == NEXT_BID or config.turn_token == "all"
+
+
+def turn_token_precedes(config: SeqModelConfig, event: GameEvent) -> bool:
+    """Does a TURN token sit immediately before this event's token?"""
+
+    if event.type == EventType.BID:
+        return turn_token_for_phase(config, NEXT_BID)
+    if event.type == EventType.PLAY:
+        return turn_token_for_phase(config, NEXT_PLAY)
+    return False
+
+
+def emits_token(config: SeqModelConfig, event: GameEvent) -> bool:
+    if event.type == EventType.TRICK_WIN:
+        return config.trick_win_token
+    return event.type in (EventType.BID, EventType.PLAY)
+
+
 def event_token(
     config: SeqModelConfig,
     event: GameEvent,
@@ -136,6 +190,8 @@ def event_token(
         token[SLOT_POS_IN_TRICK] = event.position_in_trick
         return token
     if event.type == EventType.TRICK_WIN:
+        if not config.trick_win_token:
+            return None
         token = _base_token(config, num_players, hand_size)
         token[SLOT_TYPE] = TOKEN_TRICK_WIN
         token[SLOT_REL_PLAYER] = _relative(event.player, observer, num_players)
@@ -152,7 +208,12 @@ def prefix_tokens(
     initial_hand: list[Card],
     bidding_start_player: int,
 ) -> list[list[int]]:
-    """[GAME] + [HAND x N] with next-actor fields set for the first bid."""
+    """[GAME] + [HAND x N] with next-actor fields set for the first bid.
+
+    With ``turn_token`` enabled the opening bid's TURN token belongs here: it
+    precedes the first event, so it is part of the prefill rather than of any
+    wave, and the first bidder's readout comes off it.
+    """
 
     if len(initial_hand) != hand_size:
         raise ValueError("Observer hand does not match the hand size.")
@@ -160,8 +221,14 @@ def prefix_tokens(
     tokens = [game_token(config, num_players, hand_size, bidding_position)]
     for card in sort_cards(initial_hand):
         tokens.append(hand_token(config, num_players, hand_size, card))
-    tokens[-1][SLOT_NEXT_ACTOR] = _relative(bidding_start_player, observer, num_players)
-    tokens[-1][SLOT_NEXT_PHASE] = NEXT_BID
+    rel_first = _relative(bidding_start_player, observer, num_players)
+    if config.turn_token != "off":
+        tokens.append(
+            turn_token(config, num_players, hand_size, rel_first, NEXT_BID)
+        )
+    else:
+        tokens[-1][SLOT_NEXT_ACTOR] = rel_first
+        tokens[-1][SLOT_NEXT_PHASE] = NEXT_BID
     return tokens
 
 
@@ -171,6 +238,46 @@ def _round_events(events: list[GameEvent]) -> list[GameEvent]:
         for event in events
         if event.type in (EventType.BID, EventType.PLAY, EventType.TRICK_WIN)
     ]
+
+
+def token_layout(
+    config: SeqModelConfig, round_events: list[GameEvent]
+) -> list[tuple[str, int]]:
+    """Token stream after the prefix, as ("turn"|"event", event index) pairs.
+
+    One layout serves both the rollout wave loop and the replay labeller, so
+    the schema flags cannot make the two disagree about which token sits where.
+    Event 0 is always the opening bid, whose TURN token lives in the prefix.
+    """
+
+    layout: list[tuple[str, int]] = []
+    for index, event in enumerate(round_events):
+        if index > 0 and turn_token_precedes(config, event):
+            layout.append(("turn", index))
+        if emits_token(config, event):
+            layout.append(("event", index))
+    return layout
+
+
+def _turn_row(
+    config: SeqModelConfig,
+    event: GameEvent,
+    observer: int,
+    num_players: int,
+    hand_size: int,
+) -> list[int]:
+    """The TURN token that precedes ``event``."""
+
+    is_bid = event.type == EventType.BID
+    return turn_token(
+        config,
+        num_players,
+        hand_size,
+        _relative(event.player, observer, num_players),
+        NEXT_BID if is_bid else NEXT_PLAY,
+        trick_index=None if is_bid else event.trick_index,
+        pos_in_trick=None if is_bid else event.position_in_trick,
+    )
 
 
 def build_seat_tokens(
@@ -191,15 +298,23 @@ def build_seat_tokens(
     tokens = prefix_tokens(
         config, observer, num_players, hand_size, initial_hand, bidding_start_player
     )
-    for event in round_events:
+    for kind, index in token_layout(config, round_events):
+        event = round_events[index]
+        if kind == "turn":
+            tokens.append(
+                _turn_row(config, event, observer, num_players, hand_size)
+            )
+            continue
         token = event_token(config, event, observer, num_players, hand_size)
         if token is None:
-            raise AssertionError("Round events must map to tokens.")
+            raise AssertionError("Layout emitted an event with no token.")
         tokens.append(token)
 
     # Look-ahead next-actor annotation: token t announces the actor of the
     # action event at t+1 (TRICK_WIN and HAND interiors announce nothing).
-    prefix_len = 1 + hand_size
+    # With TURN tokens on, the token before an action is the TURN token, which
+    # already carries the same annotation -- this loop just re-derives it.
+    prefix_len = config.prefix_len(hand_size)
     for position in range(prefix_len - 1, len(tokens) - 1):
         upcoming = tokens[position + 1]
         if upcoming[SLOT_TYPE] in (TOKEN_BID, TOKEN_PLAY):
@@ -207,12 +322,35 @@ def build_seat_tokens(
             tokens[position][SLOT_NEXT_PHASE] = (
                 NEXT_BID if upcoming[SLOT_TYPE] == TOKEN_BID else NEXT_PLAY
             )
-        else:
+        elif upcoming[SLOT_TYPE] != TOKEN_TURN:
             tokens[position][SLOT_NEXT_ACTOR] = config.player_na_id
             tokens[position][SLOT_NEXT_PHASE] = NEXT_NONE
     if pending_actor is not None:
-        tokens[-1][SLOT_NEXT_ACTOR] = _relative(pending_actor, observer, num_players)
-        tokens[-1][SLOT_NEXT_PHASE] = pending_phase
+        rel = _relative(pending_actor, observer, num_players)
+        if turn_token_for_phase(config, pending_phase):
+            # An in-progress game stops one token short of the decision: the
+            # actor's TURN token is the position the policy head reads. Its
+            # trick fields come off the event tail so this matches byte for
+            # byte what the rollout wave loop appends.
+            trick = pos = None
+            if pending_phase == NEXT_PLAY:
+                trick = sum(
+                    1 for e in round_events if e.type == EventType.TRICK_WIN
+                )
+                pos = 0
+                for event in reversed(round_events):
+                    if event.type == EventType.TRICK_WIN:
+                        break
+                    if event.type == EventType.PLAY:
+                        pos += 1
+            tokens.append(
+                turn_token(
+                    config, num_players, hand_size, rel, pending_phase, trick, pos
+                )
+            )
+        else:
+            tokens[-1][SLOT_NEXT_ACTOR] = rel
+            tokens[-1][SLOT_NEXT_PHASE] = pending_phase
     return np.asarray(tokens, dtype=np.int64)
 
 
@@ -271,7 +409,7 @@ def build_replay_arrays(
         initial_hands[observer],
         bidding_start_player,
     )
-    total_len = seq_len(num_players, hand_size)
+    total_len = config.seq_len(num_players, hand_size)
     if tokens.shape[0] != total_len:
         raise ValueError(
             f"Replay expects a completed round: {tokens.shape[0]} tokens != {total_len}."
@@ -337,7 +475,7 @@ def build_replay_arrays(
             suit_count_rel[1:num_players] > 0
         ).astype(np.int64)
 
-    prefix_len = 1 + hand_size
+    prefix_len = config.prefix_len(hand_size)
     if label_from < prefix_len:
         first = max(label_from, 0)
         fill_labels(first)
@@ -386,10 +524,23 @@ def build_replay_arrays(
         action_targets.append(target)
 
     round_events = _round_events(events)
-    if round_events:
-        record_decision(prefix_len - 1, round_events[0])
+    # Walk events and token positions together. The two can drift apart in both
+    # directions: a TURN token is a position with no event, and a TRICK_WIN
+    # with the token disabled is an event with no position (its state change
+    # still has to land, and shows up in the next token's labels).
+    position = prefix_len - 1
     for index, event in enumerate(round_events):
-        position = prefix_len + index
+        if index > 0 and turn_token_precedes(config, event):
+            position += 1
+            if position >= label_from:
+                fill_labels(position)
+        tokenized = emits_token(config, event)
+        if tokenized:
+            # The readout for an action sits on the token immediately before
+            # it -- the TURN token when TURN tokens are on. Record before
+            # applying the event so the legal mask is the pre-action one.
+            record_decision(position, event)
+            position += 1
         if event.type == EventType.BID:
             bid_values.append(event.bid)
         elif event.type == EventType.PLAY:
@@ -415,11 +566,13 @@ def build_replay_arrays(
             completed_tricks += 1
             current_trick_size = 0
             current_led_suit = None
-        if position >= label_from:
+        if tokenized and position >= label_from:
             fill_labels(position)
-        if index + 1 < len(round_events):
-            record_decision(position, round_events[index + 1])
 
+    if position + 1 != total_len:
+        raise AssertionError(
+            f"Replay walked {position + 1} token positions, expected {total_len}."
+        )
     if completed_tricks != hand_size:
         raise ValueError("Replay expects a completed round.")
 

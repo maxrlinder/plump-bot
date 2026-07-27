@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 import random
 from collections import Counter
+from dataclasses import replace
 
 import numpy as np
 import pytest
@@ -40,9 +41,10 @@ def make_collector(
     bid_top_k=4,
     play_mode="all_legal",
     play_top_k=4,
+    model_config: SeqModelConfig = MODEL_CONFIG,
 ):
     torch.manual_seed(seed)
-    model = SeqPlumpModel(MODEL_CONFIG).eval()
+    model = SeqPlumpModel(model_config).eval()
     train = SeqTrainingConfig(
         schedule_cells=tuple(cells),
         branch_rule=BranchRuleConfig(
@@ -151,11 +153,22 @@ def test_backed_values_match_backup_formulas():
     assert checked_exact > 0
 
 
-def test_rollout_probs_match_full_forward_replay():
-    """The KV-cached rollout path must equal a from-scratch causal forward."""
+@pytest.mark.parametrize("trick_win_token", [True, False])
+@pytest.mark.parametrize("turn_token", ["off", "bid", "all"])
+def test_rollout_probs_match_full_forward_replay(trick_win_token, turn_token):
+    """The KV-cached rollout path must equal a from-scratch causal forward.
 
+    Parametrised over the schema flags because they are exactly the thing that
+    can make the wave loop and the replay labeller disagree about which token
+    sits at which position -- a disagreement that is silent everywhere else and
+    poisons every training row.
+    """
+
+    config = replace(
+        MODEL_CONFIG, trick_win_token=trick_win_token, turn_token=turn_token
+    )
     cells = [GameScheduleCell(hand_size=4, num_players=3)]
-    collector = make_collector(cells=cells)
+    collector = make_collector(cells=cells, model_config=config)
     trees = collect_trees(collector, seed=3)
     model = collector.model
     checked_branch_leaf = False
@@ -163,7 +176,7 @@ def test_rollout_probs_match_full_forward_replay():
         for leaf in tree.leaves:
             round_state = leaf.env.state.current_round
             tokens = build_seat_tokens(
-                MODEL_CONFIG,
+                config,
                 leaf.env.state.event_log,
                 tree.focal,
                 tree.num_players,

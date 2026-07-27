@@ -18,7 +18,10 @@ TOKEN_HAND = 2
 TOKEN_BID = 3
 TOKEN_PLAY = 4
 TOKEN_TRICK_WIN = 5
-NUM_TOKEN_TYPES = 6
+# "Someone is about to act" -- rel_player 0 means the observer. Carries no game
+# content beyond whose turn it is: it exists to be a blank canvas.
+TOKEN_TURN = 6
+NUM_TOKEN_TYPES = 7
 
 # Next-phase ids (slot 11).
 NEXT_NONE = 0
@@ -43,10 +46,35 @@ SLOT_NEXT_ACTOR = 10
 SLOT_NEXT_PHASE = 11
 
 
-def seq_len(num_players: int, hand_size: int) -> int:
-    """[GAME] [HAND x N] [BID x P] { [PLAY x P] [TRICK_WIN] } x N."""
+# Where a TURN token is inserted, if any.
+#   off  -> never
+#   bid  -> before each bid only (the single highest-leverage decision, and it
+#           costs P tokens instead of P + N*P)
+#   all  -> before every bid and every card play
+TurnTokenMode = Literal["off", "bid", "all"]
 
-    return 1 + hand_size + num_players + hand_size * (num_players + 1)
+
+def seq_len(
+    num_players: int,
+    hand_size: int,
+    *,
+    trick_win_token: bool = True,
+    turn_token: TurnTokenMode = "off",
+) -> int:
+    """[GAME] [HAND x N] [BID x P] { [PLAY x P] [TRICK_WIN] } x N.
+
+    ``trick_win_token=False`` drops the per-trick winner token; ``turn_token``
+    inserts a contentless "X is about to act" token before actions.
+    """
+
+    length = 1 + hand_size + num_players + hand_size * num_players
+    if trick_win_token:
+        length += hand_size
+    if turn_token != "off":
+        length += num_players
+    if turn_token == "all":
+        length += hand_size * num_players
+    return length
 
 
 @dataclass(frozen=True)
@@ -56,6 +84,26 @@ class SeqModelConfig:
     schema_version: int = SEQ_SCHEMA_VERSION
     max_players: int = 5
     max_hand_size: int = 10
+
+    # --- sequence schema knobs (change the token stream, not the trunk) ---
+    # The trick winner is already derivable: these rounds have no trump, so the
+    # highest card of the led suit wins, and the winner leads next -- which the
+    # trick's last PLAY token announces in SLOT_NEXT_ACTOR. Dropping the token
+    # costs ~13-16% of every sequence. What it buys back is (a) counting
+    # tricks-won stops being "count tokens of type TRICK_WIN" and becomes a
+    # two-slot conjunction, and (b) the model loses a compute step sitting
+    # exactly where trick state has to be revised.
+    trick_win_token: bool = True
+    # A pause/register token before an action. The hidden state that the policy
+    # head reads currently doubles as the representation of whatever event
+    # happened last; a TURN token gives the head a position whose only job is
+    # to be read, and buys n_layers of extra serial compute before acting.
+    # It is appended to *every* seat's sequence at the same position (its
+    # rel_player differs per observer), which is what keeps the wave loop
+    # rectangular -- see the note in rollout._append_wave.
+    turn_token: TurnTokenMode = "off"
+
+
     d_model: int = 256
     n_layers: int = 6
     n_heads: int = 8
@@ -72,9 +120,28 @@ class SeqModelConfig:
     def head_dim(self) -> int:
         return self.d_model // self.n_heads
 
+    def seq_len(self, num_players: int, hand_size: int) -> int:
+        return seq_len(
+            num_players,
+            hand_size,
+            trick_win_token=self.trick_win_token,
+            turn_token=self.turn_token,
+        )
+
+    def prefix_len(self, hand_size: int) -> int:
+        """[GAME] [HAND x N] plus the TURN token for the opening bid."""
+
+        return 1 + hand_size + (0 if self.turn_token == "off" else 1)
+
+    def bid_token_position(self, hand_size: int, bid_index: int) -> int:
+        """Token position of the ``bid_index``-th bid event."""
+
+        stride = 1 if self.turn_token == "off" else 2
+        return self.prefix_len(hand_size) + bid_index * stride
+
     @property
     def max_seq_len(self) -> int:
-        return seq_len(self.max_players, self.max_hand_size)
+        return self.seq_len(self.max_players, self.max_hand_size)
 
     @property
     def bid_count(self) -> int:

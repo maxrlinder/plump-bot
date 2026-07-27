@@ -37,7 +37,6 @@ from .config import (
     SEQ_SCHEMA_VERSION,
     SeqModelConfig,
     SeqTrainingConfig,
-    seq_len,
 )
 from .model import SeqPlumpModel
 from .policy import SeqLeague, best_seq_device
@@ -225,7 +224,8 @@ def build_training_groups(
     per_tree = train_config.tree_weighting == "per_tree"
     owned_per_tree = {
         id(tree): sum(
-            seq_len(tree.num_players, tree.hand_size) - leaf.owned_from
+            model_config.seq_len(tree.num_players, tree.hand_size)
+            - leaf.owned_from
             for leaf in tree.leaves
         )
         for tree in trees
@@ -292,7 +292,7 @@ def build_training_groups(
 
     groups: list[SeqTrainingGroup] = []
     for (num_players, hand_size), entries in sorted(by_shape.items()):
-        length = seq_len(num_players, hand_size)
+        length = model_config.seq_len(num_players, hand_size)
         batch = len(entries)
         tokens = np.zeros((batch, length, 12), dtype=np.int64)
         owned = np.zeros((batch, length), dtype=bool)

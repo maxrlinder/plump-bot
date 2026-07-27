@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import pytest
 import torch
 
 from plump.evaluation import DealBank, evaluate_policy
@@ -18,9 +19,18 @@ from plump.seq.policy import SeqModelPolicy
 from plump.seq.trainer import SeqTrainer
 
 
-def test_two_iterations_and_eval(tmp_path):
+@pytest.mark.parametrize("trick_win_token", [True, False])
+@pytest.mark.parametrize("turn_token", ["off", "bid", "all"])
+def test_two_iterations_and_eval(tmp_path, trick_win_token, turn_token):
     torch.manual_seed(0)
-    model_config = SeqModelConfig(d_model=32, n_layers=1, n_heads=2, d_ff=64)
+    model_config = SeqModelConfig(
+        d_model=32,
+        n_layers=1,
+        n_heads=2,
+        d_ff=64,
+        trick_win_token=trick_win_token,
+        turn_token=turn_token,
+    )
     train_config = SeqTrainingConfig(
         schedule_cells=(
             GameScheduleCell(hand_size=3, num_players=3),
