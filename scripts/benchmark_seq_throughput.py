@@ -73,6 +73,7 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="derive the per-shape branch rate table from this rate at 10 cards",
     )
+    parser.add_argument("--exhaustive-until", type=int, default=7)
     parser.add_argument("--max-cache-rows", type=int, default=None)
     return parser.parse_args()
 
@@ -135,6 +136,7 @@ def main() -> None:
                 if args.reference_rate is None
                 else build_branch_rate_table(
                     args.reference_rate,
+                    exhaustive_until=args.exhaustive_until,
                     hand_sizes=hand_sizes,
                     player_counts=(args.players,) if args.players else (3, 4, 5),
                 )

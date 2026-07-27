@@ -86,21 +86,40 @@ class DecoderBlock(nn.Module):
     def _decode_attention(
         self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor
     ) -> torch.Tensor:
-        """Attention for a single new query position, KV heads left grouped.
+        """Attention for ``T`` new query positions, KV heads left grouped.
 
         Written out rather than delegated to SDPA because on MPS the fused
-        kernel is markedly slower at query length 1, and its GQA path slower
-        still -- which would make grouped KV a memory saving paid for in wall
-        time. Grouping the *query* heads instead keeps K/V at ``kv_heads``,
-        so GQA wins on both axes. Softmax runs in fp32 (as SDPA does) so an
-        fp16 cache does not cost accuracy.
+        kernel is markedly slower at short query lengths, and its GQA path
+        slower still -- which would make grouped KV a memory saving paid for in
+        wall time. Grouping the *query* heads instead keeps K/V at
+        ``kv_heads``, so GQA wins on both axes. Softmax runs in fp32 (as SDPA
+        does) so an fp16 cache does not cost accuracy.
+
+        With ``T > 1`` the new queries sit at the end of the cached prefix, so
+        query ``i`` may see keys up to ``len(k) - T + i``: a rectangular causal
+        mask over the tail, not a square one.
         """
 
-        batch = q.shape[0]
-        grouped = q.reshape(batch, self.kv_heads, self.head_group, self.head_dim)
+        batch, _, length, _ = q.shape
+        # Merge the query's head-group and time axes so this stays a 4-D
+        # batched matmul against un-expanded K/V. Broadcasting a group axis
+        # against [B, kv_heads, L, D] instead makes MPS materialise the
+        # expanded K/V -- measured 3x slower and 2x the memory, which is the
+        # whole point of not using SDPA's GQA path here.
+        grouped = q.reshape(
+            batch, self.kv_heads, self.head_group * length, self.head_dim
+        )
         scores = (grouped @ k.transpose(-1, -2)) * self.scale
+        if length > 1:
+            total = k.shape[2]
+            offsets = torch.arange(length, device=q.device) + (total - length)
+            blocked = torch.arange(total, device=q.device) > offsets[:, None]
+            # Row g * length + t of the merged axis is query t of group g.
+            scores = scores.masked_fill(
+                blocked.repeat(self.head_group, 1), float("-inf")
+            )
         weights = scores.float().softmax(dim=-1).to(v.dtype)
-        return (weights @ v).view(batch, self.n_heads, 1, self.head_dim)
+        return (weights @ v).view(batch, self.n_heads, length, self.head_dim)
 
     def _finish(self, x: torch.Tensor, attn: torch.Tensor) -> torch.Tensor:
         batch, _, length, _ = attn.shape
@@ -132,18 +151,18 @@ class DecoderBlock(nn.Module):
         length = x.shape[1]
         q, k, v = self._qkv(self.ln_attn(x))
         cache.write_range(layer, slots, start, k, v)
-        if length == 1:
+        if start == 0 and length > 1:
+            # Prefill: no prefix to attend to, so the square causal kernel is
+            # exactly right and SDPA is worth using at this length.
+            attn = F.scaled_dot_product_attention(
+                q, k, v, is_causal=True, enable_gqa=self._gqa
+            )
+        else:
             k_all, v_all = cache.read(
-                layer, slots, start + 1, count=x.shape[0]
+                layer, slots, start + length, count=x.shape[0]
             )
             attn = self._decode_attention(q.to(cache.dtype), k_all, v_all).to(
                 x.dtype
-            )
-        else:
-            if start != 0:
-                raise NotImplementedError("Multi-token append requires an empty prefix.")
-            attn = F.scaled_dot_product_attention(
-                q, k, v, is_causal=True, enable_gqa=self._gqa
             )
         return self._finish(x, attn)
 
@@ -291,10 +310,18 @@ class SeqPlumpModel(nn.Module):
         cache: KVCache,
         slots: torch.Tensor | None,
     ) -> SeqStepOutput:
-        """Append one token [B, WIDTH] at ``position`` and read the heads."""
+        """Append tokens at ``position`` and read the heads at the last one.
 
-        x = self.embed(tokens.unsqueeze(1), start=position)
+        ``tokens`` is [B, WIDTH] for a single append, or [B, T, WIDTH] to
+        append a run of events in one call. Only the last position produces a
+        readout, which is why a run is worth merging: the events before it in
+        the run exist purely to advance the cache.
+        """
+
+        if tokens.dim() == 2:
+            tokens = tokens.unsqueeze(1)
+        x = self.embed(tokens, start=position)
         for layer, block in enumerate(self.blocks):
             x = block.forward_cached(x, cache, layer, slots, start=position)
-        hidden = self.final_norm(x[:, 0])
+        hidden = self.final_norm(x[:, -1])
         return self._step_heads(hidden)

@@ -85,6 +85,64 @@ def test_cached_decode_matches_full_forward(kv_heads):
             )
 
 
+@pytest.mark.parametrize("kv_heads", [None, 2])
+@pytest.mark.parametrize("run", [2, 3, 6])
+def test_multi_token_append_matches_stepping_one_at_a_time(kv_heads, run):
+    """Appending a run of events in one call must equal appending them singly.
+
+    The wave loop merges a trick's completing play with its TRICK_WIN token,
+    because only the last event of a run produces a readout. The queries then
+    sit at the end of a non-empty prefix, so the mask is rectangular -- query i
+    sees the prefix plus the first i tokens of the run, and nothing after.
+    """
+
+    torch.manual_seed(0)
+    config = small_config(n_kv_heads=kv_heads)
+    model = SeqPlumpModel(config).eval()
+    num_players, hand_size = 4, 5
+    tokens = token_batch(num_players, hand_size, seeds=[0, 1, 2])
+    length = seq_len(num_players, hand_size)
+    prefix_len = 1 + hand_size
+
+    with torch.no_grad():
+        full = model.forward_full(tokens, aux_heads=False)
+
+        single = model.new_cache(capacity=4)
+        single_slots = torch.tensor(single.alloc(3), dtype=torch.long)
+        model.forward_prefill(tokens[:, :prefix_len], single, single_slots)
+        merged = model.new_cache(capacity=4)
+        merged_slots = torch.tensor(merged.alloc(3), dtype=torch.long)
+        model.forward_prefill(tokens[:, :prefix_len], merged, merged_slots)
+
+        for start in range(prefix_len, length - run + 1, run):
+            stop = start + run
+            for position in range(start, stop):
+                step = model.forward_step(
+                    tokens[:, position], position, single, single_slots
+                )
+            block = model.forward_step(
+                tokens[:, start:stop], start, merged, merged_slots
+            )
+            # The merged call reads the heads at the last position of the run,
+            # which is the only readout the wave loop consumes.
+            torch.testing.assert_close(
+                block.card_logits, step.card_logits, atol=ATOL, rtol=0
+            )
+            torch.testing.assert_close(
+                block.card_logits, full.card_logits[:, stop - 1], atol=ATOL, rtol=0
+            )
+            torch.testing.assert_close(block.value, step.value, atol=ATOL, rtol=0)
+        # And the caches must agree everywhere, not just at the readout: the
+        # skipped positions' K/V are what later steps attend to.
+        for layer in range(config.n_layers):
+            torch.testing.assert_close(
+                merged.k[layer], single.k[layer], atol=ATOL, rtol=0
+            )
+            torch.testing.assert_close(
+                merged.v[layer], single.v[layer], atol=ATOL, rtol=0
+            )
+
+
 def test_branch_copy_matches_independent_full_forwards():
     torch.manual_seed(1)
     config = small_config()

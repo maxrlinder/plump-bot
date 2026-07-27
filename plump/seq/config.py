@@ -396,32 +396,38 @@ def _apportion(weights: dict, total: int) -> dict:
 def build_branch_rate_table(
     reference_rate: float,
     *,
+    exhaustive_until: int = 7,
     reference_hand_size: int = 10,
     reference_players: int = 5,
     hand_sizes: tuple[int, ...] = tuple(range(3, 11)),
     player_counts: tuple[int, ...] = (3, 4, 5),
     player_exponent: float = 0.0,
-    max_rate: float = 1.0,
 ) -> tuple[ShapeBranchRate, ...]:
-    """Per-shape branch rates that cost roughly the same tree at every shape.
+    """Per-shape branch rates: exhaustive on short games, tapering on long ones.
 
     A path through an ``N``-card game has ``N - 1`` branchable decisions (the
-    last card is forced), and each branch point multiplies the path by the
-    branching factor. So a tree is about ``b ** (rate * (N - 1))`` leaves: the
-    rate compounds over the *length* of the game. Holding one rate flat across
-    the grid therefore does not mean "branch equally" -- at rate 0.5 a 10-card
-    tree is ~2^4.5 = 23x a 3-card one, so the long games take the whole budget
-    and the short ones stay nearly unbranched, even though a 3-card round pays
-    the same points.
+    last card is forced -- in practice slightly fewer, since follow-suit often
+    leaves a single legal card), and each branch point multiplies the path by
+    the branching factor. A tree is therefore about ``b ** (rate * (N - 1))``
+    leaves: the rate compounds over the *length* of the game. One flat rate
+    across the grid is thus not one amount of branching -- at 0.5 a 10-card
+    tree is ~2^4.5 the size of a 3-card one, so the long games take the whole
+    budget and the short ones stay nearly unbranched, even though a 3-card
+    round pays the same points.
 
-    Equal tree size wants ``rate * (N - 1)`` constant, hence
+    Two regimes, because the cost curve has two regimes:
 
-        rate(N) = reference_rate * (reference_hand_size - 1) / (N - 1)
+    - ``N <= exhaustive_until``: rate 1.0, branch every eligible decision.
+      Measured, these games' wall time is set by the number of waves (one
+      forward per game event) rather than by tree size, so the branching is
+      nearly free and there is no reason to sample.
+    - above it: taper geometrically to ``reference_rate`` at
+      ``reference_hand_size``, i.e. equal multiplicative steps per extra card.
 
-    clipped at ``max_rate``. Measured on the (players, cards) grid, hand sizes
-    up to about 6 hit that clip and cost no measurable extra time when they do
-    -- their wall time is set by the number of waves, not the tree -- so short
-    games get their branching for free.
+    The taper is deliberately steeper than the "equal tree size" law
+    (``rate * (N - 1)`` constant) would give. Equal tree size is the right
+    target when nothing binds; past ~8 cards time and memory do bind, and they
+    bind super-linearly, so the long games are thinned harder than parity.
 
     ``player_exponent`` scales the rate by ``(reference_players / P) ** e``.
     Rows scale with P (one cache row per seat per leaf), so a positive exponent
@@ -431,16 +437,21 @@ def build_branch_rate_table(
 
     if not 0.0 < reference_rate <= 1.0:
         raise ValueError("reference_rate must be in (0, 1].")
-    stages = max(reference_hand_size - 1, 1)
+    if exhaustive_until >= reference_hand_size:
+        raise ValueError(
+            "exhaustive_until must be below reference_hand_size, or there is "
+            "nothing left to taper over."
+        )
+    span = reference_hand_size - exhaustive_until
+
+    def rate_for(hand_size: int, players: int) -> float:
+        steps = max(hand_size - exhaustive_until, 0)
+        rate = reference_rate ** (steps / span)
+        return min(1.0, rate * (reference_players / players) ** player_exponent)
+
     return tuple(
         ShapeBranchRate(
-            rate=min(
-                max_rate,
-                reference_rate
-                * stages
-                / max(hand_size - 1, 1)
-                * (reference_players / players) ** player_exponent,
-            ),
+            rate=rate_for(hand_size, players),
             num_players=players,
             hand_size=hand_size,
         )

@@ -824,23 +824,31 @@ def test_shape_rate_table_overrides_the_global_rate():
     assert leaves(()) == leaves((ShapeBranchRate(rate=0.9, hand_size=5),))
 
 
-def test_derived_rate_table_equalises_branch_points_per_path():
-    """rate * (N - 1) is what compounds, so the table holds that constant."""
+def test_derived_rate_table_is_exhaustive_then_tapers():
+    """Rate 1.0 while branching is cheap, then geometric down to the anchor."""
 
-    table = build_branch_rate_table(0.5)
+    table = build_branch_rate_table(0.5, exhaustive_until=7)
     rates = {
         (rule.num_players, rule.hand_size): rule.rate for rule in table
     }
-    # One rule per scheduled shape, so no shape falls back to the derived rate.
+    # One rule per scheduled shape, so no shape falls back to a global rate.
     assert len(rates) == 3 * 8
-    # Expected branch points per path is flat wherever the clip does not bind.
-    for players in (3, 4, 5):
-        for hand_size in range(6, 11):
-            assert rates[(players, hand_size)] * (hand_size - 1) == pytest.approx(4.5)
-    # Short games clip at 1.0 rather than being asked for a rate above 1.
-    assert rates[(5, 3)] == 1.0
-    assert rates[(5, 10)] == 0.5
+    # Short games branch every eligible decision; long games taper to the
+    # anchor in equal multiplicative steps.
+    for hand_size in range(3, 8):
+        assert rates[(5, hand_size)] == 1.0
+    assert rates[(5, 8)] == pytest.approx(0.5 ** (1 / 3))
+    assert rates[(5, 9)] == pytest.approx(0.5 ** (2 / 3))
+    assert rates[(5, 10)] == pytest.approx(0.5)
     assert all(0.0 < rate <= 1.0 for rate in rates.values())
+    # The taper is steeper than equal-tree-size (rate * (N - 1) constant)
+    # would give, because past ~8 cards time and memory bind super-linearly.
+    assert rates[(5, 10)] < rates[(5, 7)] * 6 / 9
+    # A wider exhaustive band must not push any rate above 1.
+    wide = build_branch_rate_table(0.5, exhaustive_until=9)
+    assert all(0.0 < rule.rate <= 1.0 for rule in wide)
+    with pytest.raises(ValueError, match="exhaustive_until"):
+        build_branch_rate_table(0.5, exhaustive_until=10)
     # Player count is left alone by default; the exponent is what moves it.
     assert rates[(3, 10)] == rates[(5, 10)]
     tilted = {

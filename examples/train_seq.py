@@ -6,9 +6,9 @@ Example (Mac bring-up):
         --checkpoint-dir checkpoints/seq_v6_run1 --log-dir logs/seq_v6_run1
 
 The default schedule covers every (player count, hand size, bidding position)
-once per update, and the default branching is spread across the game at a
-per-shape rate derived from ``--reference-rate`` (the rate at 10 cards; shorter
-games get proportionally more, since the rate compounds over game length).
+once per update. Branching is placed across the whole game, exhaustively up to
+``--exhaustive-until`` cards (where it is nearly free) and tapering to
+``--reference-rate`` at 10 cards, since the rate compounds over game length.
 """
 
 from __future__ import annotations
@@ -69,9 +69,15 @@ def parse_args() -> argparse.Namespace:
         "--reference-rate",
         type=float,
         default=0.5,
-        help="branch rate at 10 cards; shorter games scale up from it",
+        help="branch rate at 10 cards; shorter games taper up to 1.0",
     )
     parser.add_argument("--branch-rate-player-exponent", type=float, default=0.0)
+    parser.add_argument(
+        "--exhaustive-until",
+        type=int,
+        default=7,
+        help="branch every eligible decision at or below this hand size",
+    )
     parser.add_argument("--bid-top-k", type=int, default=4)
     parser.add_argument(
         "--play-mode",
@@ -185,6 +191,7 @@ def main() -> None:
         )
     rate_table = build_branch_rate_table(
         args.reference_rate,
+        exhaustive_until=args.exhaustive_until,
         hand_sizes=hand_sizes,
         player_counts=player_counts,
         player_exponent=args.branch_rate_player_exponent,

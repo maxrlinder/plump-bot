@@ -96,6 +96,8 @@ def parse_args() -> argparse.Namespace:
         help="derive the per-shape table from this rate at 10 cards",
     )
     parser.add_argument("--player-exponent", type=float, default=0.0)
+    parser.add_argument("--exhaustive-until", type=int, default=7,
+                        help="branch every decision at or below this hand size")
     parser.add_argument("--iterations", type=int, default=2)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--device", default=None)
@@ -130,7 +132,9 @@ def main() -> None:
         rate_table = parse_rate_table(args.rate_table)
     elif args.reference_rate is not None:
         rate_table = build_branch_rate_table(
-            args.reference_rate, player_exponent=args.player_exponent
+            args.reference_rate,
+            exhaustive_until=args.exhaustive_until,
+            player_exponent=args.player_exponent,
         )
     else:
         rate_table = ()

@@ -1372,10 +1372,18 @@ class SeqRolloutCollector:
         event_count = len(appends[0][1])
         if any(len(events) != event_count for _, events in appends):
             raise AssertionError("Wave-synchronized leaves diverged in event count.")
-        for offset in range(event_count):
+        # Only the last event of a wave produces a readout -- a trick's
+        # completing play is appended together with its TRICK_WIN token, and
+        # nobody acts in between. So the cached path appends the whole run in
+        # one forward instead of one per event; the earlier events exist purely
+        # to advance the cache. The cache-free path cannot merge: it re-encodes
+        # the prefix from scratch, so every offset has a different length.
+        runs = [(0, event_count)] if self.use_cache else [
+            (offset, 1) for offset in range(event_count)
+        ]
+        for run_start, run_len in runs:
             t_start = time.perf_counter()
-            last = offset == event_count - 1
-            width = position + offset + 1 if not self.use_cache else 1
+            width = position + run_start + 1 if not self.use_cache else run_len
             # Cached mode addresses rows directly, so the batch is laid out by
             # cache row; rows belonging to already-terminated leaves stay
             # padding and their outputs are ignored.
@@ -1387,41 +1395,46 @@ class SeqRolloutCollector:
             token_blocks: dict[str, list[np.ndarray]] = {}
             captures: dict[str, list[tuple[int, int, SeqLeaf]]] = {}
             for leaf, events in appends:
-                event = events[offset]
                 tree = leaf.tree
                 num_players = tree.num_players
                 seats = np.arange(num_players)
-                base = np.asarray(
-                    event_token(
-                        self.model_config, event, 0, num_players, tree.hand_size
-                    ),
-                    dtype=np.int64,
-                )
-                block = np.tile(base, (num_players, 1))
-                block[:, SLOT_REL_PLAYER] = (event.player - seats) % num_players
-                next_actor = leaf.env.state.current_player if last else None
-                if next_actor is not None:
-                    block[:, SLOT_NEXT_ACTOR] = (next_actor - seats) % num_players
-                    block[:, SLOT_NEXT_PHASE] = (
-                        NEXT_BID
-                        if leaf.env.phase() == Phase.BIDDING
-                        else NEXT_PLAY
+                for step in range(run_len):
+                    offset = run_start + step
+                    last = offset == event_count - 1
+                    event = events[offset]
+                    base = np.asarray(
+                        event_token(
+                            self.model_config, event, 0, num_players, tree.hand_size
+                        ),
+                        dtype=np.int64,
                     )
-                if leaf.history is not None:
-                    leaf.history[:, position + offset] = block
-                for seat in range(num_players):
-                    policy_id, row = leaf.slots[seat]
-                    if self.use_cache:
-                        token_arrays[policy_id][row, 0] = block[seat]
-                        capture_row = row
-                    else:
-                        rows = token_blocks.setdefault(policy_id, [])
-                        rows.append(leaf.history[seat, : position + offset + 1])
-                        capture_row = len(rows) - 1
-                    if next_actor == seat:
-                        captures.setdefault(policy_id, []).append(
-                            (capture_row, seat, leaf)
+                    block = np.tile(base, (num_players, 1))
+                    block[:, SLOT_REL_PLAYER] = (event.player - seats) % num_players
+                    next_actor = leaf.env.state.current_player if last else None
+                    if next_actor is not None:
+                        block[:, SLOT_NEXT_ACTOR] = (
+                            next_actor - seats
+                        ) % num_players
+                        block[:, SLOT_NEXT_PHASE] = (
+                            NEXT_BID
+                            if leaf.env.phase() == Phase.BIDDING
+                            else NEXT_PLAY
                         )
+                    if leaf.history is not None:
+                        leaf.history[:, position + offset] = block
+                    for seat in range(num_players):
+                        policy_id, row = leaf.slots[seat]
+                        if self.use_cache:
+                            token_arrays[policy_id][row, step] = block[seat]
+                            capture_row = row
+                        else:
+                            rows = token_blocks.setdefault(policy_id, [])
+                            rows.append(leaf.history[seat, : position + offset + 1])
+                            capture_row = len(rows) - 1
+                        if next_actor == seat:
+                            captures.setdefault(policy_id, []).append(
+                                (capture_row, seat, leaf)
+                            )
             t_build = time.perf_counter()
             self.stats.token_build_sec += t_build - t_start
             batches = (
@@ -1431,14 +1444,12 @@ class SeqRolloutCollector:
             )
             for policy_id, block_array in batches.items():
                 row_count = block_array.shape[0]
-                tokens = torch.from_numpy(
-                    block_array[:, 0] if self.use_cache else block_array
-                ).to(self.device)
+                tokens = torch.from_numpy(block_array).to(self.device)
                 with torch.inference_mode():
                     if self.use_cache:
                         output = models[policy_id].forward_step(
                             tokens,
-                            position + offset,
+                            position + run_start,
                             self._caches[policy_id],
                             None,
                         )
@@ -1446,7 +1457,9 @@ class SeqRolloutCollector:
                         output = models[policy_id].forward_prefix(tokens)
                 self._sync()
                 self.stats.forward_rows += row_count * (
-                    1 if self.use_cache else position + offset + 1
+                    run_len
+                    if self.use_cache
+                    else position + run_start + 1
                 )
                 capture_list = captures.get(policy_id)
                 if capture_list:
@@ -1466,7 +1479,7 @@ class SeqRolloutCollector:
                             value=float(values[i]),
                         )
             self.stats.forward_sec += time.perf_counter() - t_build
-            if last:
+            if run_start + run_len == event_count:
                 for leaf, _ in appends:
                     for extra in range(event_count):
                         # Later split passes replay the shared prefix; only
