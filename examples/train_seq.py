@@ -57,9 +57,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--turn-token",
         choices=["off", "bid", "all"],
-        default="off",
-        help="insert a contentless pause token before actions: never, before "
-        "bids only, or before every decision",
+        default="bid",
+        help="pause token before actions. Default 'bid': the bid is the one "
+        "decision worth extra serial compute, and the token names the actor "
+        "via its player embedding. 'all' also puts one before every play, "
+        "which costs 5x more than it sounds -- the sequence carries all P "
+        "players' actions, so at 5p/10c it is +55 tokens, not +11.",
     )
 
     parser.add_argument("--hand-sizes", default="3,4,5,6,7,8,9,10")
