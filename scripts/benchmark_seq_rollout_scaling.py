@@ -149,7 +149,7 @@ def main() -> None:
         )
     ).eval().to(device)
 
-    length = seq_len(args.players, args.cards)
+    length = model_config.seq_len(args.players, args.cards)
     params = sum(p.numel() for p in model.parameters())
     print(
         f"device={device} model=d{args.d_model} L{args.n_layers} H{args.n_heads} "

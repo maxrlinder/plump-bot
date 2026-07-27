@@ -91,7 +91,7 @@ def measure(args, model, device, num_players: int, hand_size: int, rate: float) 
     elapsed = time.perf_counter() - started
     stats = collector.stats
 
-    length = seq_len(num_players, hand_size)
+    length = model_config.seq_len(num_players, hand_size)
     positions = sum(length - leaf.owned_from for tree in trees for leaf in tree.leaves)
     branch_rows = sum(
         1

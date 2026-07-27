@@ -82,6 +82,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--n-heads", type=int, default=10)
     parser.add_argument("--n-kv-heads", type=int, default=2)
     parser.add_argument("--d-ff", type=int, default=960)
+    parser.add_argument("--no-trick-win-token", action="store_true")
+    parser.add_argument(
+        "--turn-token", choices=["off", "bid", "all"], default="off"
+    )
     parser.add_argument("--kv-dtype", choices=["fp32", "fp16"], default="fp16")
     parser.add_argument("--cache-budget-gb", type=float, default=10.0)
     parser.add_argument("--auto-target-rows", type=int, default=None)
@@ -127,6 +131,8 @@ def main() -> None:
         n_heads=args.n_heads,
         n_kv_heads=args.n_kv_heads,
         d_ff=args.d_ff,
+        trick_win_token=not args.no_trick_win_token,
+        turn_token=args.turn_token,
     )
     if args.rate_table:
         rate_table = parse_rate_table(args.rate_table)
@@ -179,7 +185,8 @@ def main() -> None:
         elapsed = time.perf_counter() - started
         stats = collector.stats
         positions = sum(
-            seq_len(tree.num_players, tree.hand_size) - leaf.owned_from
+            model_config.seq_len(tree.num_players, tree.hand_size)
+            - leaf.owned_from
             for tree in trees
             for leaf in tree.leaves
         )
@@ -206,7 +213,8 @@ def main() -> None:
     for tree in trees:
         key = (tree.num_players, tree.hand_size)
         positions_by_shape[key] += sum(
-            seq_len(tree.num_players, tree.hand_size) - leaf.owned_from
+            model_config.seq_len(tree.num_players, tree.hand_size)
+            - leaf.owned_from
             for leaf in tree.leaves
         )
         branch_by_shape[key] += sum(

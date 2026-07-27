@@ -161,7 +161,7 @@ def main() -> None:
     if args.summary_only:
         total_leaves = sum(tree.leaf_total for tree in trees)
         total_positions = sum(
-            sum(seq_len(tree.num_players, tree.hand_size) - leaf.owned_from
+            sum(model_config.seq_len(tree.num_players, tree.hand_size) - leaf.owned_from
                 for leaf in tree.leaves)
             for tree in trees
         )
@@ -237,7 +237,7 @@ def main() -> None:
     total_leaves = total_positions = total_decisions = 0
     for hand_size in sorted(by_hand):
         group = by_hand[hand_size]
-        length = seq_len(group[0].num_players, hand_size)
+        length = model_config.seq_len(group[0].num_players, hand_size)
         leaves = [t.leaf_total for t in group]
         positions = [
             sum(length - leaf.owned_from for leaf in t.leaves) for t in group

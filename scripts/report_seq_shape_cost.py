@@ -98,7 +98,7 @@ def run_one_shape(args, num_players: int, hand_size: int) -> dict:
     elapsed = time.perf_counter() - started
     stats = collector.stats
 
-    length = seq_len(num_players, hand_size)
+    length = model_config.seq_len(num_players, hand_size)
     positions = sum(
         length - leaf.owned_from for tree in trees for leaf in tree.leaves
     )
