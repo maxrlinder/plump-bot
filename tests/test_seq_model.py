@@ -211,6 +211,25 @@ def test_aux_head_shapes():
     assert output.owner_logits.shape == (
         batch, length, 52, config.owner_class_count
     )
+    assert output.bid_hit_logits.shape == (batch, length, config.max_players)
+
+
+def test_aux_heads_are_individually_selectable():
+    torch.manual_seed(2)
+    model = SeqPlumpModel(small_config()).eval()
+    tokens = token_batch(4, 3, seeds=[3, 4])
+    with torch.no_grad():
+        subset = model.forward_full(tokens, aux_heads={"suit", "bid_hit"})
+        none = model.forward_full(tokens, aux_heads=False)
+    # Unrequested heads come back None, not zeros, so a loss reading one it did
+    # not ask for raises rather than silently training on nothing.
+    assert subset.suit_logits is not None
+    assert subset.bid_hit_logits is not None
+    assert subset.owner_logits is None
+    assert subset.trick_logits is None
+    assert none.suit_logits is none.bid_hit_logits is None
+    with pytest.raises(ValueError):
+        model.forward_full(tokens, aux_heads={"beliefs"})
 
 
 def test_cache_alloc_free_bookkeeping():

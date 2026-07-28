@@ -67,6 +67,18 @@ def play_random_round(num_players, hand_size, seed, observer):
                     "suit_targets": suit_presence_targets_relative(
                         env, observer, V4_CONFIG
                     ),
+                    # The v4 oracle masks the observer's own row; seq labels it.
+                    "own_suit_targets": [
+                        int(
+                            any(
+                                card.suit == suit
+                                for card in env.state.current_round.current_hands[
+                                    observer
+                                ]
+                            )
+                        )
+                        for suit in seq_tokens.SUITS
+                    ],
                 }
             )
         env.step(rng.choice(env.legal_actions()))
@@ -192,7 +204,12 @@ def test_labels_match_v4_encoder_at_decisions(num_players, hand_size, seed):
                 np.asarray(encoded.final_trick_count_mask),
             )
             assert np.array_equal(
-                arrays.suit_targets[position], np.asarray(oracle["suit_targets"])
+                arrays.suit_targets[position, 1:],
+                np.asarray(oracle["suit_targets"])[1:],
+            )
+            assert np.array_equal(
+                arrays.suit_targets[position, 0],
+                np.asarray(oracle["own_suit_targets"], dtype=np.int64),
             )
 
 
@@ -203,10 +220,15 @@ def test_label_invariants_at_every_position(num_players, hand_size, seed):
     arrays = replay_arrays_for(env, observer, start)
     round_state = env.state.current_round
 
+    bid_of = {bid.player: bid.value for bid in round_state.bids}
     for rel in range(num_players):
         player = (observer + rel) % num_players
         assert arrays.trick_targets[rel] == round_state.tricks_won[player]
+        assert arrays.bid_hit_targets[rel] == int(
+            round_state.tricks_won[player] == bid_of[player]
+        )
     assert (arrays.trick_targets[num_players:] == seq_tokens.IGNORE_LABEL).all()
+    assert (arrays.bid_hit_targets[num_players:] == seq_tokens.IGNORE_LABEL).all()
 
     total_len = arrays.tokens.shape[0]
     for position in range(total_len):

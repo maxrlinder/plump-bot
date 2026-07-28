@@ -748,17 +748,28 @@ class SeqTrainingConfig:
     branch_depth_exponent: float = 0.0
 
     # Auxiliary losses. A coefficient of exactly 0 skips computing that loss,
-    # and with owner, suit and trick all 0 the auxiliary heads are not run at
+    # and with every belief coefficient at 0 the auxiliary heads are not run at
     # all -- the owner einsum + Sinkhorn is the expensive one.
+    #
+    # The two beliefs the objective is built around are suit presence and bid
+    # hit, both per seat and both including the observer's own. Owner and trick
+    # count default off: owner is by far the most expensive head and trick count
+    # is the same question as bid hit in a wider, harder form.
     value_coef: float = 0.5
-    trick_coef: float = 0.25
-    owner_coef: float = 0.25
+    trick_coef: float = 0.0
+    owner_coef: float = 0.0
     owner_capacity_coef: float = 0.05
     owner_sinkhorn_iterations: int = 8
     # Train the owner head on a random fraction of labeled positions per
     # update (unbiased; caps the Sinkhorn autograd graph size).
     owner_position_fraction: float = 0.5
-    suit_coef: float = 0.1
+    # Per (seat, suit) sigmoid: does that seat still hold the suit? Labels move
+    # with the round, so they are rebuilt at every position of the replay.
+    suit_coef: float = 0.25
+    # Per seat sigmoid: will that seat finish the round on its bid? The label is
+    # the round's outcome, so it is one constant per seat, broadcast over every
+    # position -- a forecast that sharpens as the round resolves.
+    bid_hit_coef: float = 0.25
     # Entropy bonus over the full legal support at every decision position.
     # Defaults off: it exists to fight the entropy collapse of a pi(a)-scaled
     # policy gradient, and NeuRD does not have that failure mode -- mixing is

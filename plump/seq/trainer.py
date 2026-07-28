@@ -106,6 +106,7 @@ class SeqTrainingGroup:
     trick_targets: np.ndarray   # [B, max_players]
     trick_masks: np.ndarray
     suit_targets: np.ndarray
+    bid_hit_targets: np.ndarray  # [B, max_players]
     policy: dict[str, PolicyRows]
 
 
@@ -116,6 +117,7 @@ class SeqUpdateStats:
     loss_owner: float = 0.0
     loss_suit: float = 0.0
     loss_trick: float = 0.0
+    loss_bid_hit: float = 0.0
     entropy: float = 0.0
     policy_kl: float = 0.0
     rolled_back: bool = False
@@ -296,7 +298,10 @@ def build_training_groups(
         suit_targets = np.full(
             (batch, length, model_config.max_players, 4), IGNORE_LABEL, np.int64
         )
-        policy = {"bid": PolicyRows(), "play": PolicyRows()}
+        bid_hit_targets = np.full(
+            (batch, model_config.max_players), IGNORE_LABEL, np.int64
+        )
+        policy ={"bid": PolicyRows(), "play": PolicyRows()}
 
         # Tokens first, in a pass of their own, so a branch child can copy the
         # prefix its parent already wrote instead of replaying the same events.
@@ -356,6 +361,7 @@ def build_training_groups(
             trick_targets[row] = arrays.trick_targets
             trick_masks[row] = arrays.trick_masks
             suit_targets[row] = arrays.suit_targets
+            bid_hit_targets[row] = arrays.bid_hit_targets
 
             for record in leaf.decisions:
                 phase_key = "bid" if record.phase == NEXT_BID else "play"
@@ -421,6 +427,7 @@ def build_training_groups(
                 trick_targets=trick_targets,
                 trick_masks=trick_masks,
                 suit_targets=suit_targets,
+                bid_hit_targets=bid_hit_targets,
                 policy=policy,
             )
         )
@@ -565,12 +572,24 @@ class SeqTrainer:
         stats.loss_owner = totals["owner"]
         stats.loss_suit = totals["suit"]
         stats.loss_trick = totals["trick"]
+        stats.loss_bid_hit = totals["bid_hit"]
         stats.entropy = totals["entropy"]
 
     def _chunk_loss(self, group, start, stop, policy_rows):
         device = self.device
         train = self.train
-        aux = train.owner_coef > 0 or train.suit_coef > 0 or train.trick_coef > 0
+        # Only the heads whose loss is actually weighted -- each one skipped is
+        # its whole forward and backward saved, and owner is by far the largest.
+        aux = frozenset(
+            name
+            for name, coef in (
+                ("owner", train.owner_coef),
+                ("suit", train.suit_coef),
+                ("trick", train.trick_coef),
+                ("bid_hit", train.bid_hit_coef),
+            )
+            if coef > 0
+        )
         tokens = torch.from_numpy(group.tokens[start:stop]).to(device)
         output = self.model.forward_full(tokens, aux_heads=aux)
         owned = torch.from_numpy(group.owned[start:stop]).to(device)
@@ -694,6 +713,29 @@ class SeqTrainer:
             trick_loss = (per_position * position_weight).sum()
             loss = loss + train.trick_coef * trick_loss
             terms["trick"] = float(trick_loss.detach())
+
+        # Bid hit (per relative seat, sigmoid). One constant label per seat for
+        # the whole round -- it is the outcome -- broadcast over every owned
+        # position, so the same head is asked the same question from a
+        # progressively more informed prefix.
+        bid_hit_labeled = None
+        if train.bid_hit_coef > 0:
+            bid_hit_targets = torch.from_numpy(
+                group.bid_hit_targets[start:stop]
+            ).to(device)
+            bid_hit_labeled = bid_hit_targets != IGNORE_LABEL  # [B, P]
+        if bid_hit_labeled is not None and bid_hit_labeled.any():
+            logits = output.bid_hit_logits  # [B, L, P]
+            bce = F.binary_cross_entropy_with_logits(
+                logits,
+                bid_hit_targets.clamp_min(0).float()[:, None, :].expand_as(logits),
+                reduction="none",
+            )
+            mask = bid_hit_labeled[:, None, :].expand_as(logits).float()
+            per_position = (bce * mask).sum(dim=2) / mask.sum(dim=2).clamp_min(1.0)
+            bid_hit_loss = (per_position * position_weight).sum()
+            loss = loss + train.bid_hit_coef * bid_hit_loss
+            terms["bid_hit"] = float(bid_hit_loss.detach())
 
         # Policy: NeuRD over every focal decision, branched or not.
         policy_total = 0.0

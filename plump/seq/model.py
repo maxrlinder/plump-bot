@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Collection
 from dataclasses import dataclass
 from typing import Optional
 
@@ -12,6 +13,12 @@ from torch import nn
 
 from .config import NUM_CARDS, TOKEN_WIDTH, SeqModelConfig
 from .kv import KVCache
+
+# Auxiliary heads, selectable one by one in forward_full. They differ by an order
+# of magnitude in cost -- "owner" is a d -> 5d projection plus a [B, L, 5, d] x
+# [52, d] einsum, the other three are single small matmuls on [B, L, d] -- so a
+# caller whose loss weights owner at zero should not be paying for it.
+AUX_HEADS = ("trick", "suit", "owner", "bid_hit")
 
 
 @dataclass
@@ -35,6 +42,7 @@ class SeqOutput:
     trick_logits: Optional[torch.Tensor] = None  # [B, L, max_players, bid_count]
     suit_logits: Optional[torch.Tensor] = None   # [B, L, max_players, 4]
     owner_logits: Optional[torch.Tensor] = None  # [B, L, NUM_CARDS, owner_classes]
+    bid_hit_logits: Optional[torch.Tensor] = None  # [B, L, max_players]
 
 
 class DecoderBlock(nn.Module):
@@ -195,7 +203,22 @@ class SeqPlumpModel(nn.Module):
             nn.Linear(d, d), nn.GELU(), nn.Linear(d, 1)
         )
         self.trick_count_head = nn.Linear(d, config.max_players * config.bid_count)
+        # Both belief heads emit one logit per (relative seat, class) and let the
+        # loss mask seats a shape does not have. The alternative -- 4 (resp. 1)
+        # logits plus a seat embedding, evaluated once per seat -- would turn a
+        # single d x 20 matmul into P passes over [B, L, d] for at most five
+        # seats that are already distinguishable by their relative index.
         self.suit_presence_head = nn.Linear(d, config.max_players * 4)
+        # An MLP, where suit presence is linear, because the two ask structurally
+        # different questions of the trunk. "Does seat p still hold a spade" is
+        # monotone in an accumulated feature, so a linear readout suffices. "Did
+        # seat p win exactly its bid" is a *bump*: measured on completed rounds,
+        # a linear head learns tricks_won >= k essentially perfectly and
+        # tricks_won == k barely at all, because equality needs two decision
+        # boundaries and one hidden layer to bracket them.
+        self.bid_hit_head = nn.Sequential(
+            nn.Linear(d, d), nn.GELU(), nn.Linear(d, config.max_players)
+        )
         self.owner_class_proj = nn.Linear(d, config.owner_class_count * d)
         self.owner_card_emb = nn.Embedding(NUM_CARDS, d)
 
@@ -245,8 +268,29 @@ class SeqPlumpModel(nn.Module):
             value=self.value_head(hidden).squeeze(-1),
         )
 
-    def forward_full(self, tokens: torch.Tensor, *, aux_heads: bool = True) -> SeqOutput:
-        """Full causal forward over [B, L, WIDTH] with per-position heads."""
+    def forward_full(
+        self,
+        tokens: torch.Tensor,
+        *,
+        aux_heads: bool | Collection[str] = True,
+    ) -> SeqOutput:
+        """Full causal forward over [B, L, WIDTH] with per-position heads.
+
+        ``aux_heads`` selects which auxiliary heads to run: True for all of
+        AUX_HEADS, False for none, or any subset by name. Heads left out are
+        None on the returned SeqOutput rather than zeros, so a loss that reads
+        one it did not ask for fails loudly instead of training on nothing.
+        """
+
+        if aux_heads is True:
+            wanted: Collection[str] = AUX_HEADS
+        elif aux_heads is False:
+            wanted = ()
+        else:
+            wanted = frozenset(aux_heads)
+            unknown = sorted(set(wanted) - set(AUX_HEADS))
+            if unknown:
+                raise ValueError(f"Unknown auxiliary heads: {unknown}")
 
         x = self.embed(tokens)
         for block in self.blocks:
@@ -260,14 +304,18 @@ class SeqPlumpModel(nn.Module):
             card_logits=self.card_head(hidden),
             value=self.value_head(hidden).squeeze(-1),
         )
-        if aux_heads:
-            batch, length, _ = hidden.shape
+        batch, length, _ = hidden.shape
+        if "trick" in wanted:
             output.trick_logits = self.trick_count_head(hidden).view(
                 batch, length, config.max_players, config.bid_count
             )
+        if "suit" in wanted:
             output.suit_logits = self.suit_presence_head(hidden).view(
                 batch, length, config.max_players, 4
             )
+        if "bid_hit" in wanted:
+            output.bid_hit_logits = self.bid_hit_head(hidden)
+        if "owner" in wanted:
             class_states = self.owner_class_proj(hidden).view(
                 batch, length, config.owner_class_count, config.d_model
             )

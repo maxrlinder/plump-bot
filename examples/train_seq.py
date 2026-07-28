@@ -156,16 +156,30 @@ def parse_args() -> argparse.Namespace:
         "--owner-coef",
         type=float,
         default=0.0,
-        help="belief losses start disabled: the initial objective is NeuRD "
-        "+ value. Raise to re-enable (0.25 was the v1 default).",
+        help="per-card ownership belief (Sinkhorn). Off: it is the most "
+        "expensive head by a wide margin. 0.25 was the v1 default.",
     )
     parser.add_argument(
         "--suit-coef",
         type=float,
-        default=0.0,
-        help="belief losses start disabled; 0.1 was the v1 default",
+        default=0.25,
+        help="per (seat, suit) sigmoid: does that seat still hold the suit? "
+        "Labelled at every position for every seat, own included.",
     )
-    parser.add_argument("--trick-coef", type=float, default=0.25)
+    parser.add_argument(
+        "--bid-hit-coef",
+        type=float,
+        default=0.25,
+        help="per seat sigmoid: will that seat finish on its bid? One "
+        "constant label per seat, read at every position.",
+    )
+    parser.add_argument(
+        "--trick-coef",
+        type=float,
+        default=0.0,
+        help="per seat distribution over final trick counts. Off: bid hit is "
+        "the same question in the form the score actually cares about.",
+    )
     parser.add_argument(
         "--entropy-coef",
         type=float,
@@ -216,6 +230,7 @@ LOG_COLUMNS = [
     "loss_owner",
     "loss_suit",
     "loss_trick",
+    "loss_bid_hit",
     "entropy",
     "policy_kl",
     "rolled_back",
@@ -284,6 +299,7 @@ def main() -> None:
         value_coef=args.value_coef,
         owner_coef=args.owner_coef,
         suit_coef=args.suit_coef,
+        bid_hit_coef=args.bid_hit_coef,
         trick_coef=args.trick_coef,
         entropy_coef=args.entropy_coef,
         kv_dtype=args.kv_dtype,
@@ -377,6 +393,7 @@ def main() -> None:
             f"{stats.loss_owner:.5f}",
             f"{stats.loss_suit:.5f}",
             f"{stats.loss_trick:.5f}",
+            f"{stats.loss_bid_hit:.5f}",
             f"{stats.entropy:.5f}",
             f"{stats.policy_kl:.6f}",
             int(stats.rolled_back),

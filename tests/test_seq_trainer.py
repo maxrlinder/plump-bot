@@ -17,6 +17,7 @@ from plump.seq.config import (
 )
 from plump.seq.model import SeqPlumpModel
 from plump.seq.policy import SeqModelPolicy
+from plump.seq.tokens import IGNORE_LABEL
 from plump.seq.trainer import (
     SeqTrainer,
     _rows_by_chunk,
@@ -66,7 +67,9 @@ def test_group_weights_normalize_to_one():
 
 
 def test_update_produces_finite_losses_and_changes_weights():
-    trainer = make_trainer()
+    # Every auxiliary head on, including the two the default objective leaves
+    # off, so all four label paths stay exercised.
+    trainer = make_trainer(owner_coef=0.25, trick_coef=0.25)
     trees, summary = trainer.collect()
     assert summary.trees == len(trees)
     before = [p.detach().clone() for p in trainer.model.parameters()]
@@ -75,6 +78,11 @@ def test_update_produces_finite_losses_and_changes_weights():
     assert np.isfinite(stats.loss_owner)
     assert np.isfinite(stats.loss_trick)
     assert np.isfinite(stats.loss_suit)
+    assert np.isfinite(stats.loss_bid_hit)
+    assert stats.loss_owner > 0.0
+    assert stats.loss_trick > 0.0
+    assert stats.loss_suit > 0.0
+    assert stats.loss_bid_hit > 0.0
     assert np.isfinite(stats.policy_kl)
     assert stats.policy_rows > 0
     assert stats.policy_rows == stats.branched_rows + stats.unbranched_rows
@@ -104,13 +112,16 @@ def test_kl_cap_rolls_back_the_epoch():
 def test_update_with_belief_losses_disabled_is_policy_value_only():
     """The initial objective: PPO + NeuRD + value, aux heads never run."""
 
-    trainer = make_trainer(owner_coef=0.0, suit_coef=0.0, trick_coef=0.0)
+    trainer = make_trainer(
+        owner_coef=0.0, suit_coef=0.0, trick_coef=0.0, bid_hit_coef=0.0
+    )
     trees, _ = trainer.collect()
     before = [p.detach().clone() for p in trainer.model.parameters()]
     stats = trainer.update(trees)
     assert stats.loss_owner == 0.0
     assert stats.loss_suit == 0.0
     assert stats.loss_trick == 0.0
+    assert stats.loss_bid_hit == 0.0
     assert np.isfinite(stats.loss_value)
     assert np.isfinite(stats.loss_policy)
     if not stats.rolled_back:
@@ -118,6 +129,59 @@ def test_update_with_belief_losses_disabled_is_policy_value_only():
             not torch.equal(a, b)
             for a, b in zip(before, trainer.model.parameters())
         )
+
+
+def test_belief_gradients_reach_only_the_heads_the_loss_weights():
+    """The default objective: suit presence + bid hit, one forward, one backward.
+
+    Owner and trick are weighted at zero, so their heads must not even run --
+    the owner einsum is the most expensive thing in the aux forward.
+    """
+
+    trainer = make_trainer()
+    trees, _ = trainer.collect()
+    groups = build_training_groups(trees, MODEL_CONFIG, trainer.train)
+    group = groups[0]
+
+    # Empty policy rows: this isolates the auxiliary losses, so any gradient
+    # below came from a belief head and not from NeuRD reaching the trunk.
+    loss, terms = trainer._chunk_loss(group, 0, group.tokens.shape[0], {})
+    trainer.model.zero_grad(set_to_none=True)
+    loss.backward()
+
+    model = trainer.model
+    assert terms["suit"] > 0.0
+    assert terms["bid_hit"] > 0.0
+    assert "owner" not in terms and "trick" not in terms
+    assert model.suit_presence_head.weight.grad.abs().sum() > 0.0
+    assert all(
+        p.grad is not None and p.grad.abs().sum() > 0.0
+        for p in model.bid_hit_head.parameters()
+    )
+    assert model.owner_class_proj.weight.grad is None
+    assert model.trick_count_head.weight.grad is None
+
+
+def test_belief_labels_cover_every_seat_and_stop_at_the_table_size():
+    """Both beliefs label the observer's own seat; padding seats stay masked."""
+
+    trainer = make_trainer()
+    trees, _ = trainer.collect()
+    groups = build_training_groups(trees, MODEL_CONFIG, trainer.train)
+    for group in groups:
+        players = group.num_players
+        owned = group.owned
+
+        assert (group.bid_hit_targets[:, :players] != IGNORE_LABEL).all()
+        assert (group.bid_hit_targets[:, players:] == IGNORE_LABEL).all()
+        assert np.isin(group.bid_hit_targets[:, :players], (0, 1)).all()
+
+        # Suit presence is per position, so check it only where a leaf owns the
+        # position -- unowned rows are never read by the loss.
+        real = group.suit_targets[:, :, :players, :][owned]
+        padding = group.suit_targets[:, :, players:, :][owned]
+        assert (real != IGNORE_LABEL).all()
+        assert (padding == IGNORE_LABEL).all()
 
 
 def test_entropy_bonus_and_advantage_clip_run():

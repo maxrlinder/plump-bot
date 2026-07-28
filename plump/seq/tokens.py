@@ -419,6 +419,7 @@ class ReplayArrays:
     trick_targets: np.ndarray     # [max_players] int64, IGNORE_LABEL padding
     trick_masks: np.ndarray       # [L, max_players, bid_count] bool
     suit_targets: np.ndarray      # [L, max_players, 4] int64, IGNORE_LABEL masked
+    bid_hit_targets: np.ndarray   # [max_players] int64 in {0,1}, IGNORE_LABEL padding
     final_tricks_won: dict[int, int]
 
 
@@ -457,7 +458,9 @@ def build_replay_arrays(
     building targets nothing will read -- the owner labels in particular are the
     bulk of the per-position work. The arrays are still returned at full shape,
     left at IGNORE_LABEL / False, so a loss enabled against labels that were not
-    built sees no labeled positions rather than wrong ones.
+    built sees no labeled positions rather than wrong ones. Bid hit has no gate:
+    it is one comparison per seat at the end of the walk, with no per-position
+    work to skip.
     """
 
     if set(initial_hands) != set(range(num_players)):
@@ -508,6 +511,9 @@ def build_replay_arrays(
     tricks_won_rel = np.zeros(num_players, dtype=np.int64)
     observer_hand: set[Card] = set(initial_hands[observer])
     bid_values: list[int] = []
+    # bid_values is in bidding order (the forbidden-bid rule needs that); this is
+    # the same bids keyed by relative seat, for the end-of-round hit comparison.
+    bid_rel = np.full(num_players, -1, dtype=np.int64)
     completed_tricks = 0
     current_led_suit: Suit | None = None
     current_trick_size = 0
@@ -541,8 +547,13 @@ def build_replay_arrays(
                 count_range[None, :] >= tricks_won_rel[:, None]
             ) & (count_range[None, :] <= upper[:, None])
         if suit_labels:
-            suit_targets[position, 1:num_players] = (
-                suit_count_rel[1:num_players] > 0
+            # Every seat including the observer's own (rel 0). Own suit presence
+            # is derivable from the prefix rather than a belief, but it costs one
+            # column and makes "do I still hold a spade" an explicit, supervised
+            # part of the representation instead of something the policy has to
+            # rediscover; it also keeps the head's seat axis uniform.
+            suit_targets[position, :num_players] = (
+                suit_count_rel[:num_players] > 0
             ).astype(np.int64)
 
     prefix_len = config.prefix_len(hand_size)
@@ -613,6 +624,7 @@ def build_replay_arrays(
             position += 1
         if event.type == EventType.BID:
             bid_values.append(event.bid)
+            bid_rel[(event.player - observer) % num_players] = event.bid
         elif event.type == EventType.PLAY:
             rel = (event.player - observer) % num_players
             if current_trick_size == 0:
@@ -649,6 +661,15 @@ def build_replay_arrays(
     trick_targets = np.full(config.max_players, IGNORE_LABEL, dtype=np.int64)
     trick_targets[:num_players] = tricks_won_rel
 
+    if (bid_rel < 0).any():
+        raise ValueError("Replay expects every player to have bid.")
+    # One boolean per seat for the whole round: the label is the outcome, so it
+    # is the same at every position. Positions before a seat has bid are labeled
+    # too -- there the question is "will this seat hit whatever it ends up
+    # bidding", which is a genuine forecast, not leakage.
+    bid_hit_targets = np.full(config.max_players, IGNORE_LABEL, dtype=np.int64)
+    bid_hit_targets[:num_players] = (tricks_won_rel == bid_rel).astype(np.int64)
+
     return ReplayArrays(
         tokens=tokens,
         decision_positions=np.asarray(decision_positions, dtype=np.int64),
@@ -670,6 +691,7 @@ def build_replay_arrays(
         trick_targets=trick_targets,
         trick_masks=trick_masks,
         suit_targets=suit_targets,
+        bid_hit_targets=bid_hit_targets,
         final_tricks_won={
             (observer + rel) % num_players: int(tricks_won_rel[rel])
             for rel in range(num_players)
