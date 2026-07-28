@@ -208,9 +208,6 @@ def test_aux_head_shapes():
         batch, length, config.max_players, config.bid_count
     )
     assert output.suit_logits.shape == (batch, length, config.max_players, 4)
-    assert output.owner_logits.shape == (
-        batch, length, 52, config.owner_class_count
-    )
     assert output.bid_hit_logits.shape == (batch, length, config.max_players)
 
 
@@ -225,7 +222,6 @@ def test_aux_heads_are_individually_selectable():
     # not ask for raises rather than silently training on nothing.
     assert subset.suit_logits is not None
     assert subset.bid_hit_logits is not None
-    assert subset.owner_logits is None
     assert subset.trick_logits is None
     assert none.suit_logits is none.bid_hit_logits is None
     with pytest.raises(ValueError):

@@ -147,15 +147,6 @@ class SeqModelConfig:
     def bid_count(self) -> int:
         return self.max_hand_size + 1
 
-    @property
-    def owner_class_count(self) -> int:
-        # Relative opponents 1..max_players-1, then the undealt pool.
-        return self.max_players
-
-    @property
-    def undealt_owner_class(self) -> int:
-        return self.max_players - 1
-
     # NA ids used to pad token slots.
     @property
     def player_na_id(self) -> int:
@@ -747,22 +738,15 @@ class SeqTrainingConfig:
     # -1.0 roughly equalizes weight across depths for a branching factor of 2.
     branch_depth_exponent: float = 0.0
 
-    # Auxiliary losses. A coefficient of exactly 0 skips computing that loss,
-    # and with every belief coefficient at 0 the auxiliary heads are not run at
-    # all -- the owner einsum + Sinkhorn is the expensive one.
+    # Auxiliary losses. A coefficient of exactly 0 skips computing that loss and
+    # skips running its head at all, so an unused belief costs nothing.
     #
     # The two beliefs the objective is built around are suit presence and bid
-    # hit, both per seat and both including the observer's own. Owner and trick
-    # count default off: owner is by far the most expensive head and trick count
-    # is the same question as bid hit in a wider, harder form.
+    # hit, both per seat and both including the observer's own. Trick count is
+    # kept as an option but starts at 0: it is the same question as bid hit in a
+    # wider, harder form.
     value_coef: float = 0.5
     trick_coef: float = 0.0
-    owner_coef: float = 0.0
-    owner_capacity_coef: float = 0.05
-    owner_sinkhorn_iterations: int = 8
-    # Train the owner head on a random fraction of labeled positions per
-    # update (unbiased; caps the Sinkhorn autograd graph size).
-    owner_position_fraction: float = 0.5
     # Per (seat, suit) sigmoid: does that seat still hold the suit? Labels move
     # with the round, so they are rebuilt at every position of the replay.
     suit_coef: float = 0.25

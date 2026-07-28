@@ -37,7 +37,6 @@ from plump.seq.config import (
 )
 from plump.state import EventType
 from plump.training.common import (
-    owner_targets_relative,
     suit_presence_targets_relative,
 )
 
@@ -61,9 +60,6 @@ def play_random_round(num_players, hand_size, seed, observer):
             oracles.append(
                 {
                     "encoded": encoded,
-                    "owner_targets": owner_targets_relative(
-                        env, observer, encoded.owner_valid_mask, V4_CONFIG
-                    ),
                     "suit_targets": suit_presence_targets_relative(
                         env, observer, V4_CONFIG
                     ),
@@ -190,16 +186,6 @@ def test_labels_match_v4_encoder_at_decisions(num_players, hand_size, seed):
                 arrays.legal_card_masks[index], np.asarray(encoded.legal_card_mask)
             )
             assert np.array_equal(
-                arrays.owner_valid[position], np.asarray(encoded.owner_valid_mask)
-            )
-            assert np.array_equal(
-                arrays.owner_capacities[position],
-                np.asarray(encoded.owner_capacities),
-            )
-            assert np.array_equal(
-                arrays.owner_targets[position], np.asarray(oracle["owner_targets"])
-            )
-            assert np.array_equal(
                 arrays.trick_masks[position],
                 np.asarray(encoded.final_trick_count_mask),
             )
@@ -232,24 +218,9 @@ def test_label_invariants_at_every_position(num_players, hand_size, seed):
 
     total_len = arrays.tokens.shape[0]
     for position in range(total_len):
-        hidden = arrays.owner_targets[position] != seq_tokens.IGNORE_LABEL
-        assert arrays.owner_capacities[position].sum() == hidden.sum()
-        targets = arrays.owner_targets[position][hidden]
-        valid = arrays.owner_valid[position][hidden]
-        assert valid[np.arange(len(targets)), targets].all()
         for rel in range(num_players):
             # The realized final trick count is always inside the mask.
             assert arrays.trick_masks[position, rel, arrays.trick_targets[rel]]
-
-
-def test_owner_capacity_shrinks_and_kitty_constant():
-    env, _, start = play_random_round(4, 6, seed=9, observer=1)
-    arrays = replay_arrays_for(env, 1, start)
-    kitty = 52 - 4 * 6
-    assert (arrays.owner_capacities[:, CONFIG.undealt_owner_class] == kitty).all()
-    opponent_capacity = arrays.owner_capacities[:, :3].sum(axis=1)
-    assert opponent_capacity[0] == 3 * 6
-    assert opponent_capacity[-1] == 0
 
 
 @pytest.mark.parametrize("label_from", [0, 10, 25])
@@ -260,13 +231,6 @@ def test_label_from_matches_full_build(label_from):
     assert np.array_equal(full.tokens, partial.tokens)
     total_len = full.tokens.shape[0]
     for position in range(label_from, total_len):
-        assert np.array_equal(
-            full.owner_targets[position], partial.owner_targets[position]
-        )
-        assert np.array_equal(full.owner_valid[position], partial.owner_valid[position])
-        assert np.array_equal(
-            full.owner_capacities[position], partial.owner_capacities[position]
-        )
         assert np.array_equal(full.trick_masks[position], partial.trick_masks[position])
         assert np.array_equal(
             full.suit_targets[position], partial.suit_targets[position]
@@ -425,17 +389,16 @@ def test_disabled_label_groups_stay_unlabelled_and_do_not_disturb_the_rest(
         num_players,
         round_state.hand_size,
         start,
-        owner_labels=False,
         suit_labels=False,
+        trick_labels=False,
     )
-    assert (off.owner_targets == seq_tokens.IGNORE_LABEL).all()
-    assert not off.owner_valid.any()
-    assert not off.owner_capacities.any()
     assert (off.suit_targets == seq_tokens.IGNORE_LABEL).all()
-    # Everything not switched off is untouched.
+    assert not off.trick_masks.any()
+    # Everything not switched off is untouched. Bid hit has no gate, so it is
+    # built either way and must still agree.
     assert np.array_equal(off.tokens, full.tokens)
-    assert np.array_equal(off.trick_masks, full.trick_masks)
     assert np.array_equal(off.trick_targets, full.trick_targets)
+    assert np.array_equal(off.bid_hit_targets, full.bid_hit_targets)
     assert np.array_equal(off.decision_positions, full.decision_positions)
     assert np.array_equal(off.action_targets, full.action_targets)
     assert np.array_equal(off.legal_card_masks, full.legal_card_masks)

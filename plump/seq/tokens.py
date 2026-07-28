@@ -6,9 +6,9 @@ A seat sequence is the game from one observer's point of view:
 
 All player references are observer-relative. The sequence contains exactly the
 information the observer may see: their own dealt hand plus the public event
-stream. Per-position auxiliary labels (card ownership, suit presence, final
-trick counts) are reconstructed by replaying the event log against the true
-deal; they are training targets only and never model inputs.
+stream. Per-position auxiliary labels (suit presence, bid hit, final trick
+counts) are reconstructed by replaying the event log against the true deal; they
+are training targets only and never model inputs.
 """
 
 from __future__ import annotations
@@ -413,9 +413,6 @@ class ReplayArrays:
     legal_bid_masks: np.ndarray   # [D, bid_count] bool
     legal_card_masks: np.ndarray  # [D, 52] bool
     action_targets: np.ndarray    # [D] int64 — bid value or card id actually taken
-    owner_targets: np.ndarray     # [L, 52] int64, IGNORE_LABEL outside hidden cards
-    owner_valid: np.ndarray       # [L, 52, owner_classes] bool
-    owner_capacities: np.ndarray  # [L, owner_classes] int64
     trick_targets: np.ndarray     # [max_players] int64, IGNORE_LABEL padding
     trick_masks: np.ndarray       # [L, max_players, bid_count] bool
     suit_targets: np.ndarray      # [L, max_players, 4] int64, IGNORE_LABEL masked
@@ -433,7 +430,6 @@ def build_replay_arrays(
     bidding_start_player: int,
     label_from: int = 0,
     tokens: np.ndarray | None = None,
-    owner_labels: bool = True,
     suit_labels: bool = True,
     trick_labels: bool = True,
 ) -> ReplayArrays:
@@ -450,17 +446,16 @@ def build_replay_arrays(
     ``tokens`` supplies an already-built token array, for callers that built it
     themselves to reuse a sibling's prefix (see ``build_seat_tokens``). The
     event walk below still runs in full either way: the replay state it carries
-    (holders, voids, tricks won) has to reach ``label_from`` before any label
-    can be written, so only the token construction is skippable.
+    (holders, suit counts, tricks won) has to reach ``label_from`` before any
+    label can be written, so only the token construction is skippable.
 
-    ``owner_labels`` / ``suit_labels`` / ``trick_labels`` all default to on. A
-    caller whose loss weights one of these at zero can turn it off to skip
-    building targets nothing will read -- the owner labels in particular are the
-    bulk of the per-position work. The arrays are still returned at full shape,
-    left at IGNORE_LABEL / False, so a loss enabled against labels that were not
-    built sees no labeled positions rather than wrong ones. Bid hit has no gate:
-    it is one comparison per seat at the end of the walk, with no per-position
-    work to skip.
+    ``suit_labels`` / ``trick_labels`` both default to on. A caller whose loss
+    weights one of these at zero can turn it off to skip building targets
+    nothing will read. The arrays are still returned at full shape, left at
+    IGNORE_LABEL / False, so a loss enabled against labels that were not built
+    sees no labeled positions rather than wrong ones. Bid hit has no gate: it is
+    one comparison per seat at the end of the walk, with no per-position work to
+    skip.
     """
 
     if set(initial_hands) != set(range(num_players)):
@@ -485,11 +480,7 @@ def build_replay_arrays(
             f"Replay expects a completed round: {tokens.shape[0]} tokens != {total_len}."
         )
 
-    classes = config.owner_class_count
     bid_count = config.bid_count
-    owner_targets = np.full((total_len, NUM_CARDS), IGNORE_LABEL, dtype=np.int64)
-    owner_valid = np.zeros((total_len, NUM_CARDS, classes), dtype=bool)
-    owner_capacities = np.zeros((total_len, classes), dtype=np.int64)
     trick_masks = np.zeros((total_len, config.max_players, bid_count), dtype=bool)
     suit_targets = np.full(
         (total_len, config.max_players, len(SUITS)), IGNORE_LABEL, dtype=np.int64
@@ -497,8 +488,8 @@ def build_replay_arrays(
 
     # Vectorized replay state (rel-indexed): holder_rel[card] is the current
     # holder's relative seat, ``num_players`` for the undealt kitty, -1 once
-    # publicly played.
-    suit_of_card = np.arange(NUM_CARDS) // len(RANKS)
+    # publicly played. It exists to catch a replay that has drifted from the
+    # real game -- see the non-holder assertion below.
     holder_rel = np.full(NUM_CARDS, num_players, dtype=np.int64)
     suit_count_rel = np.zeros((num_players, len(SUITS)), dtype=np.int64)
     for player, hand in initial_hands.items():
@@ -506,8 +497,6 @@ def build_replay_arrays(
         for card in hand:
             holder_rel[card_id(card)] = rel
             suit_count_rel[rel, SUITS.index(card.suit)] += 1
-    void_rel = np.zeros((num_players, len(SUITS)), dtype=bool)
-    played_count_rel = np.zeros(num_players, dtype=np.int64)
     tricks_won_rel = np.zeros(num_players, dtype=np.int64)
     observer_hand: set[Card] = set(initial_hands[observer])
     bid_values: list[int] = []
@@ -517,29 +506,9 @@ def build_replay_arrays(
     completed_tricks = 0
     current_led_suit: Suit | None = None
     current_trick_size = 0
-    kitty_size = NUM_CARDS - hand_size * num_players
-    undealt = config.undealt_owner_class
     count_range = np.arange(bid_count)
-    card_range = np.arange(NUM_CARDS)
 
     def fill_labels(position: int) -> None:
-        if owner_labels:
-            hidden = holder_rel > 0
-            valid = owner_valid[position]
-            for rel in range(1, num_players):
-                valid[:, rel - 1] = hidden & ~void_rel[rel, suit_of_card]
-            if kitty_size > 0:
-                valid[:, undealt] = hidden
-            targets = np.where(holder_rel == num_players, undealt, holder_rel - 1)
-            owner_targets[position] = np.where(hidden, targets, IGNORE_LABEL)
-            if not valid[card_range[hidden], targets[hidden]].all():
-                raise AssertionError(
-                    "Ground-truth owner is excluded by the public owner mask."
-                )
-            owner_capacities[position, : num_players - 1] = (
-                hand_size - played_count_rel[1:num_players]
-            )
-            owner_capacities[position, undealt] = kitty_size
         if trick_labels:
             unresolved = hand_size - completed_tricks
             upper = np.minimum(tricks_won_rel + unresolved, config.max_hand_size)
@@ -561,9 +530,6 @@ def build_replay_arrays(
         first = max(label_from, 0)
         fill_labels(first)
         for position in range(first + 1, prefix_len):
-            owner_targets[position] = owner_targets[first]
-            owner_valid[position] = owner_valid[first]
-            owner_capacities[position] = owner_capacities[first]
             trick_masks[position] = trick_masks[first]
             suit_targets[position] = suit_targets[first]
 
@@ -629,17 +595,11 @@ def build_replay_arrays(
             rel = (event.player - observer) % num_players
             if current_trick_size == 0:
                 current_led_suit = event.card.suit
-            elif (
-                current_led_suit is not None
-                and event.card.suit != current_led_suit
-            ):
-                void_rel[rel, SUITS.index(current_led_suit)] = True
             index_of_card = card_id(event.card)
             if holder_rel[index_of_card] != rel:
                 raise AssertionError("Replay saw a play from a non-holder.")
             holder_rel[index_of_card] = -1
             suit_count_rel[rel, SUITS.index(event.card.suit)] -= 1
-            played_count_rel[rel] += 1
             if event.player == observer:
                 observer_hand.remove(event.card)
             current_trick_size += 1
@@ -685,9 +645,6 @@ def build_replay_arrays(
             else np.zeros((0, NUM_CARDS), dtype=bool)
         ),
         action_targets=np.asarray(action_targets, dtype=np.int64),
-        owner_targets=owner_targets,
-        owner_valid=owner_valid,
-        owner_capacities=owner_capacities,
         trick_targets=trick_targets,
         trick_masks=trick_masks,
         suit_targets=suit_targets,

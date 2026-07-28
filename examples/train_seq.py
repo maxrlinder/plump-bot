@@ -153,13 +153,6 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--value-coef", type=float, default=0.5)
     parser.add_argument(
-        "--owner-coef",
-        type=float,
-        default=0.0,
-        help="per-card ownership belief (Sinkhorn). Off: it is the most "
-        "expensive head by a wide margin. 0.25 was the v1 default.",
-    )
-    parser.add_argument(
         "--suit-coef",
         type=float,
         default=0.25,
@@ -227,7 +220,6 @@ LOG_COLUMNS = [
     "spine_entropy",
     "loss_policy",
     "loss_value",
-    "loss_owner",
     "loss_suit",
     "loss_trick",
     "loss_bid_hit",
@@ -297,7 +289,6 @@ def main() -> None:
         neurd_advantage_clip=args.neurd_advantage_clip,
         neurd_inclusion_exponent=args.neurd_inclusion_exponent,
         value_coef=args.value_coef,
-        owner_coef=args.owner_coef,
         suit_coef=args.suit_coef,
         bid_hit_coef=args.bid_hit_coef,
         trick_coef=args.trick_coef,
@@ -390,7 +381,6 @@ def main() -> None:
             f"{summary.spine_entropy:.4f}",
             f"{stats.loss_policy:.5f}",
             f"{stats.loss_value:.5f}",
-            f"{stats.loss_owner:.5f}",
             f"{stats.loss_suit:.5f}",
             f"{stats.loss_trick:.5f}",
             f"{stats.loss_bid_hit:.5f}",

@@ -14,11 +14,9 @@ from torch import nn
 from .config import NUM_CARDS, TOKEN_WIDTH, SeqModelConfig
 from .kv import KVCache
 
-# Auxiliary heads, selectable one by one in forward_full. They differ by an order
-# of magnitude in cost -- "owner" is a d -> 5d projection plus a [B, L, 5, d] x
-# [52, d] einsum, the other three are single small matmuls on [B, L, d] -- so a
-# caller whose loss weights owner at zero should not be paying for it.
-AUX_HEADS = ("trick", "suit", "owner", "bid_hit")
+# Auxiliary heads, selectable one by one in forward_full: a caller whose loss
+# weights one at zero should not pay for its forward or its backward.
+AUX_HEADS = ("trick", "suit", "bid_hit")
 
 
 @dataclass
@@ -41,7 +39,6 @@ class SeqOutput:
     value: torch.Tensor        # [B, L]
     trick_logits: Optional[torch.Tensor] = None  # [B, L, max_players, bid_count]
     suit_logits: Optional[torch.Tensor] = None   # [B, L, max_players, 4]
-    owner_logits: Optional[torch.Tensor] = None  # [B, L, NUM_CARDS, owner_classes]
     bid_hit_logits: Optional[torch.Tensor] = None  # [B, L, max_players]
 
 
@@ -219,8 +216,6 @@ class SeqPlumpModel(nn.Module):
         self.bid_hit_head = nn.Sequential(
             nn.Linear(d, d), nn.GELU(), nn.Linear(d, config.max_players)
         )
-        self.owner_class_proj = nn.Linear(d, config.owner_class_count * d)
-        self.owner_card_emb = nn.Embedding(NUM_CARDS, d)
 
         self.apply(self._init_module)
         residual_scale = 1.0 / math.sqrt(2 * config.n_layers)
@@ -315,13 +310,6 @@ class SeqPlumpModel(nn.Module):
             )
         if "bid_hit" in wanted:
             output.bid_hit_logits = self.bid_hit_head(hidden)
-        if "owner" in wanted:
-            class_states = self.owner_class_proj(hidden).view(
-                batch, length, config.owner_class_count, config.d_model
-            )
-            output.owner_logits = torch.einsum(
-                "blkd,cd->blck", class_states, self.owner_card_emb.weight
-            ) / math.sqrt(config.d_model)
         return output
 
     def forward_prefill(

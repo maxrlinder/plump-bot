@@ -2,7 +2,7 @@
 
 One update consumes the collected trees as full causal forwards grouped by
 (players, hand size). There is a single policy objective — NeuRD — over every
-focal decision, plus per-position value/owner/suit/trick auxiliary losses.
+focal decision, plus per-position value and belief auxiliary losses.
 
 Why one objective. The rollout is an external-sampling tree: the focal's
 actions are enumerated (or drawn by an explicit rule) while chance and the
@@ -46,12 +46,10 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from plump.modeling.torch_model import masked_capacity_sinkhorn
 from plump.rounds import rules_fingerprint
 
 from .config import (
     NEXT_BID,
-    NUM_CARDS,
     SEQ_SCHEMA_VERSION,
     SeqModelConfig,
     SeqTrainingConfig,
@@ -100,9 +98,6 @@ class SeqTrainingGroup:
     owned: np.ndarray           # [B, L] bool
     value_targets: np.ndarray   # [B, L] float32
     seq_weight: np.ndarray      # [B] float32 (aux/value weight per sequence)
-    owner_targets: np.ndarray
-    owner_valid: np.ndarray
-    owner_capacities: np.ndarray
     trick_targets: np.ndarray   # [B, max_players]
     trick_masks: np.ndarray
     suit_targets: np.ndarray
@@ -114,7 +109,6 @@ class SeqTrainingGroup:
 class SeqUpdateStats:
     loss_policy: float = 0.0
     loss_value: float = 0.0
-    loss_owner: float = 0.0
     loss_suit: float = 0.0
     loss_trick: float = 0.0
     loss_bid_hit: float = 0.0
@@ -281,13 +275,6 @@ def build_training_groups(
         owned = np.zeros((batch, length), dtype=bool)
         value_targets = np.zeros((batch, length), dtype=np.float32)
         seq_weight = np.zeros(batch, dtype=np.float32)
-        owner_targets = np.full((batch, length, NUM_CARDS), IGNORE_LABEL, np.int64)
-        owner_valid = np.zeros(
-            (batch, length, NUM_CARDS, model_config.owner_class_count), dtype=bool
-        )
-        owner_capacities = np.zeros(
-            (batch, length, model_config.owner_class_count), dtype=np.int64
-        )
         trick_targets = np.full(
             (batch, model_config.max_players), IGNORE_LABEL, np.int64
         )
@@ -347,7 +334,6 @@ def build_training_groups(
                 tree.bidding_start_player,
                 label_from=leaf.owned_from,
                 tokens=tokens[row],
-                owner_labels=train_config.owner_coef > 0,
                 suit_labels=train_config.suit_coef > 0,
                 trick_labels=train_config.trick_coef > 0,
             )
@@ -355,9 +341,6 @@ def build_training_groups(
             for position, value in leaf.value_targets().items():
                 value_targets[row, position] = value
             seq_weight[row] = seq_weight_for(tree)
-            owner_targets[row] = arrays.owner_targets
-            owner_valid[row] = arrays.owner_valid
-            owner_capacities[row] = arrays.owner_capacities
             trick_targets[row] = arrays.trick_targets
             trick_masks[row] = arrays.trick_masks
             suit_targets[row] = arrays.suit_targets
@@ -421,9 +404,6 @@ def build_training_groups(
                 owned=owned,
                 value_targets=value_targets,
                 seq_weight=seq_weight,
-                owner_targets=owner_targets,
-                owner_valid=owner_valid,
-                owner_capacities=owner_capacities,
                 trick_targets=trick_targets,
                 trick_masks=trick_masks,
                 suit_targets=suit_targets,
@@ -569,7 +549,6 @@ class SeqTrainer:
                     totals[key] += value
         stats.loss_policy = totals["policy"]
         stats.loss_value = totals["value"]
-        stats.loss_owner = totals["owner"]
         stats.loss_suit = totals["suit"]
         stats.loss_trick = totals["trick"]
         stats.loss_bid_hit = totals["bid_hit"]
@@ -579,11 +558,10 @@ class SeqTrainer:
         device = self.device
         train = self.train
         # Only the heads whose loss is actually weighted -- each one skipped is
-        # its whole forward and backward saved, and owner is by far the largest.
+        # its whole forward and backward saved.
         aux = frozenset(
             name
             for name, coef in (
-                ("owner", train.owner_coef),
                 ("suit", train.suit_coef),
                 ("trick", train.trick_coef),
                 ("bid_hit", train.bid_hit_coef),
@@ -607,62 +585,6 @@ class SeqTrainer:
         ).sum()
         loss = loss + train.value_coef * value_loss
         terms["value"] = float(value_loss.detach())
-
-        # Owner (Sinkhorn-constrained NLL + capacity term).
-        sel = None
-        if train.owner_coef > 0:
-            owner_targets = torch.from_numpy(
-                group.owner_targets[start:stop]
-            ).to(device)
-            labeled = (owner_targets != IGNORE_LABEL) & owned[:, :, None]
-            if labeled.any():
-                positions = labeled.any(dim=2)
-                fraction = self.train.owner_position_fraction
-                if fraction < 1.0:
-                    keep = (
-                        torch.rand_like(positions, dtype=torch.float32) < fraction
-                    )
-                    positions = positions & keep
-                sel = positions.nonzero(as_tuple=True)
-                if sel[0].numel() == 0:
-                    sel = None
-        if sel is not None:
-            logits = output.owner_logits[sel[0], sel[1]]
-            valid = torch.from_numpy(group.owner_valid[start:stop]).to(device)[
-                sel[0], sel[1]
-            ]
-            capacities = torch.from_numpy(
-                group.owner_capacities[start:stop]
-            ).to(device)[sel[0], sel[1]]
-            targets = owner_targets[sel[0], sel[1]]
-            weights = (seq_weight[:, None] * positions.float())[sel[0], sel[1]]
-            probs = masked_capacity_sinkhorn(
-                logits, valid, capacities,
-                iterations=train.owner_sinkhorn_iterations,
-            )
-            card_labeled = targets != IGNORE_LABEL
-            gathered = probs.gather(
-                2, targets.clamp_min(0).unsqueeze(-1)
-            ).squeeze(-1)
-            nll = -torch.log(gathered.clamp_min(1e-9)) * card_labeled.float()
-            hidden_counts = card_labeled.float().sum(dim=1).clamp_min(1.0)
-            owner_loss = (weights * nll.sum(dim=1) / hidden_counts).sum()
-            # -1e9 instead of -inf: fully-masked card rows (observer-held or
-            # played cards) must stay NaN-free through softmax backward.
-            pre = torch.softmax(
-                logits.float().masked_fill(~valid, -1e9), dim=-1
-            )
-            pre = torch.where(
-                valid.any(dim=-1, keepdim=True), pre, torch.zeros_like(pre)
-            )
-            capacity_mse = (
-                (pre.sum(dim=1) - capacities.float()) ** 2
-            ).mean(dim=-1)
-            owner_loss = owner_loss + train.owner_capacity_coef * (
-                weights * capacity_mse
-            ).sum()
-            loss = loss + train.owner_coef * owner_loss
-            terms["owner"] = float(owner_loss.detach())
 
         # Suit presence.
         suit_labeled = None

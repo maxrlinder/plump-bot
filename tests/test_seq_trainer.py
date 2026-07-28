@@ -67,19 +67,17 @@ def test_group_weights_normalize_to_one():
 
 
 def test_update_produces_finite_losses_and_changes_weights():
-    # Every auxiliary head on, including the two the default objective leaves
-    # off, so all four label paths stay exercised.
-    trainer = make_trainer(owner_coef=0.25, trick_coef=0.25)
+    # Trick count on as well, so every label path stays exercised even though
+    # the default objective leaves it at zero.
+    trainer = make_trainer(trick_coef=0.25)
     trees, summary = trainer.collect()
     assert summary.trees == len(trees)
     before = [p.detach().clone() for p in trainer.model.parameters()]
     stats = trainer.update(trees)
     assert np.isfinite(stats.loss_value)
-    assert np.isfinite(stats.loss_owner)
     assert np.isfinite(stats.loss_trick)
     assert np.isfinite(stats.loss_suit)
     assert np.isfinite(stats.loss_bid_hit)
-    assert stats.loss_owner > 0.0
     assert stats.loss_trick > 0.0
     assert stats.loss_suit > 0.0
     assert stats.loss_bid_hit > 0.0
@@ -113,12 +111,11 @@ def test_update_with_belief_losses_disabled_is_policy_value_only():
     """The initial objective: PPO + NeuRD + value, aux heads never run."""
 
     trainer = make_trainer(
-        owner_coef=0.0, suit_coef=0.0, trick_coef=0.0, bid_hit_coef=0.0
+        suit_coef=0.0, trick_coef=0.0, bid_hit_coef=0.0
     )
     trees, _ = trainer.collect()
     before = [p.detach().clone() for p in trainer.model.parameters()]
     stats = trainer.update(trees)
-    assert stats.loss_owner == 0.0
     assert stats.loss_suit == 0.0
     assert stats.loss_trick == 0.0
     assert stats.loss_bid_hit == 0.0
@@ -134,8 +131,7 @@ def test_update_with_belief_losses_disabled_is_policy_value_only():
 def test_belief_gradients_reach_only_the_heads_the_loss_weights():
     """The default objective: suit presence + bid hit, one forward, one backward.
 
-    Owner and trick are weighted at zero, so their heads must not even run --
-    the owner einsum is the most expensive thing in the aux forward.
+    Trick count is weighted at zero, so its head must not even run.
     """
 
     trainer = make_trainer()
@@ -152,13 +148,12 @@ def test_belief_gradients_reach_only_the_heads_the_loss_weights():
     model = trainer.model
     assert terms["suit"] > 0.0
     assert terms["bid_hit"] > 0.0
-    assert "owner" not in terms and "trick" not in terms
+    assert "trick" not in terms
     assert model.suit_presence_head.weight.grad.abs().sum() > 0.0
     assert all(
         p.grad is not None and p.grad.abs().sum() > 0.0
         for p in model.bid_hit_head.parameters()
     )
-    assert model.owner_class_proj.weight.grad is None
     assert model.trick_count_head.weight.grad is None
 
 
