@@ -110,7 +110,7 @@ examples/train_seq.py            training entrypoint
 scripts/calibrate_seq_schedule.py    rollout-only timing over the shape grid
 scripts/benchmark_seq_throughput.py  full collect+update cycle
 scripts/report_seq_*.py              branch shape / rate grid / shape cost
-tests/test_seq_*.py                  135 tests
+tests/test_seq_*.py                  147 tests
 ```
 
 ## 4. Schema v6: the token stream
@@ -143,8 +143,8 @@ The GAME token also carries the observer's **bidding position** in the
 
 **Decision positions.** The hidden state `h_t` at the token whose `next_actor`
 is the observer predicts the observer's action — ordinary next-token
-prediction. Value, ownership, suit-presence and trick-count heads are read at
-*every* position.
+prediction. The value and belief heads are read at *every* position, not only at
+the focal's own decisions.
 
 ### The two schema flags
 
@@ -230,30 +230,52 @@ decoder written out by hand (`nn.TransformerEncoder` cannot do cached decode).
 | `bid_head` | `[.., 11]` | bid policy, read at decision positions |
 | `card_head` | `[.., 52]` | card policy, read at decision positions |
 | `value_head` | `[.., 1]` | MLP; focal relative reward / backed value |
-| `trick_count_head` | `[.., P, 11]` | final tricks-won per relative player, feasibility-masked |
-| `suit_presence_head` | `[.., P, 4]` | does relative opponent `p` still hold suit `s` |
-| owner (bilinear) | `[.., 52, P]` | which relative opponent (or the kitty) holds each hidden card |
+| `suit_presence_head` | `[.., P, 4]` | **belief**: does seat `p` still hold suit `s`? |
+| `bid_hit_head` | `[.., P]` | **belief**: will seat `p` finish on its bid? |
+| `trick_count_head` | `[.., P, 11]` | final tricks-won per seat, feasibility-masked. Optional, off by default |
 
-The owner head is factored: `owner_class_proj` maps `h_t` to one state per
-owner class, contracted against a card embedding table. Sinkhorn capacity
-normalisation is applied **loss-side only** — never during rollout — over a
-random fraction of labeled positions per update, which caps the autograd graph.
+Both belief heads emit **one logit per (relative seat, class)** and let the loss
+mask seats a shape does not have. The alternative — a few logits plus a seat
+embedding evaluated once per seat — turns one `d × 20` matmul into `P` passes
+over `[B, L, d]` to distinguish at most five seats the relative index already
+separates. Both beliefs cover **every seat including the observer's own**: own
+suit presence is derivable from the prefix rather than a belief, but it costs one
+column and makes "do I still hold a spade" explicitly supervised.
 
-Three entry points: `forward_full` (all positions, all heads — training and
-eval), `forward_prefill` (encode a fresh prefix into empty cache rows), and
-`forward_step` (append one token or a run of tokens, read the last — the
-rollout hot path, lean heads only).
+**Suit presence is linear and bid hit is an MLP**, and that asymmetry was
+measured rather than assumed. Suit presence is an *existence* question, monotone
+in an accumulated feature, so a linear readout suffices. Bid hit is `tricks_won
+== bid` — a **bump**, not a threshold. On completed rounds, held out by deal, a
+linear head learns `tricks_won >= k` essentially perfectly and `tricks_won == k`
+barely at all:
 
-**Sizes measured so far:**
+| task at the final position | linear head | MLP head |
+|---|---:|---:|
+| `won >= 2` (threshold) | **+0.685** (solved) | +0.686 |
+| `won == 2` (exact count, no bid) | +0.031 | +0.046 |
+| `won == bid` (bid hit) | +0.005 | **+0.027** |
+
+(gain in nats of held-out BCE against a base rate fitted per task). The trunk
+counts fine — thresholds are solved. Equality needs two decision boundaries, so
+`bid_hit_head` is `Linear → GELU → Linear`. **Check this shape question before
+adding any new belief head.**
+
+`forward_full(aux_heads=...)` takes a **set of head names**, so a head whose loss
+coefficient is zero costs neither a forward nor a backward. Three entry points:
+`forward_full` (all positions — training and eval), `forward_prefill` (encode a
+fresh prefix into empty cache rows), and `forward_step` (append one token or a
+run of tokens, read the last — the rollout hot path, lean heads only).
+
+**Sizes:**
 
 | dims | params |
 |---|---:|
-| `d_model 256, 6 layers, 8 heads, kv 2, ff 768` | 3,855,499 |
-| `d_model 320, 8 layers, 10 heads, kv 2, ff 960` | ~7.65M |
-| `d_model 384, 6 layers, 12 heads, kv 2, ff 1024` (**default**) | 7,846,795 |
+| `d_model 256, 6 layers, 8 heads, kv 2, ff 768` | 3,579,024 |
+| `d_model 320, 8 layers, 10 heads, kv 2, ff 960` | 7,223,184 |
+| `d_model 384, 6 layers, 12 heads, kv 2, ff 1024` (**default**) | 7,235,472 |
 
-The 7.85M config is the `examples/train_seq.py` default: head_dim stays 32 at 6
-layers so KV bytes/row are unchanged from the 3.86M model, and the rollout is
+The 7.24M config is the `examples/train_seq.py` default: head_dim stays 32 at 6
+layers so KV bytes/row are unchanged from the 3.58M model, and the rollout is
 latency-bound, so doubling the parameters measured only +6% rollout time.
 
 ## 6. KV cache
@@ -408,6 +430,37 @@ of its children, so the backup is identical to an unsplit tree's.
 full causal forwards grouped by `(players, hand_size)`, in
 `microbatch_positions`-sized chunks with gradient accumulation.
 
+### How the batching actually works
+
+There are no waves here — waves are a rollout concept. The rounds are complete,
+so each finished sequence is re-encoded in one causal forward.
+
+The unit of work is a **leaf**, not a game: every leaf of every tree is one row
+holding the full token sequence for that round from the focal seat's view. Rows
+group by **shape**, because a rectangular `[B, L, 12]` tensor needs uniform `L`.
+Each group is then chunked by a *position* budget (`microbatch_positions`,
+16384), so rows per microbatch fall as sequences lengthen. One measured
+iteration (96 deals, 35,578 leaves):
+
+| | rows | `L` | rows/microbatch | microbatches |
+|---|---:|---:|---:|---:|
+| 3p × 3c | 46 | 22 | 744 | 1 |
+| 4p × 9c | 3,803 | 63 | 260 | 15 |
+| 5p × 10c | 3,879 | 81 | 202 | 20 |
+
+**24 groups → 144 microbatches → 144 forward+backward pairs → gradients
+accumulate across all of them → one optimizer step.** `epochs` (default 1) is
+the only knob that makes it more than one step.
+
+Note the cost of the ownership rule: of the 2,098,340 positions the forward
+computes, only **565,101 (27%) carry loss**. Each leaf owns only the suffix after
+its last branch point, but every sibling still has to *run* the shared prefix —
+you cannot get `h_t` at position 60 without computing 0–59. The rollout avoids
+exactly this redundancy via `branch_copy`; the update throws it away and
+re-encodes each row independently. Fixing that means attention over the tree
+rather than over independent sequences, so the branch rate is effectively a
+redundant-prefix multiplier on update cost.
+
 Nothing is stored as tensors during rollout: a leaf keeps its env's event log
 plus per-decision records, and `build_replay_arrays` re-derives tokens and
 *all* per-position labels at update time by replaying the log against the true
@@ -481,14 +534,41 @@ rollback if weighted KL exceeds `policy_kl_cap`. The guard now covers *every*
 policy row; under the old split it measured branch rows only, leaving the spine
 half of the decisions outside it.
 
-**Auxiliary losses**: value (smooth-L1, every owned position — terminal reward
-on the spine tail, backed value at resolved branch positions), owner NLL with
-loss-side Sinkhorn plus a capacity term, suit-presence masked BCE, trick-count
-feasibility-masked CE, and an entropy bonus at decision positions. A
-coefficient of exactly 0 skips computing that loss, and with owner/suit/trick
-all 0 the auxiliary heads are not run at all. The training entrypoint starts
-with the belief losses (owner, suit) **disabled** — the initial objective is
-NeuRD + value + trick-count; re-enable via `--owner-coef` / `--suit-coef`.
+**Auxiliary losses.** Value (smooth-L1, every owned position — terminal reward
+on the spine tail, backed value at resolved branch positions), plus **two
+beliefs**, both sigmoid, both per seat, both including the observer's own, both
+read at every owned position rather than only at focal decisions:
+
+| loss | label | shape of the label |
+|---|---|---|
+| **suit presence** (`--suit-coef`, 0.25) | does seat `p` still hold suit `s`? | changes through the round, so rebuilt at every position of the replay |
+| **bid hit** (`--bid-hit-coef`, 0.25) | will seat `p` finish on its bid? | an outcome, so one constant per seat broadcast over every position |
+
+Bid hit is labelled from position 0, including positions before a seat has bid —
+there the question is "will this seat hit whatever it ends up bidding", which is
+a genuine forecast rather than leakage.
+
+Trick count (`--trick-coef`) is retained as an option but **defaults to 0**: it
+is the same question as bid hit in a wider, harder form. A coefficient of exactly
+0 skips both the loss and the head's forward.
+
+**The per-card ownership head is deleted**, not merely disabled — head, labels,
+Sinkhorn loss, config, CLI flag and metrics column. It was by far the most
+expensive thing in the auxiliary forward (17s of a 66s update, against 1.6s for
+both beliefs combined) and nothing reads it. Removing it also dropped the replay
+bookkeeping that existed only to feed it: the per-card void table, per-seat
+played counts, suit-of-card index and kitty capacities, all of which ran on every
+PLAY event regardless of whether owner labels were gated on. The v4 pipeline's
+owner head in `plump/training` and `plump/modeling` is untouched.
+
+**Caveat on bid hit.** It is conceptually valid and correctly wired, but it is
+the weaker of the two. Suit presence generalises strongly on held-out deals
+(BCE 0.668 → 0.369, strongest mid-to-late round); bid hit reached only +0.027
+against its base rate on a fixed 4.7k-deal probe. Part of that is real
+difficulty, part is that a constant-per-round label repeated across ~57 positions
+is highly memorisable on a *fixed* set — a probe artifact, not the training
+regime, which is `epochs=1` on a fresh deal stream. Judge `loss_bid_hit` against
+its base-rate floor (≈0.41 at 4p × 8c), never against zero.
 
 The entropy bonus defaults to **0**. It exists to fight the entropy collapse of
 a `π(a)`-scaled policy gradient, and NeuRD does not have that failure mode —
@@ -539,6 +619,35 @@ All on an M-series Mac (24 GB unified memory, MPS), the 96-deal
 position-balanced schedule: one deal per (player count, hand size, bidding
 position), `gumbel_top_k` k=3, exhaustive to 7 cards tapering to 0.5
 at 10, `n_kv_heads=2`, 65536-row cap.
+
+> **The schedule is 24 cells, not 96.** `build_position_balanced_schedule()`
+> returns one cell per (players, cards) and each cell carries `games = players`,
+> giving 96 deals. Replicating it out to 96 *cells* silently produces 384 deals,
+> ~170k leaves and a ~305s iteration — a 4× oversized benchmark.
+
+### Current full cycle
+
+3 consecutive iterations, `gumbel_top_k` k=4, rate 0.5 at 10 cards, 3.58M model,
+fp32 KV, objective = NeuRD + value + suit presence + bid hit:
+
+| leaves | total | collect | update | of which label build | decisions/s |
+|---:|---:|---:|---:|---:|---:|
+| 35,578 | 66.4s | 23.4s | **43.0s** | 3.2s | 691 |
+| 37,607 | 68.6s | 23.1s | **45.5s** | 3.6s | 692 |
+| 44,851 | 76.7s | 24.8s | **51.9s** | 3.9s | 706 |
+
+**~47s update, ~70s iteration, ~700 decisions/s** (a *decision* is a policy row:
+one focal choice the update trains on, branched or not). Collect is 34% and the
+update 66%; inside the update the label and token build is only 3–4s and the rest
+is the backward. decisions/s is flat across a 26% swing in leaf count, so cost is
+linear in leaves at this scale — no batching cliff.
+
+The numbers in the rest of this section predate both the optimisation work in
+§10 and the deletion of the owner head, and are kept for the *relative*
+comparisons they make (schema flags, model scale, deals vs depth), not as current
+absolute costs. Where they say "3.86M model" or "7.85M parameters" they mean the
+same dims listed in §5, which are 3.58M and 7.24M now that the owner projection
+and its card embedding are gone.
 
 **Rollout only** (`calibrate_seq_schedule.py`), 3.86M model, fp32 KV:
 
@@ -601,12 +710,93 @@ gather buffer did not help, so it is system-level memory pressure rather than
 an allocation-size problem. Levers in the order that pays best: GQA, then fp16
 KV, then `bid_split_groups`, then fewer deals per batch.
 
-## 10. Running it
+## 10. Optimizations
+
+The architectural optimisations live where they belong — GQA and hand-written
+decode attention in §5, the cache design in §6, the wave loop in §7. This
+section is about the **host-side** work, which turned out to matter more than any
+of them: the cycle went **144s → ~70s** on the same schedule with byte-identical
+output, and almost none of that came from touching the model.
+
+### The four Python traps
+
+All four share one shape: **per-item work that looks free.**
+
+- **`PlumpEnv.step()` built a full `Observation` on every call** — voids over
+  every player and suit, played-card dicts, legal actions, a copy of the event
+  log — which the wave loop never reads, since it goes straight to `event_log`
+  and `is_done()`. ~20% of collect. Fixed with `emit_observations = False`, set
+  in `_new_deal` and carried through `clone()`.
+- **`_policy_terms` padded its candidate tensors with a Python loop of
+  device-side slice assignments** — four MPS kernel launches per policy row,
+  ~200k tiny dispatches per update. Padding on the host in numpy and shipping one
+  transfer per field took it **54.6s → 11.0s**. This was the single largest cost
+  in the entire pipeline and it was invisible as any one line.
+- **`random.Random()` + `setstate`** draws 32 bytes of OS entropy and runs the
+  key schedule (~15 µs) purely for `setstate` to discard it. `Random.__new__` +
+  `setstate` is ~1.5 µs with a provably identical stream. Hit once per branch
+  child and once per `env.clone()`.
+- **`torch.tensor(python_list, device=...)`** walks the list elementwise; going
+  via numpy is ~1.5× faster.
+
+### Not recomputing what a sibling already built
+
+A branch child's tokens are identical to its parent's up to the branch — the env
+was cloned there. `SeqLeaf.parent` plus `build_seat_tokens(token_prefix=...)`
+copies that prefix instead of replaying the events. Ordering the pass by
+`owned_from` is a free topological order, since a parent always branched strictly
+earlier than its child. Token build **1.90s → 0.86s** over 37k leaves.
+
+Two things this must not disturb: the *policy row* order stays the entries order,
+because reordering changes float reduction order; and the labels are **not**
+shareable the way tokens are, since they need the replay state walked event by
+event to reach `owned_from`.
+
+### Skipping labels nothing will read
+
+`build_replay_arrays` gates each label group on its loss coefficient. Arrays are
+still returned at full shape, left at `IGNORE_LABEL`/`False`, so a loss enabled
+against labels that were not built sees *no* labelled positions rather than wrong
+ones. Together with the auxiliary-head selection in §5, an unused belief now
+costs nothing on either the host or the device.
+
+### How this was verified, and how it should be next time
+
+**Bit-exact fingerprints.** A SHA-256 over every tree, leaf, event log, decision,
+probability array, backed value and inclusion probability (collect), and over
+every `SeqUpdateStats` field plus all final weights (update) — run on **CPU**,
+where reductions are bitwise reproducible. Exclude `update_sec` / `build_sec`:
+they are wall times and will always differ.
+
+Three traps in the measurement itself, each of which produced a wrong conclusion
+before being caught:
+
+- **`git stash` is a no-op once the work is committed**, so the "baseline" run
+  silently re-measured the optimised code. Use `git checkout <base> -- <files>`.
+- **cProfile lies about this code path.** It reported the token build at 7.15s
+  against a true **1.90s**: the path makes ~9M tiny calls and the profiler adds
+  ~1 µs to each. An optimisation sized off that number was predicted at ~5s and
+  delivered ~1s. cProfile is fine for finding *which* function, never for how
+  much. Time with `perf_counter` around the real thing.
+- **The machine throttles**, so sequential A-then-B flatters whichever ran first.
+  Interleave A/B/A/B. (A closed lid mid-run is worse still — one iteration
+  measured 97.7s against a true 68.6s.)
+
+### On CPU cores
+
+Python 3.12 with the GIL on, so threads cannot parallelise any of this. The
+rollout's remaining CPU sits in a strict `forward → sample → step → forward`
+chain that cannot overlap anyway. The one genuinely parallel load,
+`build_replay_arrays`, is now ~4s — too small to justify a process pool that
+would have to move gigabytes of label arrays back through shared memory. Worth
+revisiting only if the label set grows or leaf counts rise substantially.
+
+## 11. Running it
 
 Use `.venv/bin/python -m <tool>` rather than `uv run` (stale shebangs in the
 venv).
 
-**Tests** — 129 seq tests, 330 in the full suite:
+**Tests** — 147 seq tests, 351 in the full suite:
 
 ```bash
 .venv/bin/python -m pytest tests/test_seq_*.py
@@ -655,22 +845,30 @@ log directory, checkpoints and league snapshots to the checkpoint directory.
 `report_seq_rate_grid.py` (cost vs branch rate), `report_seq_shape_cost.py`,
 `sweep_seq_rollout.py`, `benchmark_seq_rollout_scaling.py`.
 
-## 11. Status
+## 12. Status
 
 Built and tested: token schema, model, KV cache, wave-loop rollout with
-branching and exact backups, the trainer with all losses and the KL guard,
-checkpoints, league, policy adapter, and the full benchmark/reporting toolchain.
-Rollout throughput and the full-cycle cost are measured and documented above.
+branching and exact backups, the trainer with NeuRD plus the value and belief
+losses and the KL guard, checkpoints, league, policy adapter, and the full
+benchmark/reporting toolchain. Rollout throughput and the full-cycle cost are
+measured and documented above, and the cycle has been optimised to ~70s with
+bit-identical output at every step.
 
 **Not yet done** — this document will grow here:
 
 - No real training run has been launched. All numbers above are throughput, not
   learning.
+- Whether bid hit earns its place. It is correctly wired and cheap, but on a
+  fixed-deal probe it barely separates from its base rate (§8). The streaming
+  regime should be much kinder to it; that is an empirical question a real run
+  answers.
 - Quality validation of `n_kv_heads=2` against full MHA via `evaluate_policy`,
   in **both** matchup directions (directed matchups favour the lone focal seat
   by ~0.1 points/round, so a one-directional comparison is not evidence).
-- Whether to adopt the 7.85M dims as the default, and whether
+- Whether to adopt the 7.24M dims as the default, and whether
   `branch_depth_exponent=-0.5` is worth it.
+- Sharing branch prefixes in the *update* the way the rollout already does
+  (§8): 73% of forwarded positions carry no loss.
 - Modal / L40S scale-up (the older v9 pipeline already trains there).
 
 ## Legacy pipelines
