@@ -941,9 +941,10 @@ class SeqRolloutCollector:
 
         raw = {index: float(probs[index]) for index in candidates}
         if mc_weights is not None:
-            # Empirical frequencies over i.i.d. draws already sum to 1, so the
-            # backup uses the full-mass (exact-form) path and is an unbiased
-            # Monte-Carlo estimate of the policy value.
+            # Already-normalized backup weights -- empirical frequencies for
+            # sample_k's i.i.d. draws, Hajek pi(a)/q(a) for the Gumbel modes'
+            # draws without replacement. Either way they sum to 1, so the
+            # backup takes the full-mass (exact-form) path.
             priors = tuple(mc_weights)
             mass = 1.0
         else:
@@ -1235,9 +1236,11 @@ class SeqRolloutCollector:
     ) -> tuple[list[int], Optional[list[float]], int, list[float]]:
         """Return (candidates, mc weights or None, deterministic count, q).
 
-        Weights are returned only for ``sample_k``, where the candidate set is
-        i.i.d. draws and the backup must weight by empirical frequency instead
-        of by renormalized policy mass.
+        Weights are returned by the sampling rules, whose candidate sets are
+        draws rather than a deterministic top-k, so the backup cannot simply
+        renormalize policy mass over the set: ``sample_k`` weights by empirical
+        frequency, the Gumbel modes by Hajek pi(a)/q(a). The deterministic
+        rules return None and the caller renormalizes.
 
         ``q`` is the inclusion probability of each returned candidate -- the
         chance this rule would have expanded that action at this node. It is
@@ -1248,31 +1251,41 @@ class SeqRolloutCollector:
 
         rule = self.train.branch_rule
         if phase == Phase.BIDDING:
-            top_k = rule.bid_top_k
-            if top_k == 0 or len(legal) <= top_k:
-                ordered = sorted(legal, key=lambda index: (-probs[index], index))
-                return ordered, None, len(ordered), [1.0] * len(ordered)
-            ranked = sorted(legal, key=lambda index: (-probs[index], index))
-            selected = ranked[: top_k - 1]
-            deterministic_count = len(selected)
-            inclusion = [1.0] * deterministic_count
-            if sampled not in selected:
-                # Reached only by being drawn, so its inclusion is exactly the
-                # policy mass on it.
-                selected = [*selected, sampled]
-                inclusion.append(float(probs[sampled]))
-            return selected, None, deterministic_count, inclusion
+            mode, top_k = rule.bid_rule()
+        else:
+            trick_index = len(
+                [
+                    t
+                    for t in leaf.env.state.current_round.tricks
+                    if t.winner is not None
+                ]
+            )
+            mode, top_k = rule.play_rule_for_trick(trick_index)
+        return self._candidates_for_mode(leaf, legal, probs, sampled, mode, top_k)
 
-        trick_index = len(
-            [t for t in leaf.env.state.current_round.tricks if t.winner is not None]
-        )
-        mode, top_k = rule.play_rule_for_trick(trick_index)
+    def _candidates_for_mode(
+        self,
+        leaf: SeqLeaf,
+        legal: list[int],
+        probs: np.ndarray,
+        sampled: int,
+        mode: str,
+        top_k: int,
+    ) -> tuple[list[int], Optional[list[float]], int, list[float]]:
+        """Apply one selection rule, with no knowledge of which phase asked.
+
+        Bids and plays share this outright rather than each holding a copy:
+        ``bid_mode = "same_as_play"`` has to mean *the same rule*, and two
+        parallel implementations agreeing today is not the same guarantee as
+        one implementation serving both.
+        """
+
         if mode == "none":
             return [sampled], None, 0, [float(probs[sampled])]
 
         if mode in ("sample_k", "sample_k_plus_uniform"):
             if top_k < 1:
-                raise ValueError("play_top_k must be >= 1 for sample_k.")
+                raise ValueError(f"top_k must be >= 1 for {mode}.")
             # The realized action is the first draw, so the spine child stays
             # the on-policy one and all k draws are i.i.d. from the policy.
             draws = [sampled]
@@ -1304,7 +1317,7 @@ class SeqRolloutCollector:
 
         if mode in ("gumbel_top_k", "gumbel_top_k_plus_random"):
             if top_k < 1:
-                raise ValueError("play_top_k must be >= 1 for gumbel_top_k.")
+                raise ValueError(f"top_k must be >= 1 for {mode}.")
             return self._gumbel_candidates(
                 leaf,
                 legal,

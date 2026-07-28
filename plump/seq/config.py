@@ -254,6 +254,23 @@ PlayBranchMode = Literal[
 # Literal is erased at runtime, so validate() checks membership against this.
 PLAY_BRANCH_MODES: frozenset[str] = frozenset(get_args(PlayBranchMode))
 
+# How the focal's own bid -- the root of every tree -- is expanded.
+BidBranchMode = Literal[
+    # Resolve to play_mode/play_top_k, so the bid is selected by exactly the
+    # rule the plays use. Not a default for tidiness: "the same rule" is a
+    # property that has to survive someone retuning the play rule and not
+    # noticing the bid has its own copy of the numbers.
+    "same_as_play",
+    # Deterministic: the top (bid_top_k - 1) bids by policy probability, plus
+    # the realized sample if it is not already among them. Those arms have
+    # inclusion probability 1, but the set is a hard truncation -- a bid the
+    # policy currently ranks fourth is never expanded, however close it is.
+    "top_k",
+    "gumbel_top_k",
+    "gumbel_top_k_plus_random",
+]
+BID_BRANCH_MODES: frozenset[str] = frozenset(get_args(BidBranchMode))
+
 
 @dataclass(frozen=True)
 class StageBranchRule:
@@ -295,9 +312,21 @@ class ShapeBranchRate:
 class BranchRuleConfig:
     """Pluggable branching restrictions; tunable without code changes."""
 
-    # Bidding: branch the top (bid_top_k - 1) bids by policy probability plus
-    # the unconditional raw-policy sample (control-variate estimator).
-    # 0 disables the cap (branch every legal bid).
+    # Bidding. ``bid_top_k`` is how many arms the mode gets: under "top_k" the
+    # top (bid_top_k - 1) bids by policy probability plus the unconditional
+    # raw-policy sample, and 0 disables the cap (branch every legal bid); under
+    # the Gumbel modes it is k, the number of *distinct* policy-drawn arms, and
+    # "plus_random" adds one uniform explorer on top. Both are ignored under
+    # "same_as_play", which takes the play rule's mode and k instead.
+    #
+    # Sharing the play rule is usually right. The bid is the root of the tree
+    # and the only decision expanded unconditionally, so a truncation there is
+    # not one missed counterfactual -- it is a whole subtree of the round that
+    # never gets played out. "top_k" can never expand a bid the policy
+    # currently ranks below the cut, so an early misvaluation is self-sealing;
+    # the sampling modes reach it with probability proportional to its policy
+    # mass, and the uniform arm floors that at 1/|legal|.
+    bid_mode: BidBranchMode = "top_k"
     bid_top_k: int = 4
     play_mode: PlayBranchMode = "all_legal"
     play_top_k: int = 4
@@ -309,6 +338,20 @@ class BranchRuleConfig:
             if trick_index >= rule.from_trick:
                 mode, top_k = rule.play_mode, rule.play_top_k
         return mode, top_k
+
+    def bid_rule(self) -> tuple[str, int]:
+        """The rule the focal's bid is expanded under.
+
+        "same_as_play" resolves through ``play_rule_for_trick(0)`` rather than
+        reading ``play_mode`` directly: bidding happens before any trick is
+        complete, so a stage rule written ``from_trick = 0`` is meant to cover
+        it, and reading the field would quietly disagree with the plays it is
+        supposed to match.
+        """
+
+        if self.bid_mode == "same_as_play":
+            return self.play_rule_for_trick(0)
+        return self.bid_mode, self.bid_top_k
 
 
 @dataclass(frozen=True)
@@ -852,6 +895,31 @@ class SeqTrainingConfig:
             raise ValueError("player_count_weights must have positive mass.")
         if self.branch_rule.bid_top_k < 0:
             raise ValueError("bid_top_k must be >= 0.")
+        if self.branch_rule.bid_mode not in BID_BRANCH_MODES:
+            raise ValueError(
+                f"Unknown bid_mode {self.branch_rule.bid_mode!r}; expected one "
+                f"of {sorted(BID_BRANCH_MODES)}."
+            )
+        # The Gumbel modes need at least the realized arm to draw around, and
+        # unlike "top_k" they have no "0 means uncapped" reading. "same_as_play"
+        # ignores bid_top_k entirely.
+        if self.branch_rule.bid_mode in ("gumbel_top_k", "gumbel_top_k_plus_random"):
+            if self.branch_rule.bid_top_k < 1:
+                raise ValueError(
+                    f"bid_top_k must be >= 1 for bid_mode "
+                    f"{self.branch_rule.bid_mode!r}."
+                )
+        # The focal's bid is the root and is expanded unconditionally -- it is
+        # the one decision the branch rate never gates. A play rule of "none"
+        # is a legitimate way to run unbranched plays, but inherited by the bid
+        # it would leave every tree a single path, which is not what anyone
+        # setting "same_as_play" is asking for.
+        if self.branch_rule.bid_rule()[0] == "none":
+            raise ValueError(
+                "bid_mode 'same_as_play' resolves to play_mode 'none', which "
+                "would leave the focal's bid -- the root of every tree -- "
+                "unexpanded. Set bid_mode explicitly."
+            )
         # PlayBranchMode is only a type hint, and an unrecognized mode falls
         # through the dispatch in _branch_candidates to the plain top-k path --
         # a typo in a TOML preset would silently train under a different

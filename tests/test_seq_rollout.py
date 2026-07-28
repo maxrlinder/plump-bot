@@ -1086,6 +1086,96 @@ def test_gumbel_top_k_plus_random_adds_one_zero_weight_explorer():
     assert widened > 0, "the uniform arm never fired"
 
 
+def test_same_as_play_gives_bids_the_identical_rule_not_a_similar_one():
+    """The bid must be selected by the play rule itself.
+
+    Asserting on the bid's *shape* would pass for a parallel implementation
+    that happens to agree today, so this asserts on the resolution instead --
+    and that the bid branch really carries the sampling rule's fingerprints
+    (distinct arms, a zero-weight explorer, non-degenerate inclusion probs)
+    rather than deterministic top-k's all-ones.
+    """
+
+    from plump.seq.config import (
+        BranchBudgetConfig,
+        BranchRuleConfig,
+        GameScheduleCell,
+        SeqModelConfig,
+        SeqTrainingConfig,
+        StageBranchRule,
+    )
+    from plump.seq.model import SeqPlumpModel
+    from plump.seq.trainer import SeqTrainer
+
+    rule = BranchRuleConfig(
+        bid_mode="same_as_play", play_mode="gumbel_top_k_plus_random", play_top_k=3
+    )
+    assert rule.bid_rule() == ("gumbel_top_k_plus_random", 3)
+    # bid_top_k is inert under same_as_play -- k comes from the play rule.
+    assert replace(rule, bid_top_k=9).bid_rule() == ("gumbel_top_k_plus_random", 3)
+    # Bidding precedes every trick, so a stage rule from trick 0 owns it too.
+    staged = replace(
+        rule,
+        stage_rules=(
+            StageBranchRule(from_trick=0, play_mode="sample_k", play_top_k=2),
+        ),
+    )
+    assert staged.bid_rule() == ("sample_k", 2)
+    # And an explicit mode still overrides.
+    assert replace(rule, bid_mode="top_k", bid_top_k=4).bid_rule() == ("top_k", 4)
+
+    torch.manual_seed(0)
+    train = SeqTrainingConfig(
+        schedule_cells=(GameScheduleCell(hand_size=6, num_players=4),),
+        branch_rule=rule,
+        branch_budget=BranchBudgetConfig(branch_rate=1.0),
+    )
+    model = SeqPlumpModel(SeqModelConfig(d_model=64, n_layers=2, n_heads=4, d_ff=128))
+    trees, _ = SeqTrainer(model, train, device="cpu").collect()
+
+    bids = widened = 0
+    for tree in trees:
+        for leaf in tree.leaves:
+            for record in leaf.decisions:
+                branch = record.branch
+                if branch is None or record.phase != NEXT_BID:
+                    continue
+                bids += 1
+                indices = branch.candidate_indices
+                assert len(set(indices)) == len(indices)
+                assert len(indices) <= 4
+                # Deterministic top-k would put 1.0 on its ranked arms; the
+                # sampling rules never do except when the set is exhaustive.
+                assert all(0.0 < q <= 1.0 for q in branch.inclusion_probs)
+                zero_weight = [w for w in branch.prior_probs if w == 0.0]
+                assert len(zero_weight) <= 1
+                if len(indices) == 4:
+                    widened += 1
+                    assert len(zero_weight) == 1
+    assert bids > 0
+    assert widened > 0, "the bid's uniform arm never fired"
+
+
+def test_a_bid_rule_that_would_leave_the_root_unexpanded_is_rejected():
+    """"none" is fine for plays and fatal for the bid, which never rate-gates."""
+
+    from plump.seq.config import BranchRuleConfig, GameScheduleCell, SeqTrainingConfig
+
+    train = SeqTrainingConfig(
+        schedule_cells=(GameScheduleCell(hand_size=3, num_players=3),),
+        branch_rule=BranchRuleConfig(bid_mode="same_as_play", play_mode="none"),
+    )
+    with pytest.raises(ValueError, match="unexpanded"):
+        train.validate()
+
+    bad = SeqTrainingConfig(
+        schedule_cells=(GameScheduleCell(hand_size=3, num_players=3),),
+        branch_rule=BranchRuleConfig(bid_mode="gumbel_topk"),
+    )
+    with pytest.raises(ValueError, match="Unknown bid_mode"):
+        bad.validate()
+
+
 def test_unknown_play_mode_is_rejected_rather_than_silently_downgraded():
     """PlayBranchMode is erased at runtime; a typo must not become top_k."""
 

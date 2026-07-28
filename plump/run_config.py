@@ -118,6 +118,7 @@ def resolve_training_config(raw: dict[str, Any]) -> ResolvedTraining:
         player_counts=player_counts,
         player_count_weights=player_weights,
         branch_rule=BranchRuleConfig(
+            bid_mode=str(training_raw.get("bid_mode", "top_k")),
             bid_top_k=int(training_raw["bid_top_k"]),
             play_mode=str(training_raw["play_mode"]),
             play_top_k=int(training_raw["play_top_k"]),

@@ -25,6 +25,8 @@ games_per_cell = 0
 reference_rate = 0.5
 branch_rate_player_exponent = 0.0
 exhaustive_until = 7
+# The focal's bid is picked by the play rule itself, not a copy of it.
+bid_mode = "same_as_play"
 bid_top_k = 4
 play_mode = "gumbel_top_k_plus_random"
 play_top_k = 3
