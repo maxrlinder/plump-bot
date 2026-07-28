@@ -38,6 +38,13 @@ from .state import (
 class PlumpEnv:
     """Core Plump engine with explicit legal actions and deterministic stepping."""
 
+    # Build the per-step Observation, i.e. StepResult.observation. Callers that
+    # read the state directly can turn this off: the observation is rebuilt from
+    # scratch on every step (voids over every player and suit, per-player played
+    # cards, legal actions, a copy of the event log) and it is the single most
+    # expensive part of stepping. get_observation() stays callable either way.
+    emit_observations: bool = True
+
     def __init__(self, config: Optional[GameConfig] = None, seed: Optional[int] = None):
         self.config = config or GameConfig()
         self._validate_config()
@@ -78,7 +85,10 @@ class PlumpEnv:
 
         clone = object.__new__(PlumpEnv)
         clone.config = self.config
-        clone.rng = random.Random()
+        # __new__ rather than Random(): the constructor draws 32 bytes from the
+        # OS and runs the key schedule (~15us) only for setstate to throw it all
+        # away (~1.5us). Branching rollouts clone thousands of envs per batch.
+        clone.rng = random.Random.__new__(random.Random)
         clone.rng.setstate(self.rng.getstate())
         clone.state = GameState(
             config=self.config,
@@ -128,6 +138,7 @@ class PlumpEnv:
             "_deck_override",
             "_hands_override",
             "_trump_override",
+            "emit_observations",
         ):
             if hasattr(self, name):
                 setattr(clone, name, getattr(self, name))
@@ -460,7 +471,9 @@ class PlumpEnv:
     def _result(self, rewards: dict[int, int], info: Optional[dict[str, object]] = None) -> StepResult:
         observation = (
             None
-            if self.is_done() or self.state.current_player is None
+            if not self.emit_observations
+            or self.is_done()
+            or self.state.current_player is None
             else self.get_observation(self.current_player())
         )
         return StepResult(

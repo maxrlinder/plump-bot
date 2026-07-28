@@ -59,6 +59,21 @@ CURRENT = "current"
 OPPONENT = "opponent"
 
 
+def _rng_from_state(state) -> random.Random:
+    """A Random restored to ``state``, without seeding it first.
+
+    ``random.Random()`` draws 32 bytes from the OS and runs the Mersenne key
+    schedule, all of which ``setstate`` then discards -- ~15us against ~1.5us
+    here, and this runs once per branch child. ``__new__`` skips the seeding;
+    ``setstate`` restores the full state including ``gauss_next``, so the
+    resulting stream is identical.
+    """
+
+    rng = random.Random.__new__(random.Random)
+    rng.setstate(state)
+    return rng
+
+
 def _upstream_depth(upstream) -> int:
     """How many branch decisions sit above this point on its path."""
 
@@ -430,6 +445,11 @@ class SeqRolloutCollector:
             ),
             seed=seed,
         )
+        # The wave loop reads env.state.event_log and env.is_done() directly and
+        # never touches StepResult, so the observation every step() built was
+        # pure waste -- and it is rebuilt once per step per leaf. clone() carries
+        # the flag, so every leaf in every tree inherits it.
+        env.emit_observations = False
         env.reset(seed=seed)
         return env, start_player, seed
 
@@ -555,8 +575,8 @@ class SeqRolloutCollector:
         leaves: list[SeqLeaf] = []
         row_counters: dict[str, int] = {CURRENT: 0, OPPONENT: 0}
         for tree, deal_env, crn_state in unit:
-            leaf_rng = random.Random()
-            leaf_rng.setstate(crn_state)  # matched arms share the random tape
+            # matched arms share the random tape
+            leaf_rng = _rng_from_state(crn_state)
             slots = {}
             for seat in range(num_players):
                 policy_id = self._policy_for_seat(tree.arm, tree.focal, seat)
@@ -621,8 +641,12 @@ class SeqRolloutCollector:
             for policy_id, (parents, children) in branch_copies.items():
                 self._caches[policy_id].ensure_capacity(row_counters[policy_id])
                 self._caches[policy_id].branch_copy(
-                    torch.tensor(parents, dtype=torch.long, device=self.device),
-                    torch.tensor(children, dtype=torch.long, device=self.device),
+                    torch.from_numpy(
+                        np.asarray(parents, dtype=np.int64)
+                    ).to(self.device),
+                    torch.from_numpy(
+                        np.asarray(children, dtype=np.int64)
+                    ).to(self.device),
                     length=position,
                 )
             if branch_copies:
@@ -976,8 +1000,7 @@ class SeqRolloutCollector:
             if candidate == sampled:
                 leaf.bid_group = group
                 continue
-            child_rng = random.Random()
-            child_rng.setstate(crn_state)
+            child_rng = _rng_from_state(crn_state)
             child_slots: dict[int, tuple[str, int]] = {}
             if self.use_cache:
                 for seat, (policy_id, parent_row) in leaf.slots.items():
@@ -1122,8 +1145,7 @@ class SeqRolloutCollector:
         crn_state = leaf.rng.getstate()
         # The parent leaf carries the first candidate; the rest are clones.
         for candidate in group[1:]:
-            child_rng = random.Random()
-            child_rng.setstate(crn_state)
+            child_rng = _rng_from_state(crn_state)
             child_slots: dict[int, tuple[str, int]] = {}
             if self.use_cache:
                 for seat, (policy_id, parent_row) in leaf.slots.items():
@@ -1413,10 +1435,10 @@ class SeqRolloutCollector:
     def _is_forced_runout(env: PlumpEnv) -> bool:
         if env.phase() != Phase.PLAYING:
             return False
-        return all(
-            len(hand) <= 1
-            for hand in env.state.current_round.current_hands.values()
-        )
+        # max(map(len, ...)) rather than all(len(h) <= 1 for h in ...): this runs
+        # once per leaf per step, and the genexpr's frame setup costs more than
+        # the whole comparison over 3-5 hands.
+        return max(map(len, env.state.current_round.current_hands.values())) <= 1
 
     def _finalize_leaf(self, leaf: SeqLeaf) -> None:
         scores = leaf.env.state.current_round.round_scores
@@ -1648,11 +1670,16 @@ class SeqRolloutCollector:
                 )
                 capture_list = captures.get(policy_id)
                 if capture_list:
-                    indices = torch.tensor(
-                        [row for row, _, _ in capture_list],
-                        dtype=torch.long,
-                        device=self.device,
-                    )
+                    # via numpy: torch.tensor() on a Python list walks it
+                    # element by element, which is ~1.5x the cost of a numpy
+                    # buffer copy at wave-sized lists.
+                    indices = torch.from_numpy(
+                        np.fromiter(
+                            (row for row, _, _ in capture_list),
+                            dtype=np.int64,
+                            count=len(capture_list),
+                        )
+                    ).to(self.device)
                     bid_logits = output.bid_logits[indices].float().cpu().numpy()
                     card_logits = output.card_logits[indices].float().cpu().numpy()
                     values = output.value[indices].float().cpu().numpy()
