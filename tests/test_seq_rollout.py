@@ -947,3 +947,42 @@ def test_rate_skips_are_not_cache_blocks():
     collector.collect(None, random.Random(0))
     assert collector.stats.skipped_by_placement > 0
     assert collector.stats.blocked_by_cache == 0
+
+
+def test_gumbel_top_k_never_repeats_a_candidate():
+    """Duplicates cost a whole subtree and buy no counterfactual."""
+
+    from plump.seq.config import BranchRuleConfig, BranchBudgetConfig
+    from plump.seq.trainer import SeqTrainer
+    from plump.seq.model import SeqPlumpModel
+    from plump.seq.config import GameScheduleCell, SeqModelConfig, SeqTrainingConfig
+
+    torch.manual_seed(0)
+    train = SeqTrainingConfig(
+        schedule_cells=(
+            GameScheduleCell(hand_size=6, num_players=4),
+            GameScheduleCell(hand_size=8, num_players=5),
+        ),
+        branch_rule=BranchRuleConfig(play_mode="gumbel_top_k", play_top_k=3),
+        branch_budget=BranchBudgetConfig(branch_rate=1.0),
+    )
+    model = SeqPlumpModel(SeqModelConfig(d_model=64, n_layers=2, n_heads=4, d_ff=128))
+    trees, _ = SeqTrainer(model, train, device="cpu").collect()
+
+    seen = 0
+    for tree in trees:
+        for leaf in tree.leaves:
+            for record in leaf.decisions:
+                branch = record.branch
+                if branch is None or record.phase == NEXT_BID:
+                    continue
+                seen += 1
+                indices = branch.candidate_indices
+                assert len(set(indices)) == len(indices)
+                assert len(indices) <= 3
+                assert len(branch.inclusion_probs) == len(indices)
+                assert all(0.0 < q <= 1.0 for q in branch.inclusion_probs)
+                # Backup weights are a probability vector over the candidates,
+                # so the parent's value stays inside the children's range.
+                assert sum(branch.prior_probs) == pytest.approx(1.0)
+    assert seen > 0

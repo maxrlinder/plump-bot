@@ -1,16 +1,34 @@
 """Trainer for the schema-v6 sequence pipeline.
 
 One update consumes the collected trees as full causal forwards grouped by
-(players, hand size). Policy losses follow the v4 recursive pipeline:
-guarded NeuRD (or PPO) on branch rows with counterfactual Q backups, PPO on
-spine rows, plus per-position value/owner/suit/trick auxiliary losses.
+(players, hand size). There is a single policy objective — NeuRD — over every
+focal decision, plus per-position value/owner/suit/trick auxiliary losses.
 
-Gradient-scale note: NeuRD's logit gradient is ~A while PPO's at ratio 1 is
-~pi(a)*A, so branch rows push low-probability actions much harder. Branch and
-spine contributions are therefore normalized by their own global weight sums
-each update and combined via explicit ``branch_policy_coef`` /
-``spine_policy_coef`` — the branch/spine mix cannot drift the effective
-learning rate. Tree weighting keeps factorially larger games from dominating.
+Why one objective. The rollout is an external-sampling tree: the focal's
+actions are enumerated (or drawn by an explicit rule) while chance and the
+opponents are sampled. On that data an importance ratio corrects nothing —
+ratios exist to repair sampling from the policy, and the candidate set was not
+drawn that way. NeuRD's loss has no expectation over actions in it at all:
+
+    L = -sum_a w_a * sg[A(a)] * y_a      =>      dL/dy_a = -w_a * A(a)
+
+which is a per-action statement, true for each ``a`` independently of which
+other actions were expanded. So an arbitrary candidate set is valid, provided
+(1) Q(a) is unbiased for that action's continuation value, (2) the baseline V
+is the full-policy value rather than a mean over the candidates, and (3) set
+membership does not depend on the noise in Q(a).
+
+A branched decision supplies Q(a) per candidate and V from the backup (exact
+for full candidate mass, control-variate for a capped set). An unbranched one
+is the k=1 case: Q is the realized return and V is the value head's estimate,
+which is the same statement with a bootstrapped baseline. Both are rows of the
+same loss, so there is no branch/spine mix to balance.
+
+``w_a`` is 1/q(a)**exponent, where q is the chance the branch rule would have
+expanded that action. Without it, a rule that expands by sampling the policy
+gives E[gradient] ~ pi(a)*A(a) — the policy-gradient prefactor NeuRD exists to
+remove, reintroduced through the candidate sampler. Tree weighting keeps
+factorially larger games from dominating.
 """
 
 from __future__ import annotations
@@ -51,34 +69,27 @@ from .tokens import IGNORE_LABEL, build_replay_arrays
 
 @dataclass
 class PolicyRows:
-    """Spine PPO rows for one phase within one group."""
+    """NeuRD rows for one phase within one group.
 
-    seq_index: list[int] = field(default_factory=list)
-    position: list[int] = field(default_factory=list)
-    action: list[int] = field(default_factory=list)
-    old_probs: list[np.ndarray] = field(default_factory=list)
-    advantage: list[float] = field(default_factory=list)
-    weight: list[float] = field(default_factory=list)
-
-
-@dataclass
-class BranchRows:
-    """Branch rows (counterfactual Q backups) for one phase within one group."""
+    One row per focal decision, branched or not. A branched decision carries
+    its candidate set; an unbranched one carries the single realized action.
+    """
 
     seq_index: list[int] = field(default_factory=list)
     position: list[int] = field(default_factory=list)
     old_probs_full: list[np.ndarray] = field(default_factory=list)
     candidates: list[np.ndarray] = field(default_factory=list)
-    # Backup weights: what the parent's value averages the child Q values with.
-    # Zero for a purely explored arm, so these are *not* a behaviour policy.
-    priors: list[np.ndarray] = field(default_factory=list)
-    # The behaviour policy restricted to the candidate set. This is the correct
-    # importance-ratio denominator; ``priors`` would divide by zero on an
-    # explored arm and can be a Monte-Carlo frequency rather than a
-    # probability on the sampling modes.
-    behaviour: list[np.ndarray] = field(default_factory=list)
     q_values: list[np.ndarray] = field(default_factory=list)
+    # Full-policy value at this state, *not* a mean over the candidates: the
+    # backup for a branched decision, the value head for an unbranched one.
+    # NeuRD needs A(a) = Q(a) - V with V over all legal actions, because the
+    # loss makes a claim about each candidate logit on its own.
+    baseline: list[float] = field(default_factory=list)
+    # P(this action was expanded here), per candidate. See the module docstring.
+    inclusion: list[np.ndarray] = field(default_factory=list)
     weight: list[float] = field(default_factory=list)
+    # Diagnostics only: how the row was produced.
+    branched: list[bool] = field(default_factory=list)
 
 
 @dataclass
@@ -95,23 +106,24 @@ class SeqTrainingGroup:
     trick_targets: np.ndarray   # [B, max_players]
     trick_masks: np.ndarray
     suit_targets: np.ndarray
-    spine: dict[str, PolicyRows]
-    branch: dict[str, BranchRows]
+    policy: dict[str, PolicyRows]
 
 
 @dataclass
 class SeqUpdateStats:
-    loss_spine: float = 0.0
-    loss_branch: float = 0.0
+    loss_policy: float = 0.0
     loss_value: float = 0.0
     loss_owner: float = 0.0
     loss_suit: float = 0.0
     loss_trick: float = 0.0
     entropy: float = 0.0
-    branch_kl: float = 0.0
+    policy_kl: float = 0.0
     rolled_back: bool = False
-    spine_rows: int = 0
-    branch_rows: int = 0
+    policy_rows: int = 0
+    # Split of policy_rows by how the row was produced. Diagnostics: both
+    # feed the same loss.
+    branched_rows: int = 0
+    unbranched_rows: int = 0
     positions: int = 0
     update_sec: float = 0.0
     build_sec: float = 0.0
@@ -167,21 +179,10 @@ def summarize_trees(trees: list[SeqTree], collector_stats) -> SeqRolloutSummary:
 # --------------------------------------------------------------------- #
 
 
-def _branch_depth(record) -> int:
-    """How many branch decisions sit above this one on its path."""
-
-    depth = 0
-    upstream = record.branch.upstream
-    while upstream is not None:
-        depth += 1
-        upstream = upstream[0].upstream
-    return depth
-
-
 def _branch_depth_scale(trees, exponent: float) -> dict[int, float]:
-    """Per-branch-record multiplier that re-weights rows by depth.
+    """Per-decision multiplier that re-weights rows by depth.
 
-    Normalized per tree so the tree's total branch weight is untouched: this
+    Normalized per tree so the tree's total policy weight is untouched: this
     knob decides where inside a tree the gradient lands, and must not double as
     a way of making some trees count more.
     """
@@ -190,17 +191,11 @@ def _branch_depth_scale(trees, exponent: float) -> dict[int, float]:
         return {}
     scale: dict[int, float] = {}
     for tree in trees:
-        records = [
-            record
-            for leaf in tree.leaves
-            for record in leaf.decisions
-            if record.branch is not None
-        ]
+        records = [record for leaf in tree.leaves for record in leaf.decisions]
         if not records:
             continue
         raw = {
-            id(record): (1.0 + _branch_depth(record)) ** exponent
-            for record in records
+            id(record): (1.0 + record.depth) ** exponent for record in records
         }
         total = sum(raw.values())
         if total <= 0:
@@ -230,18 +225,8 @@ def build_training_groups(
         )
         for tree in trees
     }
-    rows_per_tree_spine = {
-        id(tree): sum(
-            sum(1 for r in leaf.decisions if r.branch is None)
-            for leaf in tree.leaves
-        )
-        for tree in trees
-    }
-    rows_per_tree_branch = {
-        id(tree): sum(
-            sum(1 for r in leaf.decisions if r.branch is not None)
-            for leaf in tree.leaves
-        )
+    rows_per_tree_policy = {
+        id(tree): sum(len(leaf.decisions) for leaf in tree.leaves)
         for tree in trees
     }
     exponent = float(train_config.tree_weight_exponent) if per_tree else 1.0
@@ -276,19 +261,15 @@ def build_training_groups(
         }
 
     seq_weights = row_weights(owned_per_tree)
-    spine_weights = row_weights(rows_per_tree_spine)
-    branch_weights = row_weights(rows_per_tree_branch)
+    policy_weights = row_weights(rows_per_tree_policy)
 
     depth_scale = _branch_depth_scale(trees, train_config.branch_depth_exponent)
 
     def seq_weight_for(tree: SeqTree) -> float:
         return seq_weights[id(tree)]
 
-    def spine_weight_for(tree: SeqTree) -> float:
-        return spine_weights[id(tree)]
-
-    def branch_weight_for(tree: SeqTree) -> float:
-        return branch_weights[id(tree)]
+    def policy_weight_for(tree: SeqTree) -> float:
+        return policy_weights[id(tree)]
 
     groups: list[SeqTrainingGroup] = []
     for (num_players, hand_size), entries in sorted(by_shape.items()):
@@ -315,8 +296,7 @@ def build_training_groups(
         suit_targets = np.full(
             (batch, length, model_config.max_players, 4), IGNORE_LABEL, np.int64
         )
-        spine = {"bid": PolicyRows(), "play": PolicyRows()}
-        branch = {"bid": BranchRows(), "play": BranchRows()}
+        policy = {"bid": PolicyRows(), "play": PolicyRows()}
 
         for row, (tree, leaf) in enumerate(entries):
             arrays = build_replay_arrays(
@@ -343,41 +323,53 @@ def build_training_groups(
 
             for record in leaf.decisions:
                 phase_key = "bid" if record.phase == NEXT_BID else "play"
-                if record.branch is None:
-                    rows = spine[phase_key]
-                    rows.seq_index.append(row)
-                    rows.position.append(record.position)
-                    rows.action.append(record.action_index)
-                    rows.old_probs.append(record.old_probs)
-                    rows.advantage.append(
-                        leaf.value_target_at(record.position) - record.old_value
+                rows = policy[phase_key]
+                rows.seq_index.append(row)
+                rows.position.append(record.position)
+                rows.old_probs_full.append(record.old_probs)
+                b = record.branch
+                if b is None:
+                    # k=1: the only Q we have is the realized return, so the
+                    # baseline has to come from the value head. Inclusion is
+                    # exactly the policy mass on the action, since sampling is
+                    # the only way this action got a Q at all.
+                    action = record.action_index
+                    rows.candidates.append(np.asarray([action], dtype=np.int64))
+                    rows.q_values.append(
+                        np.asarray(
+                            [leaf.value_target_at(record.position)],
+                            dtype=np.float32,
+                        )
                     )
-                    rows.weight.append(spine_weight_for(tree))
+                    rows.baseline.append(float(record.old_value))
+                    rows.inclusion.append(
+                        np.asarray(
+                            [record.old_probs[action]], dtype=np.float32
+                        )
+                    )
+                    rows.branched.append(False)
                 else:
-                    b = record.branch
-                    rows = branch[phase_key]
-                    rows.seq_index.append(row)
-                    rows.position.append(record.position)
-                    rows.old_probs_full.append(record.old_probs)
                     rows.candidates.append(
                         np.asarray(b.candidate_indices, dtype=np.int64)
                     )
-                    rows.priors.append(np.asarray(b.prior_probs, dtype=np.float32))
-                    raw = np.asarray(
-                        [b.raw_probs[i] for i in b.candidate_indices],
-                        dtype=np.float32,
-                    )
-                    rows.behaviour.append(raw / max(float(raw.sum()), 1e-12))
                     rows.q_values.append(
                         np.asarray(
                             [b.child_values[i] for i in b.candidate_indices],
                             dtype=np.float32,
                         )
                     )
-                    rows.weight.append(
-                        branch_weight_for(tree)
-                        * depth_scale.get(id(record), 1.0)
+                    # The backup: exact sum_a pi(a) Q(a) at full candidate
+                    # mass, control-variate estimate of the same quantity for
+                    # a capped set. Either way it is the full-policy value,
+                    # which is what A(a) must be measured against.
+                    rows.baseline.append(float(b.backed_value))
+                    rows.inclusion.append(
+                        np.asarray(b.inclusion_probs, dtype=np.float32)
                     )
+                    rows.branched.append(True)
+                rows.weight.append(
+                    policy_weight_for(tree) * depth_scale.get(id(record), 1.0)
+                )
 
         groups.append(
             SeqTrainingGroup(
@@ -393,8 +385,7 @@ def build_training_groups(
                 trick_targets=trick_targets,
                 trick_masks=trick_masks,
                 suit_targets=suit_targets,
-                spine=spine,
-                branch=branch,
+                policy=policy,
             )
         )
     return groups
@@ -429,6 +420,9 @@ class SeqTrainer:
             train_config.league_max_snapshots, train_config.league_min_iteration
         )
         self.iteration = 0
+        # Optimizer steps actually kept (rolled-back steps do not count), for
+        # the LR warmup ramp. Persisted in checkpoints.
+        self.optimizer_steps = 0
         self.rng = random.Random(train_config.seed)
 
     # -------------------------------------------------------------- #
@@ -454,12 +448,13 @@ class SeqTrainer:
         groups = build_training_groups(trees, self.model.config, self.train)
         stats = SeqUpdateStats()
         stats.build_sec = time.perf_counter() - started
-        stats.spine_rows = sum(
-            len(rows.action) for g in groups for rows in g.spine.values()
+        stats.policy_rows = sum(
+            len(rows.weight) for g in groups for rows in g.policy.values()
         )
-        stats.branch_rows = sum(
-            len(rows.weight) for g in groups for rows in g.branch.values()
+        stats.branched_rows = sum(
+            sum(rows.branched) for g in groups for rows in g.policy.values()
         )
+        stats.unbranched_rows = stats.policy_rows - stats.branched_rows
         stats.positions = int(sum(g.owned.sum() for g in groups))
 
         for _ in range(self.train.epochs):
@@ -473,17 +468,37 @@ class SeqTrainer:
             torch.nn.utils.clip_grad_norm_(
                 self.model.parameters(), self.train.max_grad_norm
             )
+            self._apply_warmup_lr()
             self.optimizer.step()
-            branch_kl = self._evaluate_branch_kl(groups)
-            stats.branch_kl = branch_kl
-            if stats.branch_rows > 0 and branch_kl > self.train.branch_kl_cap:
+            policy_kl = self._evaluate_policy_kl(groups)
+            stats.policy_kl = policy_kl
+            if stats.policy_rows > 0 and policy_kl > self.train.policy_kl_cap:
                 self.model.load_state_dict(snapshot[0])
                 self.optimizer.load_state_dict(snapshot[1])
                 stats.rolled_back = True
                 break
+            self.optimizer_steps += 1
         self._release_device_memory()
         stats.update_sec = time.perf_counter() - started
         return stats
+
+    def _apply_warmup_lr(self) -> None:
+        """Linear LR ramp over the first ``lr_warmup_updates`` kept steps.
+
+        Adam's early steps are sign steps -- ``m_hat/sqrt(v_hat)`` is +/-1
+        whatever the gradient magnitude, so gradient clipping cannot soften
+        them and a cold-started model jumps ~lr per parameter in one step,
+        far past any reasonable KL cap. The ramp counts *kept* steps, so a
+        rolled-back epoch retries at the same scale on the next iteration's
+        fresh data instead of ratcheting up regardless.
+        """
+
+        warmup = self.train.lr_warmup_updates
+        scale = 1.0 if warmup <= 0 else min(
+            1.0, (self.optimizer_steps + 1) / warmup
+        )
+        for group in self.optimizer.param_groups:
+            group["lr"] = self.train.learning_rate * scale
 
     def _release_device_memory(self) -> None:
         # MPS's caching allocator keeps its high-water mark resident; with a
@@ -500,30 +515,28 @@ class SeqTrainer:
     def _epoch_backward(self, groups, stats: SeqUpdateStats) -> None:
         totals = defaultdict(float)
         for group in groups:
-            spine_by_chunk, branch_by_chunk = _rows_by_chunk(group, self._microbatches(group))
-            for (start, stop), spine_rows, branch_rows in zip(
-                self._microbatches(group), spine_by_chunk, branch_by_chunk
+            by_chunk = _rows_by_chunk(group, self._microbatches(group))
+            for (start, stop), policy_rows in zip(
+                self._microbatches(group), by_chunk
             ):
-                loss, terms = self._chunk_loss(
-                    group, start, stop, spine_rows, branch_rows
-                )
+                loss, terms = self._chunk_loss(group, start, stop, policy_rows)
                 if loss is not None:
                     loss.backward()
                 for key, value in terms.items():
                     totals[key] += value
-        stats.loss_spine = totals["spine"]
-        stats.loss_branch = totals["branch"]
+        stats.loss_policy = totals["policy"]
         stats.loss_value = totals["value"]
         stats.loss_owner = totals["owner"]
         stats.loss_suit = totals["suit"]
         stats.loss_trick = totals["trick"]
         stats.entropy = totals["entropy"]
 
-    def _chunk_loss(self, group, start, stop, spine_rows, branch_rows):
+    def _chunk_loss(self, group, start, stop, policy_rows):
         device = self.device
         train = self.train
+        aux = train.owner_coef > 0 or train.suit_coef > 0 or train.trick_coef > 0
         tokens = torch.from_numpy(group.tokens[start:stop]).to(device)
-        output = self.model.forward_full(tokens)
+        output = self.model.forward_full(tokens, aux_heads=aux)
         owned = torch.from_numpy(group.owned[start:stop]).to(device)
         seq_weight = torch.from_numpy(group.seq_weight[start:stop]).to(device)
         position_weight = seq_weight[:, None] * owned.float()
@@ -541,21 +554,23 @@ class SeqTrainer:
         terms["value"] = float(value_loss.detach())
 
         # Owner (Sinkhorn-constrained NLL + capacity term).
-        owner_targets = torch.from_numpy(group.owner_targets[start:stop]).to(device)
-        labeled = (owner_targets != IGNORE_LABEL) & owned[:, :, None]
-        if labeled.any():
-            positions = labeled.any(dim=2)
-            fraction = self.train.owner_position_fraction
-            if fraction < 1.0:
-                keep = (
-                    torch.rand_like(positions, dtype=torch.float32) < fraction
-                )
-                positions = positions & keep
-            sel = positions.nonzero(as_tuple=True)
-            if sel[0].numel() == 0:
-                sel = None
-        else:
-            sel = None
+        sel = None
+        if train.owner_coef > 0:
+            owner_targets = torch.from_numpy(
+                group.owner_targets[start:stop]
+            ).to(device)
+            labeled = (owner_targets != IGNORE_LABEL) & owned[:, :, None]
+            if labeled.any():
+                positions = labeled.any(dim=2)
+                fraction = self.train.owner_position_fraction
+                if fraction < 1.0:
+                    keep = (
+                        torch.rand_like(positions, dtype=torch.float32) < fraction
+                    )
+                    positions = positions & keep
+                sel = positions.nonzero(as_tuple=True)
+                if sel[0].numel() == 0:
+                    sel = None
         if sel is not None:
             logits = output.owner_logits[sel[0], sel[1]]
             valid = torch.from_numpy(group.owner_valid[start:stop]).to(device)[
@@ -595,9 +610,13 @@ class SeqTrainer:
             terms["owner"] = float(owner_loss.detach())
 
         # Suit presence.
-        suit_targets = torch.from_numpy(group.suit_targets[start:stop]).to(device)
-        suit_labeled = (suit_targets != IGNORE_LABEL) & owned[:, :, None, None]
-        if suit_labeled.any():
+        suit_labeled = None
+        if train.suit_coef > 0:
+            suit_targets = torch.from_numpy(
+                group.suit_targets[start:stop]
+            ).to(device)
+            suit_labeled = (suit_targets != IGNORE_LABEL) & owned[:, :, None, None]
+        if suit_labeled is not None and suit_labeled.any():
             bce = F.binary_cross_entropy_with_logits(
                 output.suit_logits,
                 suit_targets.clamp_min(0).float(),
@@ -611,10 +630,14 @@ class SeqTrainer:
             terms["suit"] = float(suit_loss.detach())
 
         # Trick counts (feasibility-masked CE, per relative player).
-        trick_targets = torch.from_numpy(group.trick_targets[start:stop]).to(device)
-        trick_masks = torch.from_numpy(group.trick_masks[start:stop]).to(device)
-        player_labeled = trick_targets != IGNORE_LABEL  # [B, P]
-        if player_labeled.any():
+        player_labeled = None
+        if train.trick_coef > 0:
+            trick_targets = torch.from_numpy(
+                group.trick_targets[start:stop]
+            ).to(device)
+            trick_masks = torch.from_numpy(group.trick_masks[start:stop]).to(device)
+            player_labeled = trick_targets != IGNORE_LABEL  # [B, P]
+        if player_labeled is not None and player_labeled.any():
             # -1e9 (not -inf): unowned positions have all-False feasibility
             # rows whose softmax must stay finite even though they are masked
             # out of the loss below.
@@ -636,70 +659,34 @@ class SeqTrainer:
             loss = loss + train.trick_coef * trick_loss
             terms["trick"] = float(trick_loss.detach())
 
-        # Spine PPO rows.
-        spine_total = 0.0
+        # Policy: NeuRD over every focal decision, branched or not.
+        policy_total = 0.0
         entropy_total = 0.0
-        for phase_key, rows in spine_rows.items():
-            if not rows["action"]:
-                continue
-            logits_all = (
-                output.bid_logits if phase_key == "bid" else output.card_logits
-            )
-            seq_idx = torch.tensor(rows["seq_index"], device=device)
-            pos_idx = torch.tensor(rows["position"], device=device)
-            logits = logits_all[seq_idx, pos_idx].float()
-            old_probs = torch.from_numpy(np.stack(rows["old_probs"])).to(device)
-            legal = old_probs > 0
-            masked_logits = logits.masked_fill(~legal, float("-inf"))
-            log_probs = torch.log_softmax(masked_logits, dim=-1)
-            actions = torch.tensor(rows["action"], device=device)
-            advantage = torch.tensor(
-                rows["advantage"], device=device, dtype=torch.float32
-            )
-            weight = torch.tensor(
-                rows["weight"], device=device, dtype=torch.float32
-            )
-            logp_new = log_probs.gather(1, actions.unsqueeze(-1)).squeeze(-1)
-            logp_old = torch.log(
-                old_probs.gather(1, actions.unsqueeze(-1)).squeeze(-1).clamp_min(1e-12)
-            )
-            ratio = torch.exp(logp_new - logp_old)
-            clipped = ratio.clamp(
-                1.0 - train.ppo_clip_eps, 1.0 + train.ppo_clip_eps
-            )
-            ppo = -torch.minimum(ratio * advantage, clipped * advantage)
-            spine_loss = (weight * ppo).sum()
-            probs_new = log_probs.exp() * legal.float()
-            entropy = -(probs_new * log_probs.masked_fill(~legal, 0.0)).sum(-1)
-            entropy_term = (weight * entropy).sum()
-            loss = (
-                loss
-                + train.spine_policy_coef * spine_loss
-                - train.entropy_coef * entropy_term
-            )
-            spine_total += float(spine_loss.detach())
-            entropy_total += float(entropy_term.detach())
-        if spine_total:
-            terms["spine"] = spine_total
-            terms["entropy"] = entropy_total
-
-        # Branch rows (NeuRD or PPO over counterfactual Q values).
-        branch_total = 0.0
-        for phase_key, rows in branch_rows.items():
+        for phase_key, rows in policy_rows.items():
             if not rows["weight"]:
                 continue
-            branch_loss = self._branch_loss(output, rows, phase_key)
-            loss = loss + train.branch_policy_coef * branch_loss
-            branch_total += float(branch_loss.detach())
-        if branch_total:
-            terms["branch"] = branch_total
+            losses, _, entropies, weight = self._policy_terms(
+                output, rows, phase_key
+            )
+            policy_loss = (weight * losses).sum()
+            loss = loss + train.policy_coef * policy_loss
+            policy_total += float(policy_loss.detach())
+            if train.entropy_coef:
+                entropy_term = (weight * entropies).sum()
+                loss = loss - train.entropy_coef * entropy_term
+                entropy_total += float(entropy_term.detach())
+            else:
+                entropy_total += float((weight * entropies).sum().detach())
+        if policy_total:
+            terms["policy"] = policy_total
+            terms["entropy"] = entropy_total
 
         if loss.requires_grad:
             return loss, terms
         return None, terms
 
-    def _branch_terms(self, output, rows, phase_key):
-        """Per-row branch losses and KL(old||new) divergences."""
+    def _policy_terms(self, output, rows, phase_key):
+        """Per-row NeuRD losses, KL(old||new) divergences, and entropies."""
 
         device = self.device
         train = self.train
@@ -712,25 +699,40 @@ class SeqTrainer:
         count = len(rows["weight"])
         cand = torch.zeros(count, max_k, dtype=torch.long, device=device)
         cand_mask = torch.zeros(count, max_k, dtype=torch.bool, device=device)
-        priors = torch.zeros(count, max_k, device=device)
-        behaviour = torch.zeros(count, max_k, device=device)
+        inclusion = torch.ones(count, max_k, device=device)
         q_values = torch.zeros(count, max_k, device=device)
         for row in range(count):
             k = len(rows["candidates"][row])
             cand[row, :k] = torch.from_numpy(rows["candidates"][row])
             cand_mask[row, :k] = True
-            priors[row, :k] = torch.from_numpy(rows["priors"][row])
-            behaviour[row, :k] = torch.from_numpy(rows["behaviour"][row])
+            inclusion[row, :k] = torch.from_numpy(rows["inclusion"][row])
             q_values[row, :k] = torch.from_numpy(rows["q_values"][row])
         old_full = torch.from_numpy(np.stack(rows["old_probs_full"])).to(device)
         weight = torch.tensor(rows["weight"], device=device, dtype=torch.float32)
+        baseline = torch.tensor(
+            rows["baseline"], device=device, dtype=torch.float32
+        ).unsqueeze(-1)
 
         gathered = logits.gather(1, cand)
-        baseline = (priors * q_values).sum(dim=-1, keepdim=True)
         advantages = (q_values - baseline) * cand_mask.float()
         advantages = advantages.clamp(
             -train.neurd_advantage_clip, train.neurd_advantage_clip
         )
+
+        # 1/q correction for which actions the branch rule expanded. Capped
+        # because the deterministic and single-sample rules can put q at the
+        # policy mass of a near-zero-probability action; with a uniform or
+        # Gumbel arm in play the cap is essentially never reached.
+        exponent = train.neurd_inclusion_exponent
+        if exponent == 0.0:
+            importance = cand_mask.float()
+        else:
+            importance = (
+                inclusion.clamp_min(1e-6).pow(-exponent).clamp_max(
+                    train.neurd_inclusion_cap
+                )
+                * cand_mask.float()
+            )
 
         # Full-support KL(old || new) anchor and guard metric.
         legal = old_full > 0
@@ -740,63 +742,58 @@ class SeqTrainer:
         safe = torch.where(legal, full_logprobs, torch.zeros_like(full_logprobs))
         log_old = torch.log(old_full.clamp_min(1e-12))
         divergences = (old_full * (log_old - safe) * legal.float()).sum(dim=-1)
+        probs_new = safe.exp() * legal.float()
+        entropies = -(probs_new * safe).sum(dim=-1)
 
-        if train.branch_policy_objective == "neurd":
-            counts = cand_mask.float().sum(dim=-1, keepdim=True).clamp_min(1.0)
-            centered_adv = (
-                advantages - advantages.sum(dim=-1, keepdim=True) / counts
-            ) * cand_mask.float()
-            finite = torch.where(cand_mask, gathered, torch.zeros_like(gathered))
-            centered_logits = (
-                finite - finite.sum(dim=-1, keepdim=True) / counts
-            ) * cand_mask.float()
-            regret = -(centered_adv.detach() * centered_logits).sum(
-                dim=-1
-            ) / counts.squeeze(-1)
-            losses = (
-                train.neurd_regret_coef * regret
-                + train.neurd_kl_coef * divergences
-            )
-        else:
-            cand_logits = gathered.masked_fill(~cand_mask, float("-inf"))
-            cand_logprobs = torch.log_softmax(cand_logits, dim=-1)
-            safe_cand = torch.where(
-                cand_mask, cand_logprobs, torch.zeros_like(cand_logprobs)
-            )
-            new = safe_cand.exp() * cand_mask.float()
-            log_behaviour = torch.log(behaviour.clamp_min(1e-12))
-            clipped = torch.exp(
-                (safe_cand - log_behaviour).clamp(-20.0, 20.0)
-            ).clamp(1.0 - train.ppo_clip_eps, 1.0 + train.ppo_clip_eps)
-            losses = -torch.minimum(
-                new * advantages, behaviour * clipped * advantages
-            ).sum(dim=-1)
-        return losses, divergences, weight
+        # L = -sum_a w_a A(a) y_a, so dL/dy_a = -w_a A(a): each candidate logit
+        # moves by its own regret, with no pi(a) prefactor and no dependence on
+        # which siblings were expanded.
+        #
+        # Deliberately *not* centered over the candidate set. Centering is only
+        # a null direction when the set is every legal action; for a capped set
+        # it would cancel the one real signal about the set as a whole -- if
+        # every expanded action beat the baseline, mass should move to them
+        # from the unexpanded ones. Nor is the loss divided by the candidate
+        # count: a k=1 row would then have exactly zero gradient, and scaling
+        # each action's regret by how many siblings it happened to get is the
+        # arbitrary weighting this objective exists to remove. What keeps the
+        # per-action gradients honest across different set sizes is the 1/q
+        # correction above, not a per-row rescale.
+        scaled_adv = advantages * importance * cand_mask.float()
+        finite = torch.where(cand_mask, gathered, torch.zeros_like(gathered))
+        regret = -(scaled_adv.detach() * finite).sum(dim=-1)
+        losses = (
+            train.neurd_regret_coef * regret + train.neurd_kl_coef * divergences
+        )
+        return losses, divergences, entropies, weight
 
-    def _branch_loss(self, output, rows, phase_key):
-        losses, _, weight = self._branch_terms(output, rows, phase_key)
-        return (weight * losses).sum()
+    def _evaluate_policy_kl(self, groups) -> float:
+        """Weighted KL(old||new) over *every* policy row.
 
-    def _evaluate_branch_kl(self, groups) -> float:
+        Under the old split this covered branch rows only, leaving the spine
+        half of the decisions outside the rollback guard. With one row type
+        there is nothing left uncovered.
+        """
+
         self.model.eval()
         total = 0.0
         weight_sum = 0.0
         with torch.inference_mode():
             for group in groups:
-                for (start, stop), spine_rows, branch_rows in zip(
+                for (start, stop), policy_rows in zip(
                     self._microbatches(group),
-                    *_rows_by_chunk(group, self._microbatches(group)),
+                    _rows_by_chunk(group, self._microbatches(group)),
                 ):
-                    if not any(rows["weight"] for rows in branch_rows.values()):
+                    if not any(rows["weight"] for rows in policy_rows.values()):
                         continue
                     tokens = torch.from_numpy(group.tokens[start:stop]).to(
                         self.device
                     )
                     output = self.model.forward_full(tokens, aux_heads=False)
-                    for phase_key, rows in branch_rows.items():
+                    for phase_key, rows in policy_rows.items():
                         if not rows["weight"]:
                             continue
-                        _, divergences, weight = self._branch_terms(
+                        _, divergences, _, weight = self._policy_terms(
                             output, rows, phase_key
                         )
                         total += float((weight * divergences).sum())
@@ -811,6 +808,7 @@ class SeqTrainer:
         payload = {
             "schema_version": SEQ_SCHEMA_VERSION,
             "iteration": self.iteration,
+            "optimizer_steps": self.optimizer_steps,
             "model_state_dict": self.model.state_dict(),
             "optimizer_state_dict": self.optimizer.state_dict(),
             "model_config": asdict(self.model.config),
@@ -834,6 +832,7 @@ class SeqTrainer:
         self.model.load_state_dict(payload["model_state_dict"])
         self.optimizer.load_state_dict(payload["optimizer_state_dict"])
         self.iteration = int(payload.get("iteration", 0))
+        self.optimizer_steps = int(payload.get("optimizer_steps", 0))
         for snapshot_id, snap_path, iteration in payload.get("league", []):
             if Path(snap_path).exists():
                 self.league.add(snapshot_id, snap_path, iteration)
@@ -849,55 +848,30 @@ class SeqTrainer:
         return str(path)
 
 
-def _rows_by_chunk(group: SeqTrainingGroup, chunks) -> tuple[list, list]:
+def _rows_by_chunk(group: SeqTrainingGroup, chunks) -> list:
     """Split the group's policy rows per microbatch chunk, reindexing rows."""
 
-    chunk_list = list(chunks)
-    spine_chunks = []
-    branch_chunks = []
-    for start, stop in chunk_list:
-        spine_chunk: dict[str, dict[str, list]] = {}
-        for phase_key, rows in group.spine.items():
-            selected = {
-                "seq_index": [],
-                "position": [],
-                "action": [],
-                "old_probs": [],
-                "advantage": [],
-                "weight": [],
-            }
+    fields = (
+        "position",
+        "old_probs_full",
+        "candidates",
+        "q_values",
+        "baseline",
+        "inclusion",
+        "weight",
+    )
+    out = []
+    for start, stop in list(chunks):
+        chunk: dict[str, dict[str, list]] = {}
+        for phase_key, rows in group.policy.items():
+            selected: dict[str, list] = {"seq_index": []}
+            for name in fields:
+                selected[name] = []
             for i, seq_index in enumerate(rows.seq_index):
                 if start <= seq_index < stop:
                     selected["seq_index"].append(seq_index - start)
-                    selected["position"].append(rows.position[i])
-                    selected["action"].append(rows.action[i])
-                    selected["old_probs"].append(rows.old_probs[i])
-                    selected["advantage"].append(rows.advantage[i])
-                    selected["weight"].append(rows.weight[i])
-            spine_chunk[phase_key] = selected
-        branch_chunk: dict[str, dict[str, list]] = {}
-        for phase_key, rows in group.branch.items():
-            selected = {
-                "seq_index": [],
-                "position": [],
-                "old_probs_full": [],
-                "candidates": [],
-                "priors": [],
-                "behaviour": [],
-                "q_values": [],
-                "weight": [],
-            }
-            for i, seq_index in enumerate(rows.seq_index):
-                if start <= seq_index < stop:
-                    selected["seq_index"].append(seq_index - start)
-                    selected["position"].append(rows.position[i])
-                    selected["old_probs_full"].append(rows.old_probs_full[i])
-                    selected["candidates"].append(rows.candidates[i])
-                    selected["priors"].append(rows.priors[i])
-                    selected["behaviour"].append(rows.behaviour[i])
-                    selected["q_values"].append(rows.q_values[i])
-                    selected["weight"].append(rows.weight[i])
-            branch_chunk[phase_key] = selected
-        spine_chunks.append(spine_chunk)
-        branch_chunks.append(branch_chunk)
-    return spine_chunks, branch_chunks
+                    for name in fields:
+                        selected[name].append(getattr(rows, name)[i])
+            chunk[phase_key] = selected
+        out.append(chunk)
+    return out

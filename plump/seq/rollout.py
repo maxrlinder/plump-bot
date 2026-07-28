@@ -59,6 +59,16 @@ CURRENT = "current"
 OPPONENT = "opponent"
 
 
+def _upstream_depth(upstream) -> int:
+    """How many branch decisions sit above this point on its path."""
+
+    depth = 0
+    while upstream is not None:
+        depth += 1
+        upstream = upstream[0].upstream
+    return depth
+
+
 @dataclass
 class SeqBranchRecord:
     """Counterfactual expansion at one focal decision."""
@@ -66,6 +76,11 @@ class SeqBranchRecord:
     candidate_indices: tuple[int, ...]
     prior_probs: tuple[float, ...]         # renormalized over candidates
     raw_probs: dict[int, float]            # unrenormalized old-policy masses
+    # P(a is in the candidate set) under whatever rule selected it, per
+    # candidate. NeuRD's logit gradient is per-action, so an action expanded
+    # with probability q contributes q * A(a) in expectation over updates --
+    # 1/q restores the true A(a). Exhaustive expansion is all ones.
+    inclusion_probs: tuple[float, ...]
     deterministic_count: int
     sampled_index: int
     candidate_mass: float
@@ -107,6 +122,10 @@ class SeqDecisionRecord:
     action_index: int
     old_probs: np.ndarray     # masked policy over 11 bids or 52 cards
     old_value: float
+    # Branch decisions above this one on its path. Recorded here rather than
+    # walked at update time because an unbranched decision has no record of
+    # its own to walk up from.
+    depth: int = 0
     branch: Optional[SeqBranchRecord] = None
 
 
@@ -848,13 +867,14 @@ class SeqRolloutCollector:
             action_index=sampled,
             old_probs=probs,
             old_value=leaf.pending.value,
+            depth=_upstream_depth(leaf.upstream),
         )
         leaf.decisions.append(record)
         leaf.tree.decision_total += 1
         self.stats.decisions += 1
 
-        candidates, mc_weights, deterministic_count = self._branch_candidates(
-            leaf, phase, legal, probs, sampled
+        candidates, mc_weights, deterministic_count, inclusion = (
+            self._branch_candidates(leaf, phase, legal, probs, sampled)
         )
         allow_branch = True
         # The rate decides *whether* this decision is a branch point. The
@@ -903,6 +923,7 @@ class SeqRolloutCollector:
             candidate_indices=tuple(candidates),
             prior_probs=priors,
             raw_probs=raw,
+            inclusion_probs=tuple(inclusion),
             deterministic_count=deterministic_count,
             sampled_index=sampled,
             candidate_mass=mass,
@@ -1015,8 +1036,10 @@ class SeqRolloutCollector:
         first_pass = tree.split_bid_record is None
 
         if first_pass:
-            candidates, mc_weights, deterministic_count = self._branch_candidates(
-                leaf, Phase.BIDDING, legal, probs, sampled
+            candidates, mc_weights, deterministic_count, inclusion = (
+                self._branch_candidates(
+                    leaf, Phase.BIDDING, legal, probs, sampled
+                )
             )
             if len(candidates) <= 1:
                 # Nothing to split; fall back to the ordinary path.
@@ -1042,6 +1065,7 @@ class SeqRolloutCollector:
                 candidate_indices=tuple(candidates),
                 prior_probs=priors,
                 raw_probs=raw,
+                inclusion_probs=tuple(inclusion),
                 deterministic_count=deterministic_count,
                 sampled_index=sampled,
                 candidate_mass=mass,
@@ -1178,12 +1202,18 @@ class SeqRolloutCollector:
         legal: list[int],
         probs: np.ndarray,
         sampled: int,
-    ) -> tuple[list[int], Optional[list[float]], int]:
-        """Return (candidates, monte-carlo weights or None, deterministic count).
+    ) -> tuple[list[int], Optional[list[float]], int, list[float]]:
+        """Return (candidates, mc weights or None, deterministic count, q).
 
         Weights are returned only for ``sample_k``, where the candidate set is
         i.i.d. draws and the backup must weight by empirical frequency instead
         of by renormalized policy mass.
+
+        ``q`` is the inclusion probability of each returned candidate -- the
+        chance this rule would have expanded that action at this node. It is
+        what the NeuRD loss divides by, so a rule that expands an action only
+        when the policy happens to sample it does not silently reintroduce the
+        pi(a) prefactor NeuRD exists to remove.
         """
 
         rule = self.train.branch_rule
@@ -1191,20 +1221,24 @@ class SeqRolloutCollector:
             top_k = rule.bid_top_k
             if top_k == 0 or len(legal) <= top_k:
                 ordered = sorted(legal, key=lambda index: (-probs[index], index))
-                return ordered, None, len(ordered)
+                return ordered, None, len(ordered), [1.0] * len(ordered)
             ranked = sorted(legal, key=lambda index: (-probs[index], index))
             selected = ranked[: top_k - 1]
             deterministic_count = len(selected)
+            inclusion = [1.0] * deterministic_count
             if sampled not in selected:
+                # Reached only by being drawn, so its inclusion is exactly the
+                # policy mass on it.
                 selected = [*selected, sampled]
-            return selected, None, deterministic_count
+                inclusion.append(float(probs[sampled]))
+            return selected, None, deterministic_count, inclusion
 
         trick_index = len(
             [t for t in leaf.env.state.current_round.tricks if t.winner is not None]
         )
         mode, top_k = rule.play_rule_for_trick(trick_index)
         if mode == "none":
-            return [sampled], None, 0
+            return [sampled], None, 0, [float(probs[sampled])]
 
         if mode in ("sample_k", "sample_k_plus_uniform"):
             if top_k < 1:
@@ -1217,6 +1251,7 @@ class SeqRolloutCollector:
             counts: dict[int, int] = {}
             for action in draws:
                 counts[action] = counts.get(action, 0) + 1
+            uniform_rate = 0.0
             if mode == "sample_k_plus_uniform":
                 # Explored uniformly, so it must not enter the backup: adding
                 # it with weight 1/(k+1) would tilt the parent's value toward
@@ -1224,23 +1259,122 @@ class SeqRolloutCollector:
                 # leaves the weight at zero unless the policy also drew it.
                 explored = leaf.rng.choice(legal)
                 counts.setdefault(explored, 0)
+                uniform_rate = 1.0 / len(legal)
             candidates = sorted(counts)
             weights = [counts[action] / top_k for action in candidates]
-            return candidates, weights, len(candidates)
+            # k i.i.d. policy draws, plus an independent uniform arm. The
+            # uniform arm is what puts a 1/|legal| floor under q, which is
+            # what keeps 1/q bounded.
+            inclusion = [
+                1.0
+                - (1.0 - float(probs[action])) ** top_k * (1.0 - uniform_rate)
+                for action in candidates
+            ]
+            return candidates, weights, len(candidates), inclusion
+
+        if mode == "gumbel_top_k":
+            if top_k < 1:
+                raise ValueError("play_top_k must be >= 1 for gumbel_top_k.")
+            return self._gumbel_candidates(leaf, legal, probs, sampled, top_k)
 
         if mode == "all_legal" or len(legal) <= top_k:
             ordered = sorted(legal, key=lambda index: (-probs[index], index))
-            return ordered, None, len(ordered)
+            return ordered, None, len(ordered), [1.0] * len(ordered)
         ranked = sorted(legal, key=lambda index: (-probs[index], index))
         selected = ranked[: top_k - 1]
         deterministic_count = len(selected)
+        inclusion = [1.0] * deterministic_count
         if sampled not in selected:
             selected = [*selected, sampled]
+            inclusion.append(float(probs[sampled]))
         if mode == "top_k_plus_random":
             extras = [index for index in legal if index not in selected]
             if extras:
-                selected = [*selected, leaf.rng.choice(extras)]
-        return selected, None, deterministic_count
+                chosen = leaf.rng.choice(extras)
+                selected = [*selected, chosen]
+                # Drawn either as the policy sample or as the random extra.
+                inclusion.append(
+                    float(probs[chosen])
+                    + (1.0 - float(probs[chosen])) / len(extras)
+                )
+        return selected, None, deterministic_count, inclusion
+
+    @staticmethod
+    def _gumbel_candidates(
+        leaf: SeqLeaf,
+        legal: list[int],
+        probs: np.ndarray,
+        sampled: int,
+        top_k: int,
+    ) -> tuple[list[int], Optional[list[float]], int, list[float]]:
+        """``top_k`` distinct actions: the realized one plus a Gumbel top-k-1.
+
+        Sampling without replacement, so no candidate is ever a duplicate of
+        another. The realized action is kept as-is (it is what the spine child
+        continues with, and what the paired-tape CRN sampling produced), and
+        the remaining arms come from perturbing the log-policy of the other
+        legal actions with Gumbel noise and taking the largest -- which is
+        exactly a policy-proportional draw without replacement.
+
+        The backup weights are Hajek (self-normalized Horvitz-Thompson):
+        pi(a)/q(a), renormalized. Without replacement the empirical-frequency
+        weighting ``sample_k`` uses is meaningless -- every candidate appears
+        once -- so the correction for over- or under-representation has to come
+        from the inclusion probabilities instead.
+        """
+
+        rest = [index for index in legal if index != sampled]
+        want = min(top_k - 1, len(rest))
+        log_p = {
+            index: math.log(max(float(probs[index]), 1e-12)) for index in legal
+        }
+        if want <= 0:
+            return [sampled], None, 1, [1.0]
+
+        perturbed = {
+            index: log_p[index]
+            - math.log(-math.log(max(leaf.rng.random(), 1e-12)))
+            for index in rest
+        }
+        ordered = sorted(rest, key=lambda index: -perturbed[index])
+        chosen = ordered[:want]
+
+        if len(ordered) > want:
+            # Conditional on kappa -- the (want+1)-th largest perturbed value --
+            # the selection events are independent Bernoullis with this
+            # probability (Kool et al., Theorem 1). Exact, and O(|legal|).
+            kappa = perturbed[ordered[want]]
+            q_gumbel = {
+                index: -math.expm1(-math.exp(min(log_p[index] - kappa, 50.0)))
+                for index in legal
+            }
+        else:
+            # Everything else was taken, so the set is exhaustive.
+            q_gumbel = {index: 1.0 for index in legal}
+
+        candidates = sorted([sampled, *chosen])
+        # An action lands in the set either as the realized draw or via the
+        # Gumbel pass over the complement. The second term is a plug-in: it
+        # uses the kappa from the complement actually drawn rather than
+        # marginalizing over which action was realized.
+        inclusion = [
+            min(
+                1.0,
+                float(probs[index])
+                + (1.0 - float(probs[index])) * q_gumbel[index],
+            )
+            for index in candidates
+        ]
+        hajek = [
+            float(probs[index]) / max(q, 1e-6)
+            for index, q in zip(candidates, inclusion)
+        ]
+        total = sum(hajek)
+        if total <= 0:
+            weights = [1.0 / len(candidates)] * len(candidates)
+        else:
+            weights = [value / total for value in hajek]
+        return candidates, weights, len(candidates), inclusion
 
     @staticmethod
     def _action_for(player: int, phase: Phase, index: int) -> BidAction | PlayCardAction:

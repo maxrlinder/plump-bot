@@ -43,11 +43,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", default=None)
     parser.add_argument("--seed", type=int, default=0)
 
-    parser.add_argument("--d-model", type=int, default=256)
+    # 7.85M params. Chosen over deeper/narrower peers because head_dim stays
+    # 32 at 6 layers (KV bytes/row unchanged vs the 3.86M model) and the
+    # rollout is latency-bound: 2x the parameters measured +6% rollout time.
+    parser.add_argument("--d-model", type=int, default=384)
     parser.add_argument("--n-layers", type=int, default=6)
-    parser.add_argument("--n-heads", type=int, default=8)
-    parser.add_argument("--n-kv-heads", type=int, default=None)
-    parser.add_argument("--d-ff", type=int, default=768)
+    parser.add_argument("--n-heads", type=int, default=12)
+    parser.add_argument("--n-kv-heads", type=int, default=2)
+    parser.add_argument("--d-ff", type=int, default=1024)
     parser.add_argument(
         "--no-trick-win-token",
         action="store_true",
@@ -103,9 +106,13 @@ def parse_args() -> argparse.Namespace:
             "top_k_plus_random",
             "sample_k",
             "sample_k_plus_uniform",
+            "gumbel_top_k",
             "none",
         ],
-        default="sample_k_plus_uniform",
+        default="gumbel_top_k",
+        help="gumbel_top_k draws k *distinct* actions (realized action plus a "
+        "Gumbel top-k-1 over the rest); sample_k draws k i.i.d. and can "
+        "repeat, which spends a whole subtree on no new counterfactual",
     )
     parser.add_argument("--play-top-k", type=int, default=3)
     parser.add_argument(
@@ -118,19 +125,55 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--auto-deals-per-batch", action="store_true", default=True)
 
     parser.add_argument("--learning-rate", type=float, default=2e-4)
+    parser.add_argument(
+        "--lr-warmup-updates",
+        type=int,
+        default=100,
+        help="linear LR ramp over this many kept optimizer steps. Adam's "
+        "first steps are sign steps, so a cold start at full LR trips the "
+        "KL cap every iteration and nothing ever learns. 0 disables.",
+    )
     parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--microbatch-positions", type=int, default=16384)
+    parser.add_argument("--policy-coef", type=float, default=1.0)
+    parser.add_argument("--policy-kl-cap", type=float, default=0.005)
     parser.add_argument(
-        "--branch-objective", choices=["neurd", "ppo"], default="neurd"
+        "--neurd-advantage-clip",
+        type=float,
+        default=10.0,
+        help="clamp on A(a) = Q(a) - V; 0 disables",
     )
-    parser.add_argument("--branch-policy-coef", type=float, default=1.0)
-    parser.add_argument("--spine-policy-coef", type=float, default=1.0)
-    parser.add_argument("--branch-kl-cap", type=float, default=0.005)
+    parser.add_argument(
+        "--neurd-inclusion-exponent",
+        type=float,
+        default=1.0,
+        help="weight each expanded action by 1/q ** this, q being the chance "
+        "the branch rule expanded it. 1.0 is true NeuRD; 0.0 leaves the "
+        "pi(a) prefactor the candidate sampler reintroduces",
+    )
     parser.add_argument("--value-coef", type=float, default=0.5)
-    parser.add_argument("--owner-coef", type=float, default=0.25)
-    parser.add_argument("--suit-coef", type=float, default=0.1)
+    parser.add_argument(
+        "--owner-coef",
+        type=float,
+        default=0.0,
+        help="belief losses start disabled: the initial objective is NeuRD "
+        "+ value. Raise to re-enable (0.25 was the v1 default).",
+    )
+    parser.add_argument(
+        "--suit-coef",
+        type=float,
+        default=0.0,
+        help="belief losses start disabled; 0.1 was the v1 default",
+    )
     parser.add_argument("--trick-coef", type=float, default=0.25)
-    parser.add_argument("--entropy-coef", type=float, default=0.01)
+    parser.add_argument(
+        "--entropy-coef",
+        type=float,
+        default=0.0,
+        help="entropy bonus at decision positions. Off by default: it exists "
+        "to fight the entropy collapse of a pi(a)-scaled policy gradient, "
+        "which NeuRD does not have",
+    )
     parser.add_argument("--kv-dtype", choices=["fp32", "fp16"], default="fp32")
 
     parser.add_argument("--snapshot-every", type=int, default=200)
@@ -160,21 +203,21 @@ LOG_COLUMNS = [
     "trees",
     "leaves",
     "decisions",
-    "spine_rows",
-    "branch_rows",
+    "policy_rows",
+    "branched_rows",
+    "unbranched_rows",
     "positions",
     "bid_hit_rate",
     "reward_self",
     "reward_historical",
     "spine_entropy",
-    "loss_spine",
-    "loss_branch",
+    "loss_policy",
     "loss_value",
     "loss_owner",
     "loss_suit",
     "loss_trick",
     "entropy",
-    "branch_kl",
+    "policy_kl",
     "rolled_back",
     "eval_reward_vs_heuristic",
     "eval_bid_hit",
@@ -231,12 +274,13 @@ def main() -> None:
             historical_arm="paired",
         ),
         learning_rate=args.learning_rate,
+        lr_warmup_updates=args.lr_warmup_updates,
         epochs=args.epochs,
         microbatch_positions=args.microbatch_positions,
-        branch_policy_objective=args.branch_objective,
-        branch_policy_coef=args.branch_policy_coef,
-        spine_policy_coef=args.spine_policy_coef,
-        branch_kl_cap=args.branch_kl_cap,
+        policy_coef=args.policy_coef,
+        policy_kl_cap=args.policy_kl_cap,
+        neurd_advantage_clip=args.neurd_advantage_clip,
+        neurd_inclusion_exponent=args.neurd_inclusion_exponent,
         value_coef=args.value_coef,
         owner_coef=args.owner_coef,
         suit_coef=args.suit_coef,
@@ -320,21 +364,21 @@ def main() -> None:
             summary.trees,
             summary.leaves,
             summary.decisions,
-            stats.spine_rows,
-            stats.branch_rows,
+            stats.policy_rows,
+            stats.branched_rows,
+            stats.unbranched_rows,
             stats.positions,
             f"{summary.bid_hit_rate:.4f}",
             f"{summary.reward_self:.4f}",
             f"{summary.reward_historical:.4f}",
             f"{summary.spine_entropy:.4f}",
-            f"{stats.loss_spine:.5f}",
-            f"{stats.loss_branch:.5f}",
+            f"{stats.loss_policy:.5f}",
             f"{stats.loss_value:.5f}",
             f"{stats.loss_owner:.5f}",
             f"{stats.loss_suit:.5f}",
             f"{stats.loss_trick:.5f}",
             f"{stats.entropy:.5f}",
-            f"{stats.branch_kl:.6f}",
+            f"{stats.policy_kl:.6f}",
             int(stats.rolled_back),
             eval_reward,
             eval_bid_hit,
@@ -347,7 +391,7 @@ def main() -> None:
             f"(collect {summary.collect_sec:.1f} update {stats.update_sec:.1f}) | "
             f"leaves {summary.leaves:5d} rows {stats.positions:6d} | "
             f"bid_hit {summary.bid_hit_rate:.3f} ent {summary.spine_entropy:.3f} | "
-            f"kl {stats.branch_kl:.5f}{' ROLLBACK' if stats.rolled_back else ''}"
+            f"kl {stats.policy_kl:.5f}{' ROLLBACK' if stats.rolled_back else ''}"
         )
         if eval_reward:
             message += f" | eval vs heuristic {eval_reward} (bid_hit {eval_bid_hit})"

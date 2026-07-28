@@ -224,6 +224,13 @@ PlayBranchMode = Literal[
     # the unbiased on-policy estimate; it exists purely so the policy loss sees
     # a Q-value at an action the policy currently under-weights.
     "sample_k_plus_uniform",
+    # k *distinct* actions: the realized action, then a Gumbel-top-(k-1) draw
+    # over the rest. argtop(log pi + Gumbel) is exactly sampling without
+    # replacement (Kool et al., ICML 2019), so the extra arms still follow the
+    # policy but can never repeat. Duplicates are pure waste in a branching
+    # tree -- a second copy of an action costs a full subtree and adds no
+    # counterfactual -- so this dominates ``sample_k`` at equal k.
+    "gumbel_top_k",
     "none",
 ]
 
@@ -655,20 +662,49 @@ class SeqTrainingConfig:
     # Optimization.
     learning_rate: float = 2e-4
     adam_betas: tuple[float, float] = (0.9, 0.999)
+    # Optimizer steps over which the learning rate ramps linearly to
+    # learning_rate. Adam's first steps are sign steps (m_hat/sqrt(v_hat) is
+    # +/-1 whatever the gradient scale, so gradient clipping cannot soften
+    # them): measured on a cold start, one full-LR step moved branch KL to
+    # 0.16 against a 0.005 cap, which under rollback means no update ever
+    # survives. 0 disables.
+    lr_warmup_updates: int = 100
     epochs: int = 1
     # Microbatch size in token positions (sequences x length), sized to memory.
     microbatch_positions: int = 16384
     max_grad_norm: float = 1.0
 
-    # Policy objectives.
-    branch_policy_objective: Literal["neurd", "ppo"] = "neurd"
-    branch_policy_coef: float = 1.0
-    spine_policy_coef: float = 1.0
+    # Policy objective. One loss over every focal decision: NeuRD, whose
+    # gradient on the logit of action a is -A(a), independent of pi(a).
+    #
+    # Why not a policy gradient: the softmax PG gradient is pi(a)*A(a), so an
+    # action the policy has drifted away from moves quadratically slowly in
+    # policy space however large its advantage. In self-play that is the
+    # central failure -- the opponent distribution moves, an action correctly
+    # suppressed early becomes correct later, and the policy has no escape
+    # velocity. Dropping the pi(a) prefactor gives replicator dynamics, and
+    # softmax-of-accumulated-advantage is Hedge, a no-regret algorithm.
+    policy_coef: float = 1.0
     neurd_regret_coef: float = 1.0
     neurd_kl_coef: float = 1.0
-    branch_kl_cap: float = 0.005
-    ppo_clip_eps: float = 0.2
+    policy_kl_cap: float = 0.005
+    # Clamp on A(a) = Q(a) - V. Relative rewards reach ~+/-20 at five players
+    # and the value baseline is untrained early, so one outlier row could
+    # otherwise dominate the normalized weight sum. 0 disables.
     neurd_advantage_clip: float = 10.0
+
+    # Correction for *which* actions got expanded. An action expanded with
+    # probability q receives q*A(a) in expectation over updates, so a rule
+    # that expands by sampling the policy silently reintroduces the pi(a)
+    # prefactor NeuRD exists to remove. Weighting by q**-exponent restores
+    # A(a):
+    #   1.0  true NeuRD -- every legal action's logit moves by its own regret
+    #   0.0  no correction, i.e. back to policy-gradient-shaped weighting
+    # This is MCCFR's importance correction on sampled regret. Normally 1/q
+    # is a variance disaster, but the uniform arm floors q at 1/|legal| and
+    # |legal| <= 11 here, so the cap below is rarely reached.
+    neurd_inclusion_exponent: float = 1.0
+    neurd_inclusion_cap: float = 12.0
 
     # Loss weighting across games/trees.
     tree_weighting: Literal["per_tree", "per_row"] = "per_tree"
@@ -711,7 +747,9 @@ class SeqTrainingConfig:
     # -1.0 roughly equalizes weight across depths for a branching factor of 2.
     branch_depth_exponent: float = 0.0
 
-    # Auxiliary losses.
+    # Auxiliary losses. A coefficient of exactly 0 skips computing that loss,
+    # and with owner, suit and trick all 0 the auxiliary heads are not run at
+    # all -- the owner einsum + Sinkhorn is the expensive one.
     value_coef: float = 0.5
     trick_coef: float = 0.25
     owner_coef: float = 0.25
@@ -721,7 +759,12 @@ class SeqTrainingConfig:
     # update (unbiased; caps the Sinkhorn autograd graph size).
     owner_position_fraction: float = 0.5
     suit_coef: float = 0.1
-    entropy_coef: float = 0.01
+    # Entropy bonus over the full legal support at every decision position.
+    # Defaults off: it exists to fight the entropy collapse of a pi(a)-scaled
+    # policy gradient, and NeuRD does not have that failure mode -- mixing is
+    # emergent, because a suppressed action's logit still moves by its full
+    # regret. Raise it only if measured entropy actually collapses.
+    entropy_coef: float = 0.0
 
     # League.
     league_max_snapshots: int = 8

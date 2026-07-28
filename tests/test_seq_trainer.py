@@ -19,6 +19,7 @@ from plump.seq.model import SeqPlumpModel
 from plump.seq.policy import SeqModelPolicy
 from plump.seq.trainer import (
     SeqTrainer,
+    _rows_by_chunk,
     build_training_groups,
     summarize_trees,
 )
@@ -51,24 +52,17 @@ def test_group_weights_normalize_to_one():
     assert groups
 
     seq_weight_total = 0.0
-    spine_weight_total = 0.0
-    branch_trees = set()
+    policy_weight_total = 0.0
     for group in groups:
-        batch, length = group.tokens.shape[:2]
         owned_counts = group.owned.sum(axis=1)
         seq_weight_total += float((group.seq_weight * owned_counts).sum())
-        for rows in group.spine.values():
-            spine_weight_total += float(np.sum(rows.weight))
-        for rows in group.branch.values():
-            if rows.weight:
-                branch_trees.add(id(group))
+        for rows in group.policy.values():
+            policy_weight_total += float(np.sum(rows.weight))
     # Each loss family's weights sum to exactly 1, whatever the exponent and
-    # however many trees happen to have rows of that kind. A tree that branched
-    # everywhere has no spine rows at all, and the spine loss must not quietly
-    # change scale -- an effective learning-rate change -- because a deal came
-    # out that way.
+    # however many trees happen to have rows of that kind, so the effective
+    # learning rate cannot drift with how the deals happened to come out.
     assert seq_weight_total == pytest.approx(1.0)
-    assert spine_weight_total == pytest.approx(1.0)
+    assert policy_weight_total == pytest.approx(1.0)
 
 
 def test_update_produces_finite_losses_and_changes_weights():
@@ -81,8 +75,9 @@ def test_update_produces_finite_losses_and_changes_weights():
     assert np.isfinite(stats.loss_owner)
     assert np.isfinite(stats.loss_trick)
     assert np.isfinite(stats.loss_suit)
-    assert np.isfinite(stats.branch_kl)
-    assert stats.spine_rows > 0
+    assert np.isfinite(stats.policy_kl)
+    assert stats.policy_rows > 0
+    assert stats.policy_rows == stats.branched_rows + stats.unbranched_rows
     assert stats.positions > 0
     if not stats.rolled_back:
         changed = any(
@@ -95,22 +90,88 @@ def test_update_produces_finite_losses_and_changes_weights():
 def test_kl_cap_rolls_back_the_epoch():
     trainer = make_trainer(
         learning_rate=1.0,  # force a destructive step
-        branch_kl_cap=1e-6,
+        policy_kl_cap=1e-6,
     )
     trees, _ = trainer.collect()
     before = [p.detach().clone() for p in trainer.model.parameters()]
     stats = trainer.update(trees)
-    if stats.branch_rows > 0:
+    if stats.policy_rows > 0:
         assert stats.rolled_back
         for a, b in zip(before, trainer.model.parameters()):
             torch.testing.assert_close(a, b.detach())
 
 
-def test_ppo_branch_objective_runs():
-    trainer = make_trainer(branch_policy_objective="ppo")
+def test_update_with_belief_losses_disabled_is_policy_value_only():
+    """The initial objective: PPO + NeuRD + value, aux heads never run."""
+
+    trainer = make_trainer(owner_coef=0.0, suit_coef=0.0, trick_coef=0.0)
+    trees, _ = trainer.collect()
+    before = [p.detach().clone() for p in trainer.model.parameters()]
+    stats = trainer.update(trees)
+    assert stats.loss_owner == 0.0
+    assert stats.loss_suit == 0.0
+    assert stats.loss_trick == 0.0
+    assert np.isfinite(stats.loss_value)
+    assert np.isfinite(stats.loss_policy)
+    if not stats.rolled_back:
+        assert any(
+            not torch.equal(a, b)
+            for a, b in zip(before, trainer.model.parameters())
+        )
+
+
+def test_entropy_bonus_and_advantage_clip_run():
+    trainer = make_trainer(entropy_coef=0.01, neurd_advantage_clip=1.0)
     trees, _ = trainer.collect()
     stats = trainer.update(trees)
-    assert np.isfinite(stats.loss_branch) or stats.branch_rows == 0
+    assert np.isfinite(stats.loss_policy) or stats.policy_rows == 0
+    assert np.isfinite(stats.entropy)
+
+
+def test_lr_warmup_ramps_and_survives_the_kl_cap():
+    """A cold start at full LR is an Adam sign step that trips the cap;
+    the warmup ramp is what lets the first updates survive."""
+
+    trainer = make_trainer(lr_warmup_updates=10)
+    base = trainer.train.learning_rate
+    trees, _ = trainer.collect()
+    stats = trainer.update(trees)
+    assert not stats.rolled_back
+    assert trainer.optimizer_steps == trainer.train.epochs
+    assert trainer.optimizer.param_groups[0]["lr"] == pytest.approx(
+        base * trainer.train.epochs / 10
+    )
+    trees, _ = trainer.collect()
+    trainer.update(trees)
+    assert trainer.optimizer_steps == 2 * trainer.train.epochs
+
+
+def test_optimizer_steps_survive_a_checkpoint_roundtrip(tmp_path):
+    trainer = make_trainer(lr_warmup_updates=10)
+    trees, _ = trainer.collect()
+    trainer.update(trees)
+    steps = trainer.optimizer_steps
+    assert steps > 0
+    path = tmp_path / "ckpt.pt"
+    trainer.save_checkpoint(path)
+    fresh = make_trainer(lr_warmup_updates=10)
+    fresh.load_checkpoint(path)
+    assert fresh.optimizer_steps == steps
+
+
+def test_inclusion_exponent_changes_the_gradient_it_does_not_break_it():
+    """1/q is the difference between having NeuRD and thinking you have it."""
+
+    trees = None
+    grads = {}
+    for exponent in (0.0, 1.0):
+        trainer = make_trainer(neurd_inclusion_exponent=exponent)
+        if trees is None:
+            trees = trainer.collect()[0]
+        stats = trainer.update(trees)
+        assert np.isfinite(stats.loss_policy)
+        grads[exponent] = stats.loss_policy
+    assert grads[0.0] != grads[1.0]
 
 
 def test_checkpoint_roundtrip_and_league(tmp_path):
@@ -233,7 +294,7 @@ def test_branch_depth_exponent_moves_weight_without_changing_tree_totals():
     cells = (GameScheduleCell(hand_size=8, num_players=4),)
     budget = BranchBudgetConfig(branch_rate=0.5)
 
-    def branch_rows(exponent):
+    def policy_rows(exponent):
         trainer = make_trainer(
             schedule_cells=cells,
             branch_budget=budget,
@@ -243,7 +304,7 @@ def test_branch_depth_exponent_moves_weight_without_changing_tree_totals():
         groups = build_training_groups(trees, MODEL_CONFIG, trainer.train)
         weights, shallow, deep = [], 0.0, 0.0
         for group in groups:
-            for rows in group.branch.values():
+            for rows in group.policy.values():
                 for i, weight in enumerate(rows.weight):
                     weights.append(weight)
                     # Row order follows leaf/decision order, so use the
@@ -255,9 +316,45 @@ def test_branch_depth_exponent_moves_weight_without_changing_tree_totals():
                         deep += weight
         return sum(weights), shallow, deep
 
-    flat_total, flat_shallow, _ = branch_rows(0.0)
-    early_total, early_shallow, _ = branch_rows(-1.0)
+    flat_total, flat_shallow, _ = policy_rows(0.0)
+    early_total, early_shallow, _ = policy_rows(-1.0)
     # The tree's total branch weight is preserved exactly.
     assert early_total == pytest.approx(flat_total, rel=1e-4)
     # But early positions now carry more of it.
     assert early_shallow > flat_shallow
+
+
+def test_unbranched_rows_produce_a_nonzero_policy_gradient():
+    """The k=1 trap: centering A over the candidate set, or dividing the row
+    loss by the candidate count, silently zeroes every unbranched decision --
+    half the rows in a typical iteration, gone with no error."""
+
+    import torch as _torch
+
+    trainer = make_trainer(branch_budget=BranchBudgetConfig(branch_rate=0.0))
+    trees, _ = trainer.collect()
+    groups = build_training_groups(trees, MODEL_CONFIG, trainer.train)
+    # The focal's own bid is expanded whatever the rate -- it is the root of
+    # the tree -- so only the play rows are unbranched here.
+    play = [group.policy["play"] for group in groups if group.policy["play"].weight]
+    assert play, "expected play decisions with branching switched off"
+    assert all(
+        len(candidates) == 1 for r in play for candidates in r.candidates
+    )
+    assert all(not any(r.branched) for r in play)
+
+    trainer.model.zero_grad(set_to_none=True)
+    total = 0.0
+    for group in groups:
+        by_chunk = _rows_by_chunk(group, trainer._microbatches(group))
+        for (start, stop), policy_rows in zip(
+            trainer._microbatches(group), by_chunk
+        ):
+            loss, terms = trainer._chunk_loss(group, start, stop, policy_rows)
+            if loss is not None:
+                loss.backward()
+            total += terms.get("policy", 0.0)
+
+    head_grad = trainer.model.card_head.weight.grad
+    assert head_grad is not None
+    assert _torch.linalg.vector_norm(head_grad).item() > 0.0
