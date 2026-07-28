@@ -14,6 +14,7 @@ deal; they are training targets only and never model inputs.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import lru_cache
 
 import numpy as np
 
@@ -53,8 +54,17 @@ RANKS: tuple[Rank, ...] = tuple(Rank)
 IGNORE_LABEL = -100
 
 
+# There are 52 cards and this is called millions of times per update, so the
+# two tuple.index() linear scans are worth trading for one dict hit.
+_CARD_IDS: dict[Card, int] = {
+    Card(suit, rank): suit_index * len(RANKS) + rank_index
+    for suit_index, suit in enumerate(SUITS)
+    for rank_index, rank in enumerate(RANKS)
+}
+
+
 def card_id(card: Card) -> int:
-    return SUITS.index(card.suit) * len(RANKS) + RANKS.index(card.rank)
+    return _CARD_IDS[card]
 
 
 def card_from_id(index: int) -> Card:
@@ -67,7 +77,10 @@ def _relative(player: int, observer: int, num_players: int) -> int:
     return (player - observer) % num_players
 
 
-def _base_token(config: SeqModelConfig, num_players: int, hand_size: int) -> list[int]:
+@lru_cache(maxsize=None)
+def _base_token_template(
+    config: SeqModelConfig, num_players: int, hand_size: int
+) -> tuple[int, ...]:
     token = [0] * TOKEN_WIDTH
     token[SLOT_REL_PLAYER] = config.player_na_id
     token[SLOT_RANK] = config.rank_na_id
@@ -80,7 +93,14 @@ def _base_token(config: SeqModelConfig, num_players: int, hand_size: int) -> lis
     token[SLOT_NUM_PLAYERS] = num_players
     token[SLOT_NEXT_ACTOR] = config.player_na_id
     token[SLOT_NEXT_PHASE] = NEXT_NONE
-    return token
+    return tuple(token)
+
+
+def _base_token(config: SeqModelConfig, num_players: int, hand_size: int) -> list[int]:
+    # The template depends only on (config, players, cards), all constant across
+    # a shape group, so the eleven field writes happen once per shape instead of
+    # once per token -- and list(tuple) is a single C-level copy.
+    return list(_base_token_template(config, num_players, hand_size))
 
 
 def game_token(
@@ -290,15 +310,32 @@ def build_seat_tokens(
     bidding_start_player: int,
     pending_actor: int | None = None,
     pending_phase: int = NEXT_NONE,
+    token_prefix: np.ndarray | None = None,
 ) -> np.ndarray:
     """Token rows for one observer. ``pending_actor`` (absolute id) sets the
-    next-actor fields of the final token for in-progress games."""
+    next-actor fields of the final token for in-progress games.
+
+    ``token_prefix`` is an already-built ``[n, TOKEN_WIDTH]`` block for the first
+    ``n`` positions, supplied by a caller that knows this sequence shares them
+    with one it has already built (a branch child and its parent, whose event
+    logs agree up to the branch). Those positions are copied rather than
+    replayed, which is where most of the work is: in a branching tree the great
+    majority of every leaf's tokens are prefix a sibling already produced.
+    """
 
     round_events = _round_events(events)
-    tokens = prefix_tokens(
-        config, observer, num_players, hand_size, initial_hand, bidding_start_player
-    )
-    for kind, index in token_layout(config, round_events):
+    prefix_len = config.prefix_len(hand_size)
+    skip = 0 if token_prefix is None else int(token_prefix.shape[0])
+    if skip >= prefix_len:
+        tokens: list = [None] * prefix_len
+    else:
+        tokens = prefix_tokens(
+            config, observer, num_players, hand_size, initial_hand, bidding_start_player
+        )
+    for offset, (kind, index) in enumerate(token_layout(config, round_events)):
+        if prefix_len + offset < skip:
+            tokens.append(None)      # comes from token_prefix; never read below
+            continue
         event = round_events[index]
         if kind == "turn":
             tokens.append(
@@ -314,8 +351,12 @@ def build_seat_tokens(
     # action event at t+1 (TRICK_WIN and HAND interiors announce nothing).
     # With TURN tokens on, the token before an action is the TURN token, which
     # already carries the same annotation -- this loop just re-derives it.
-    prefix_len = config.prefix_len(hand_size)
-    for position in range(prefix_len - 1, len(tokens) - 1):
+    #
+    # Starts at ``skip`` when a prefix was supplied: position skip-1 is the last
+    # copied token, and its annotation is already correct because it describes
+    # the *actor and phase* of the event at skip, which a branch child shares
+    # with its parent -- only the action taken differs, not who takes it.
+    for position in range(max(prefix_len - 1, skip), len(tokens) - 1):
         upcoming = tokens[position + 1]
         if upcoming[SLOT_TYPE] in (TOKEN_BID, TOKEN_PLAY):
             tokens[position][SLOT_NEXT_ACTOR] = upcoming[SLOT_REL_PLAYER]
@@ -351,7 +392,15 @@ def build_seat_tokens(
         else:
             tokens[-1][SLOT_NEXT_ACTOR] = rel
             tokens[-1][SLOT_NEXT_PHASE] = pending_phase
-    return np.asarray(tokens, dtype=np.int64)
+    if skip == 0:
+        return np.asarray(tokens, dtype=np.int64)
+    array = np.empty((len(tokens), TOKEN_WIDTH), dtype=np.int64)
+    array[:skip] = token_prefix
+    if skip < len(tokens):
+        # Guarded: an empty tail is a list, which numpy reads as shape (0,) and
+        # refuses to broadcast into (0, TOKEN_WIDTH).
+        array[skip:] = tokens[skip:]
+    return array
 
 
 @dataclass
@@ -382,6 +431,10 @@ def build_replay_arrays(
     hand_size: int,
     bidding_start_player: int,
     label_from: int = 0,
+    tokens: np.ndarray | None = None,
+    owner_labels: bool = True,
+    suit_labels: bool = True,
+    trick_labels: bool = True,
 ) -> ReplayArrays:
     """Replay a completed round and emit tokens plus per-position labels.
 
@@ -392,6 +445,19 @@ def build_replay_arrays(
     ``label_from`` restricts label filling and decision records to positions
     >= label_from — a leaf that owns only its post-branch suffix skips the
     expensive label work for prefix positions owned by another leaf.
+
+    ``tokens`` supplies an already-built token array, for callers that built it
+    themselves to reuse a sibling's prefix (see ``build_seat_tokens``). The
+    event walk below still runs in full either way: the replay state it carries
+    (holders, voids, tricks won) has to reach ``label_from`` before any label
+    can be written, so only the token construction is skippable.
+
+    ``owner_labels`` / ``suit_labels`` / ``trick_labels`` all default to on. A
+    caller whose loss weights one of these at zero can turn it off to skip
+    building targets nothing will read -- the owner labels in particular are the
+    bulk of the per-position work. The arrays are still returned at full shape,
+    left at IGNORE_LABEL / False, so a loss enabled against labels that were not
+    built sees no labeled positions rather than wrong ones.
     """
 
     if set(initial_hands) != set(range(num_players)):
@@ -400,15 +466,16 @@ def build_replay_arrays(
         if len(hand) != hand_size:
             raise ValueError(f"Player {player} hand does not match hand size.")
 
-    tokens = build_seat_tokens(
-        config,
-        events,
-        observer,
-        num_players,
-        hand_size,
-        initial_hands[observer],
-        bidding_start_player,
-    )
+    if tokens is None:
+        tokens = build_seat_tokens(
+            config,
+            events,
+            observer,
+            num_players,
+            hand_size,
+            initial_hands[observer],
+            bidding_start_player,
+        )
     total_len = config.seq_len(num_players, hand_size)
     if tokens.shape[0] != total_len:
         raise ValueError(
@@ -450,30 +517,33 @@ def build_replay_arrays(
     card_range = np.arange(NUM_CARDS)
 
     def fill_labels(position: int) -> None:
-        hidden = holder_rel > 0
-        valid = owner_valid[position]
-        for rel in range(1, num_players):
-            valid[:, rel - 1] = hidden & ~void_rel[rel, suit_of_card]
-        if kitty_size > 0:
-            valid[:, undealt] = hidden
-        targets = np.where(holder_rel == num_players, undealt, holder_rel - 1)
-        owner_targets[position] = np.where(hidden, targets, IGNORE_LABEL)
-        if not valid[card_range[hidden], targets[hidden]].all():
-            raise AssertionError(
-                "Ground-truth owner is excluded by the public owner mask."
+        if owner_labels:
+            hidden = holder_rel > 0
+            valid = owner_valid[position]
+            for rel in range(1, num_players):
+                valid[:, rel - 1] = hidden & ~void_rel[rel, suit_of_card]
+            if kitty_size > 0:
+                valid[:, undealt] = hidden
+            targets = np.where(holder_rel == num_players, undealt, holder_rel - 1)
+            owner_targets[position] = np.where(hidden, targets, IGNORE_LABEL)
+            if not valid[card_range[hidden], targets[hidden]].all():
+                raise AssertionError(
+                    "Ground-truth owner is excluded by the public owner mask."
+                )
+            owner_capacities[position, : num_players - 1] = (
+                hand_size - played_count_rel[1:num_players]
             )
-        owner_capacities[position, : num_players - 1] = (
-            hand_size - played_count_rel[1:num_players]
-        )
-        owner_capacities[position, undealt] = kitty_size
-        unresolved = hand_size - completed_tricks
-        upper = np.minimum(tricks_won_rel + unresolved, config.max_hand_size)
-        trick_masks[position, :num_players] = (
-            count_range[None, :] >= tricks_won_rel[:, None]
-        ) & (count_range[None, :] <= upper[:, None])
-        suit_targets[position, 1:num_players] = (
-            suit_count_rel[1:num_players] > 0
-        ).astype(np.int64)
+            owner_capacities[position, undealt] = kitty_size
+        if trick_labels:
+            unresolved = hand_size - completed_tricks
+            upper = np.minimum(tricks_won_rel + unresolved, config.max_hand_size)
+            trick_masks[position, :num_players] = (
+                count_range[None, :] >= tricks_won_rel[:, None]
+            ) & (count_range[None, :] <= upper[:, None])
+        if suit_labels:
+            suit_targets[position, 1:num_players] = (
+                suit_count_rel[1:num_players] > 0
+            ).astype(np.int64)
 
     prefix_len = config.prefix_len(hand_size)
     if label_from < prefix_len:

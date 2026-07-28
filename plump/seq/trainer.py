@@ -59,7 +59,7 @@ from .config import (
 from .model import SeqPlumpModel
 from .policy import SeqLeague, best_seq_device
 from .rollout import SeqRolloutCollector, SeqTree
-from .tokens import IGNORE_LABEL, build_replay_arrays
+from .tokens import IGNORE_LABEL, build_replay_arrays, build_seat_tokens
 
 
 # --------------------------------------------------------------------- #
@@ -298,6 +298,39 @@ def build_training_groups(
         )
         policy = {"bid": PolicyRows(), "play": PolicyRows()}
 
+        # Tokens first, in a pass of their own, so a branch child can copy the
+        # prefix its parent already wrote instead of replaying the same events.
+        # A parent always branched strictly earlier than its child, so ordering
+        # by owned_from is a topological order: the parent's row is filled by
+        # the time the child reads it. The batch array is the only storage --
+        # nothing extra is retained.
+        #
+        # This pass alone, and not the label loop below: the labels need the
+        # replay state walked event by event to reach owned_from, so they are
+        # not shareable the way the tokens are.
+        row_of_leaf = {id(leaf): row for row, (_, leaf) in enumerate(entries)}
+        for row in sorted(range(batch), key=lambda index: entries[index][1].owned_from):
+            tree, leaf = entries[row]
+            parent_row = (
+                None if leaf.parent is None else row_of_leaf.get(id(leaf.parent))
+            )
+            tokens[row] = build_seat_tokens(
+                model_config,
+                leaf.env.state.event_log,
+                tree.focal,
+                num_players,
+                hand_size,
+                tree.initial_hands[tree.focal],
+                tree.bidding_start_player,
+                token_prefix=(
+                    None
+                    if parent_row is None
+                    else tokens[parent_row, : leaf.owned_from]
+                ),
+            )
+
+        # Row order here stays the entries order: it sets the order of the
+        # policy rows, and reordering those would change float reduction order.
         for row, (tree, leaf) in enumerate(entries):
             arrays = build_replay_arrays(
                 model_config,
@@ -308,8 +341,11 @@ def build_training_groups(
                 hand_size,
                 tree.bidding_start_player,
                 label_from=leaf.owned_from,
+                tokens=tokens[row],
+                owner_labels=train_config.owner_coef > 0,
+                suit_labels=train_config.suit_coef > 0,
+                trick_labels=train_config.trick_coef > 0,
             )
-            tokens[row] = arrays.tokens
             owned[row, leaf.owned_from :] = True
             for position, value in leaf.value_targets().items():
                 value_targets[row, position] = value

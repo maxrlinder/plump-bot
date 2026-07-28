@@ -178,6 +178,11 @@ class SeqLeaf:
     # Cache-free mode only: [num_players, max_len, TOKEN_WIDTH] token history
     # re-encoded from scratch at every decision.
     history: Optional[np.ndarray] = None
+    # The leaf this one branched off. Its token prefix up to ``owned_from`` is
+    # identical to this leaf's -- the env was cloned there -- so the update can
+    # copy it instead of replaying the shared events again. No extra retention:
+    # ``tree.leaves`` already holds every leaf.
+    parent: Optional["SeqLeaf"] = None
 
     def value_target_at(self, position: int) -> float:
         for positions, resolver in self.segments:
@@ -1023,6 +1028,7 @@ class SeqRolloutCollector:
                 upstream=(branch, candidate),
                 bid_group=group,
                 covered_until=position,
+                parent=leaf,
             )
             leaf.tree.leaf_total += 1
             self._total_leaves += 1
@@ -1168,6 +1174,7 @@ class SeqRolloutCollector:
                 upstream=(record, candidate),
                 bid_group=groups_of[candidate],
                 covered_until=position,
+                parent=leaf,
             )
             self._advance_leaf(
                 child, self._action_for(actor, Phase.BIDDING, candidate),

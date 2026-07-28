@@ -352,3 +352,68 @@ def test_schema_flags_keep_the_stream_and_the_labels_aligned(
                 assert tokens[position, SLOT_TYPE] == TOKEN_TURN
                 assert tokens[position, SLOT_REL_PLAYER] == 0
         assert (tokens[arrays.decision_positions, SLOT_NEXT_ACTOR] == 0).all()
+
+
+@pytest.mark.parametrize("num_players,hand_size,seed", CASES)
+def test_token_prefix_reuse_matches_a_full_build(num_players, hand_size, seed):
+    """A supplied prefix must reproduce the from-scratch tokens exactly.
+
+    This is the invariant the update relies on when a branch child copies its
+    parent's tokens instead of replaying the shared events: everything before
+    the branch is identical, including the next-actor annotation on the last
+    copied token, which describes who acts at the branch rather than what they
+    do there.
+    """
+
+    env, _, start = play_random_round(num_players, hand_size, seed, observer=0)
+    round_state = env.state.current_round
+    args = (
+        CONFIG,
+        env.state.event_log,
+        0,
+        num_players,
+        hand_size,
+        round_state.initial_hands[0],
+        start,
+    )
+    scratch = seq_tokens.build_seat_tokens(*args)
+    for split in range(0, len(scratch) + 1):
+        reused = seq_tokens.build_seat_tokens(
+            *args, token_prefix=scratch[:split]
+        )
+        assert np.array_equal(reused, scratch), f"prefix reuse differs at {split}"
+
+
+@pytest.mark.parametrize("num_players,hand_size,seed", CASES)
+def test_disabled_label_groups_stay_unlabelled_and_do_not_disturb_the_rest(
+    num_players, hand_size, seed
+):
+    """Turning a label group off must leave it at IGNORE_LABEL/False and change
+    nothing else -- a loss enabled against it then sees no labelled positions
+    rather than wrong ones."""
+
+    env, _, start = play_random_round(num_players, hand_size, seed, observer=0)
+    full = replay_arrays_for(env, 0, start)
+    round_state = env.state.current_round
+    off = seq_tokens.build_replay_arrays(
+        CONFIG,
+        round_state.initial_hands,
+        env.state.event_log,
+        0,
+        num_players,
+        round_state.hand_size,
+        start,
+        owner_labels=False,
+        suit_labels=False,
+    )
+    assert (off.owner_targets == seq_tokens.IGNORE_LABEL).all()
+    assert not off.owner_valid.any()
+    assert not off.owner_capacities.any()
+    assert (off.suit_targets == seq_tokens.IGNORE_LABEL).all()
+    # Everything not switched off is untouched.
+    assert np.array_equal(off.tokens, full.tokens)
+    assert np.array_equal(off.trick_masks, full.trick_masks)
+    assert np.array_equal(off.trick_targets, full.trick_targets)
+    assert np.array_equal(off.decision_positions, full.decision_positions)
+    assert np.array_equal(off.action_targets, full.action_targets)
+    assert np.array_equal(off.legal_card_masks, full.legal_card_masks)
