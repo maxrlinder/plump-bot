@@ -93,10 +93,12 @@ def resolve_training_config(raw: dict[str, Any]) -> ResolvedTraining:
             for _ in range(games_per_cell)
         )
     else:
+        deals_per_shape = int(training_raw.get("deals_per_shape", 0))
         cells = build_position_balanced_schedule(
             hand_sizes=hand_sizes,
             player_counts=player_counts,
             repeats=int(training_raw["schedule_repeats"]),
+            deals_per_shape=deals_per_shape or None,
         )
 
     rate_table = build_branch_rate_table(
@@ -128,6 +130,9 @@ def resolve_training_config(raw: dict[str, Any]) -> ResolvedTraining:
             cache_budget_gb=float(rollout_raw["cache_budget_gb"]),
             max_cache_rows=int(rollout_raw["max_cache_rows"]),
             historical_arm=str(rollout_raw["historical_arm"]),
+            bid_position_mode=str(
+                rollout_raw.get("bid_position_mode", "cycle")
+            ),
         ),
         learning_rate=float(training_raw["learning_rate"]),
         lr_warmup_updates=int(training_raw["lr_warmup_updates"]),

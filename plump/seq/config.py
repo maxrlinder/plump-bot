@@ -359,6 +359,14 @@ class BranchBudgetConfig:
 
 
 HistoricalArmMode = Literal["off", "paired", "separate"]
+BidPositionMode = Literal["uniform", "cycle"]
+# Literals are erased at runtime and both of these come straight from a TOML
+# string, so validate() checks membership against these instead. An unknown
+# historical_arm falls through _collect_deal_batch's dispatch to "no arm at
+# all" and an unknown bid_position_mode falls through to a uniform seat --
+# either way a typo trains a different run than the preset names.
+HISTORICAL_ARM_MODES: frozenset[str] = frozenset(get_args(HistoricalArmMode))
+BID_POSITION_MODES: frozenset[str] = frozenset(get_args(BidPositionMode))
 
 
 @dataclass(frozen=True)
@@ -390,7 +398,7 @@ class RolloutOptions:
     # round-robin per player count -- balancing absolute seat would balance a
     # relabeling. "uniform" draws the seat uniformly, which leaves bidding
     # position unbiased but lumpy at these deal counts.
-    bid_position_mode: Literal["uniform", "cycle"] = "cycle"
+    bid_position_mode: BidPositionMode = "cycle"
 
     # off      -> self-play only, no historical opponents.
     # paired   -> historical arm shares the deal and the same wave loop
@@ -440,6 +448,16 @@ class RolloutOptions:
             raise ValueError("max_deals_per_batch must be >= 1.")
         if not 0.0 <= self.auto_deals_headroom < 1.0:
             raise ValueError("auto_deals_headroom must be in [0, 1).")
+        if self.historical_arm not in HISTORICAL_ARM_MODES:
+            raise ValueError(
+                f"Unknown historical_arm {self.historical_arm!r}; expected one "
+                f"of {sorted(HISTORICAL_ARM_MODES)}."
+            )
+        if self.bid_position_mode not in BID_POSITION_MODES:
+            raise ValueError(
+                f"Unknown bid_position_mode {self.bid_position_mode!r}; "
+                f"expected one of {sorted(BID_POSITION_MODES)}."
+            )
 
     def splits_for(self, hand_size: int) -> int:
         if hand_size < self.bid_split_min_hand_size:
@@ -558,6 +576,7 @@ def build_position_balanced_schedule(
     hand_sizes: tuple[int, ...] = tuple(range(3, 11)),
     player_counts: tuple[int, ...] = (3, 4, 5),
     repeats: int = 1,
+    deals_per_shape: Optional[int] = None,
 ) -> tuple[GameScheduleCell, ...]:
     """One deal per (player count, hand size, bidding position).
 
@@ -567,6 +586,14 @@ def build_position_balanced_schedule(
     the same hand seen from a different chair, or the update would contain P
     correlated copies of one deal instead of P samples.
 
+    ``deals_per_shape`` overrides that with a flat count per shape, which makes
+    the update size ``len(hand_sizes) * len(player_counts) * deals_per_shape``
+    regardless of table size. Bidding-position coverage then comes from
+    ``bid_position_mode`` instead: its "cycle" cursor is per player count and
+    persists across cells and updates, so positions are still walked
+    round-robin -- just spread over several updates rather than exhausted
+    inside one.
+
     Note this drops the tilt toward longer games in *deal counts*: every hand
     size gets the same number of deals. Long games still dominate compute, and
     ``tree_weight_exponent`` is the knob for how much of the gradient follows
@@ -575,9 +602,17 @@ def build_position_balanced_schedule(
 
     if repeats < 1:
         raise ValueError("repeats must be >= 1.")
+    if deals_per_shape is not None and deals_per_shape < 1:
+        raise ValueError("deals_per_shape must be >= 1 when set.")
     return tuple(
         GameScheduleCell(
-            hand_size=hand_size, num_players=players, games=players * repeats
+            hand_size=hand_size,
+            num_players=players,
+            games=(
+                players * repeats
+                if deals_per_shape is None
+                else deals_per_shape * repeats
+            ),
         )
         for players, hand_size in sorted(
             ((p, n) for p in player_counts for n in hand_sizes),

@@ -1,6 +1,6 @@
 [run]
-iterations = 1000
-checkpoint_every = 200
+iterations = 4000
+checkpoint_every = 100
 dashboard_every = 5
 device = "auto"
 
@@ -19,6 +19,8 @@ hand_sizes = [3, 4, 5, 6, 7, 8, 9, 10]
 player_counts = [3, 4, 5]
 player_count_weights = [2.0, 3.0, 4.0]
 schedule_repeats = 1
+# 24 cells (3 player counts x 8 hand sizes), one deal each = 24 deals/update.
+deals_per_shape = 1
 games_per_cell = 0
 reference_rate = 0.5
 branch_rate_player_exponent = 0.0
@@ -35,9 +37,9 @@ policy_kl_cap = 0.005
 neurd_advantage_clip = 10.0
 neurd_inclusion_exponent = 1.0
 value_coef = 0.5
-suit_coef = 0.25
+suit_coef = 0.5
 bid_hit_coef = 0.0
-trick_coef = 0.25
+trick_coef = 0.35
 entropy_coef = 0.0
 league_max_snapshots = 8
 league_min_iteration = 0
@@ -46,8 +48,9 @@ league_min_iteration = 0
 max_cache_rows = 65536
 cache_budget_gb = 10.0
 auto_deals_per_batch = true
-historical_arm = "paired"
+historical_arm = "off"
 kv_dtype = "fp16"
+bid_position_mode = "cycle"
 
 [evaluation]
 every = 100

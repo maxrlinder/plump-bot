@@ -25,6 +25,7 @@ from plump.seq.config import (
     ShapeBranchRate,
     build_branch_rate_table,
     build_game_schedule,
+    build_position_balanced_schedule,
     seq_len,
 )
 from plump.seq.model import SeqPlumpModel
@@ -697,6 +698,45 @@ def test_schedule_apportions_the_mix_exactly():
     for cell in schedule:
         by_players[cell.num_players] = by_players.get(cell.num_players, 0) + cell.games
     assert len(set(by_players.values())) == 1
+
+
+def test_deals_per_shape_makes_the_update_size_independent_of_table_size():
+    """Per-position coverage scales an update with P; a flat count does not."""
+
+    per_position = build_position_balanced_schedule()
+    # 8 hand sizes x (3 + 4 + 5) deals: a 5-player cell costs 5 deals.
+    assert sum(cell.games for cell in per_position) == 8 * 12
+
+    flat = build_position_balanced_schedule(deals_per_shape=1)
+    assert sum(cell.games for cell in flat) == 24
+    assert {cell.games for cell in flat} == {1}
+    # Same grid either way -- only the deal count per cell moves.
+    assert {(c.num_players, c.hand_size) for c in flat} == {
+        (c.num_players, c.hand_size) for c in per_position
+    }
+    # Widest shape first, so the cache pool is sized once at the top.
+    assert (flat[0].num_players, flat[0].hand_size) == (5, 10)
+
+    assert sum(
+        cell.games
+        for cell in build_position_balanced_schedule(deals_per_shape=2, repeats=3)
+    ) == 24 * 6
+    with pytest.raises(ValueError):
+        build_position_balanced_schedule(deals_per_shape=0)
+
+
+def test_string_valued_modes_are_rejected_rather_than_silently_downgraded():
+    """historical_arm and bid_position_mode come from TOML as bare strings.
+
+    Both Literals are erased at runtime and both dispatch sites fall through
+    on an unknown value -- to no historical arm, and to a uniform seat.
+    """
+
+    RolloutOptions(historical_arm="off", bid_position_mode="uniform").validate()
+    with pytest.raises(ValueError, match="historical_arm"):
+        RolloutOptions(historical_arm="none").validate()
+    with pytest.raises(ValueError, match="bid_position_mode"):
+        RolloutOptions(bid_position_mode="random").validate()
 
 
 def test_schedule_tilt_zero_is_uniform_over_hand_sizes():
