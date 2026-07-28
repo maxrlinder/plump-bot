@@ -691,26 +691,41 @@ class SeqTrainer:
         device = self.device
         train = self.train
         logits_all = output.bid_logits if phase_key == "bid" else output.card_logits
-        seq_idx = torch.tensor(rows["seq_index"], device=device)
-        pos_idx = torch.tensor(rows["position"], device=device)
+
+        def to_device(array: np.ndarray) -> torch.Tensor:
+            return torch.from_numpy(array).to(device)
+
+        # Everything below is padded on the host and shipped in one transfer per
+        # field. Padding these row by row on the device instead costs four
+        # kernel launches per policy row -- ~200k tiny MPS dispatches an update,
+        # which dominated the whole backward pass.
+        seq_idx = to_device(np.asarray(rows["seq_index"], dtype=np.int64))
+        pos_idx = to_device(np.asarray(rows["position"], dtype=np.int64))
         logits = logits_all[seq_idx, pos_idx].float()
 
-        max_k = max(len(c) for c in rows["candidates"])
+        candidates = rows["candidates"]
         count = len(rows["weight"])
-        cand = torch.zeros(count, max_k, dtype=torch.long, device=device)
-        cand_mask = torch.zeros(count, max_k, dtype=torch.bool, device=device)
-        inclusion = torch.ones(count, max_k, device=device)
-        q_values = torch.zeros(count, max_k, device=device)
+        max_k = max(len(c) for c in candidates)
+        cand_np = np.zeros((count, max_k), dtype=np.int64)
+        mask_np = np.zeros((count, max_k), dtype=bool)
+        # Padding stays at 1.0, not 0.0: the 1/q correction raises this to a
+        # negative power before the mask is applied.
+        incl_np = np.ones((count, max_k), dtype=np.float32)
+        q_np = np.zeros((count, max_k), dtype=np.float32)
         for row in range(count):
-            k = len(rows["candidates"][row])
-            cand[row, :k] = torch.from_numpy(rows["candidates"][row])
-            cand_mask[row, :k] = True
-            inclusion[row, :k] = torch.from_numpy(rows["inclusion"][row])
-            q_values[row, :k] = torch.from_numpy(rows["q_values"][row])
-        old_full = torch.from_numpy(np.stack(rows["old_probs_full"])).to(device)
-        weight = torch.tensor(rows["weight"], device=device, dtype=torch.float32)
-        baseline = torch.tensor(
-            rows["baseline"], device=device, dtype=torch.float32
+            k = len(candidates[row])
+            cand_np[row, :k] = candidates[row]
+            mask_np[row, :k] = True
+            incl_np[row, :k] = rows["inclusion"][row]
+            q_np[row, :k] = rows["q_values"][row]
+        cand = to_device(cand_np)
+        cand_mask = to_device(mask_np)
+        inclusion = to_device(incl_np)
+        q_values = to_device(q_np)
+        old_full = to_device(np.stack(rows["old_probs_full"]))
+        weight = to_device(np.asarray(rows["weight"], dtype=np.float32))
+        baseline = to_device(
+            np.asarray(rows["baseline"], dtype=np.float32)
         ).unsqueeze(-1)
 
         gathered = logits.gather(1, cand)
