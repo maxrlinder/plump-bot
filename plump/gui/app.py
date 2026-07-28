@@ -15,9 +15,9 @@ import torch
 
 from plump.cards import Card, Rank, Suit, card_str
 from plump.env import PlumpEnv
-from plump.modeling.encoding import SUITS, card_id
-from plump.policies import ModelPolicy
 from plump.rounds import descending_ascending_schedule
+from plump.seq.policy import SeqModelPolicy, SeqPredictions
+from plump.seq.tokens import SUITS, card_id
 from plump.state import BidAction, GameConfig, IllegalActionError, Phase, PlayCardAction
 
 
@@ -57,7 +57,11 @@ class CheckpointModel:
     """Greedy checkpoint policy plus prediction helpers for the GUI."""
 
     def __init__(self, checkpoint_path: str | Path, device: str | None = None):
-        self.policy = ModelPolicy.from_checkpoint(checkpoint_path, device=device, greedy=True)
+        self.policy = SeqModelPolicy.from_checkpoint(
+            checkpoint_path,
+            device=device,
+            greedy=True,
+        )
 
     def act(self, env: PlumpEnv) -> BidAction | PlayCardAction:
         return self.policy.act(env)
@@ -77,50 +81,36 @@ class CheckpointModel:
         predictions: dict[int, dict[str, Any]] = {}
         round_state = env.state.current_round
         players_with_bids = {bid.player for bid in round_state.bids}
-        observations = [
-            env.get_observation(observer)
-            for observer in range(env.config.num_players)
-        ]
-        encoded_rows, output = self.policy.predict_observations(
-            observations,
-            need_owner=False,
+        observers = list(range(env.config.num_players))
+        output = self.policy.predict_many(
+            [env] * env.config.num_players,
+            observers=observers,
+            aux_heads=("suit", "bid_hit"),
         )
         for observer in range(env.config.num_players):
-            encoded = encoded_rows[observer]
-            trick_probs = torch.softmax(
-                output.masked_trick_count_logits[observer].float(),
-                dim=-1,
-            )
-            score_probs = output.score_probs[observer].float()
             suit_presence = (
-                torch.sigmoid(output.suit_presence_logits[observer].float())
-                if output.suit_presence_logits is not None
+                torch.sigmoid(output.suit_logits[observer])
+                if output.suit_logits is not None
+                else None
+            )
+            bid_hit = (
+                torch.sigmoid(output.bid_hit_logits[observer])
+                if output.bid_hit_logits is not None
                 else None
             )
 
             rows = []
-            for rel in range(encoded.num_players):
-                abs_player = (observer + rel) % encoded.num_players
-                probs = trick_probs[rel]
-                counts = torch.arange(probs.shape[0], dtype=torch.float32, device=probs.device)
-                expected = float((probs * counts).sum().item())
-                top_count = int(probs.argmax(dim=-1).item())
-                top_prob = float(probs[top_count].item())
+            for rel in range(env.config.num_players):
+                abs_player = (observer + rel) % env.config.num_players
                 rows.append(
                     {
                         "player": abs_player,
-                        "expected_tricks": expected,
-                        "top_tricks": top_count,
-                        "top_tricks_prob": top_prob,
-                        # P(hit bid) is derived from the bid; hide it until
-                        # the player has actually bid.
-                        "point_prob": (
-                            float(score_probs[rel].item())
-                            if abs_player in players_with_bids
+                        "bid_hit_prob": (
+                            float(bid_hit[rel].item())
+                            if bid_hit is not None
+                            and abs_player in players_with_bids
                             else None
                         ),
-                        # Suit slot 0 is the observer (their hand is known),
-                        # so beliefs are reported for opponents only.
                         "suit_presence": (
                             {
                                 suit.value: float(suit_presence[rel][index].item())
@@ -145,7 +135,7 @@ class CheckpointModel:
             and env.phase() in (Phase.BIDDING, Phase.PLAYING)
         ):
             action_probabilities = self._action_probabilities(
-                observations[HUMAN_PLAYER],
+                env.get_observation(HUMAN_PLAYER),
                 output,
             )
         return predictions, action_probabilities
@@ -159,10 +149,13 @@ class CheckpointModel:
         )[0]
 
     @staticmethod
-    def _action_probabilities(observation, output) -> dict[str, Any]:
+    def _action_probabilities(
+        observation,
+        output: SeqPredictions,
+    ) -> dict[str, Any]:
         if observation.phase == Phase.BIDDING:
             legal_values = list(observation.legal_bids)
-            legal_logits = output.masked_bid_logits[HUMAN_PLAYER, legal_values].float()
+            legal_logits = output.bid_logits[HUMAN_PLAYER, legal_values]
             probabilities = torch.softmax(legal_logits, dim=-1).cpu().tolist()
             best_index = max(range(len(probabilities)), key=probabilities.__getitem__)
             return {
@@ -181,7 +174,7 @@ class CheckpointModel:
 
         legal_cards = list(observation.legal_cards)
         legal_indices = [card_id(card) for card in legal_cards]
-        legal_logits = output.masked_card_logits[HUMAN_PLAYER, legal_indices].float()
+        legal_logits = output.card_logits[HUMAN_PLAYER, legal_indices]
         probabilities = torch.softmax(legal_logits, dim=-1).cpu().tolist()
         best_index = max(range(len(probabilities)), key=probabilities.__getitem__)
         return {

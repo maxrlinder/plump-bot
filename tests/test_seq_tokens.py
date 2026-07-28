@@ -1,4 +1,4 @@
-"""Schema-v6 token/label builder tests, cross-checked against the v4 encoder."""
+"""Schema-v6 token and replay-label builder tests."""
 
 from __future__ import annotations
 
@@ -9,9 +9,6 @@ import numpy as np
 import pytest
 
 from plump.env import PlumpEnv
-from plump.modeling.encoding import ModelConfig
-from plump.modeling.encoding import card_id as v4_card_id
-from plump.modeling.encoding import encode_observation
 from plump.rounds import RoundSpec, round_game_config
 from plump.seq import tokens as seq_tokens
 from plump.seq.config import (
@@ -36,16 +33,12 @@ from plump.seq.config import (
     seq_len,
 )
 from plump.state import EventType
-from plump.training.common import (
-    suit_presence_targets_relative,
-)
 
 CONFIG = SeqModelConfig()
-V4_CONFIG = ModelConfig()
 
 
 def play_random_round(num_players, hand_size, seed, observer):
-    """Play one full round; capture v4-encoded oracles at observer decisions."""
+    """Play one round and capture direct environment oracles at decisions."""
 
     spec = RoundSpec(num_players, hand_size)
     start = random.Random(seed).randrange(num_players)
@@ -56,25 +49,46 @@ def play_random_round(num_players, hand_size, seed, observer):
     while not env.is_done():
         if env.current_player() == observer:
             observation = env.get_observation(observer)
-            encoded = encode_observation(observation)
+            bid_mask = np.zeros(CONFIG.bid_count, dtype=bool)
+            bid_mask[observation.legal_bids] = True
+            card_mask = np.zeros(seq_tokens.NUM_CARDS, dtype=bool)
+            for card in observation.legal_cards:
+                card_mask[seq_tokens.card_id(card)] = True
+
+            round_state = env.state.current_round
+            completed = sum(
+                trick.winner is not None for trick in round_state.tricks
+            )
+            unresolved = hand_size - completed
+            count_range = np.arange(CONFIG.bid_count)
+            trick_mask = np.zeros(
+                (CONFIG.max_players, CONFIG.bid_count),
+                dtype=bool,
+            )
+            suit_targets = np.full(
+                (CONFIG.max_players, len(seq_tokens.SUITS)),
+                seq_tokens.IGNORE_LABEL,
+                dtype=np.int64,
+            )
+            for rel in range(num_players):
+                player = (observer + rel) % num_players
+                wins = round_state.tricks_won.get(player, 0)
+                trick_mask[rel] = (
+                    (count_range >= wins)
+                    & (count_range <= wins + unresolved)
+                )
+                held = {
+                    card.suit for card in round_state.current_hands[player]
+                }
+                suit_targets[rel] = [
+                    int(suit in held) for suit in seq_tokens.SUITS
+                ]
             oracles.append(
                 {
-                    "encoded": encoded,
-                    "suit_targets": suit_presence_targets_relative(
-                        env, observer, V4_CONFIG
-                    ),
-                    # The v4 oracle masks the observer's own row; seq labels it.
-                    "own_suit_targets": [
-                        int(
-                            any(
-                                card.suit == suit
-                                for card in env.state.current_round.current_hands[
-                                    observer
-                                ]
-                            )
-                        )
-                        for suit in seq_tokens.SUITS
-                    ],
+                    "legal_bid_mask": bid_mask,
+                    "legal_card_mask": card_mask,
+                    "trick_mask": trick_mask,
+                    "suit_targets": suit_targets,
                 }
             )
         env.step(rng.choice(env.legal_actions()))
@@ -98,11 +112,19 @@ def replay_arrays_for(env, observer, start, label_from=0, config=None):
 CASES = [(3, 3, 0), (3, 10, 1), (4, 5, 2), (5, 8, 3), (5, 10, 4)]
 
 
-def test_card_id_matches_v4_encoding():
+def test_card_id_roundtrip_and_order():
     for index in range(52):
         card = seq_tokens.card_from_id(index)
         assert seq_tokens.card_id(card) == index
-        assert v4_card_id(card) == index
+    assert seq_tokens.card_id(
+        seq_tokens.Card(seq_tokens.Suit.SPADES, seq_tokens.Rank.TWO)
+    ) == 0
+    assert seq_tokens.card_id(
+        seq_tokens.Card(seq_tokens.Suit.HEARTS, seq_tokens.Rank.TWO)
+    ) == 13
+    assert seq_tokens.card_id(
+        seq_tokens.Card(seq_tokens.Suit.CLUBS, seq_tokens.Rank.ACE)
+    ) == 51
 
 
 @pytest.mark.parametrize("num_players,hand_size,seed", CASES)
@@ -171,31 +193,28 @@ def test_action_targets_match_taken_actions(num_players, hand_size, seed):
 
 
 @pytest.mark.parametrize("num_players,hand_size,seed", CASES)
-def test_labels_match_v4_encoder_at_decisions(num_players, hand_size, seed):
+def test_labels_match_environment_at_decisions(num_players, hand_size, seed):
     for observer in range(num_players):
         env, oracles, start = play_random_round(num_players, hand_size, seed, observer)
         arrays = replay_arrays_for(env, observer, start)
         assert len(oracles) == len(arrays.decision_positions)
         for index, oracle in enumerate(oracles):
             position = arrays.decision_positions[index]
-            encoded = oracle["encoded"]
             assert np.array_equal(
-                arrays.legal_bid_masks[index], np.asarray(encoded.legal_bid_mask)
+                arrays.legal_bid_masks[index],
+                oracle["legal_bid_mask"],
             )
             assert np.array_equal(
-                arrays.legal_card_masks[index], np.asarray(encoded.legal_card_mask)
+                arrays.legal_card_masks[index],
+                oracle["legal_card_mask"],
             )
             assert np.array_equal(
                 arrays.trick_masks[position],
-                np.asarray(encoded.final_trick_count_mask),
+                oracle["trick_mask"],
             )
             assert np.array_equal(
-                arrays.suit_targets[position, 1:],
-                np.asarray(oracle["suit_targets"])[1:],
-            )
-            assert np.array_equal(
-                arrays.suit_targets[position, 0],
-                np.asarray(oracle["own_suit_targets"], dtype=np.int64),
+                arrays.suit_targets[position],
+                oracle["suit_targets"],
             )
 
 

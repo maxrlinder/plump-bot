@@ -16,9 +16,9 @@ class RoundSpec:
 
     def validate(self) -> None:
         if self.num_players not in (3, 4, 5):
-            raise ValueError("Schema-v4 policies support 3 to 5 players.")
+            raise ValueError("Training supports 3 to 5 players.")
         if not 3 <= self.hand_size <= 10:
-            raise ValueError("Schema-v4 policies support hand sizes 3 to 10.")
+            raise ValueError("Training supports hand sizes 3 to 10.")
         if self.hand_size > 52 // self.num_players:
             raise ValueError("Hand size does not fit the player count.")
 

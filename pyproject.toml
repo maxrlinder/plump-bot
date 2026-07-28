@@ -1,14 +1,21 @@
 [project]
 name = "plump-bot"
 version = "0.1.0"
-description = "Plump game engine and neural model architecture."
+description = "Autoregressive self-play training for the Plump card game."
+readme = "README.md"
 requires-python = ">=3.11,<3.13"
 dependencies = [
     "matplotlib>=3.10.9",
-    "modal>=1.5.2",
     "numpy>=2.0",
-    "torch>=2.13.0.dev0; sys_platform == 'darwin' and platform_machine == 'arm64'",
+    "torch==2.13.0.dev20260518; sys_platform == 'darwin' and platform_machine == 'arm64'",
 ]
+
+[project.scripts]
+plump = "plump.cli:main"
+
+[build-system]
+requires = ["uv_build>=0.11.7,<0.12"]
+build-backend = "uv_build"
 
 [dependency-groups]
 dev = [
@@ -20,7 +27,7 @@ analysis = [
 ]
 
 [tool.uv]
-package = false
+package = true
 prerelease = "explicit"
 environments = [
     "sys_platform == 'darwin' and platform_machine == 'arm64'",
@@ -28,13 +35,13 @@ environments = [
 
 [tool.uv.sources]
 torch = [
-    { index = "pytorch-nightly", marker = "sys_platform == 'darwin' and platform_machine == 'arm64'" },
+    { url = "https://download-r2.pytorch.org/whl/nightly/cpu/torch-2.13.0.dev20260518-cp311-cp311-macosx_14_0_arm64.whl", marker = "python_version == '3.11' and sys_platform == 'darwin' and platform_machine == 'arm64'" },
+    { url = "https://download-r2.pytorch.org/whl/nightly/cpu/torch-2.13.0.dev20260518-cp312-cp312-macosx_14_0_arm64.whl", marker = "python_version == '3.12' and sys_platform == 'darwin' and platform_machine == 'arm64'" },
 ]
 
-[[tool.uv.index]]
-name = "pytorch-nightly"
-url = "https://download.pytorch.org/whl/nightly/cpu"
-explicit = true
+[tool.uv.build-backend]
+module-name = "plump"
+module-root = ""
 
 [tool.pytest.ini_options]
 pythonpath = ["."]

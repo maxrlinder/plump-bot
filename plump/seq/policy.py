@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import random
+from collections.abc import Collection
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -116,6 +117,79 @@ class SeqModelPolicy:
             pending_phase=pending_phase,
         )
 
+    def _tokens_for_observer(self, env: PlumpEnv, observer: int) -> np.ndarray:
+        """Build the visible prefix for any observer at the current state."""
+
+        observation = env.get_observation(observer)
+        initial_hand = list(observation.my_hand) + list(
+            observation.played_cards_by_player[observer]
+        )
+        pending_phase = (
+            NEXT_BID if observation.phase == Phase.BIDDING else NEXT_PLAY
+        )
+        return build_seat_tokens(
+            self.config,
+            observation.event_log,
+            observer,
+            env.config.num_players,
+            observation.hand_size,
+            initial_hand,
+            observation.bidding_start_player,
+            pending_actor=env.current_player(),
+            pending_phase=pending_phase,
+        )
+
+    def predict_many(
+        self,
+        envs: list[PlumpEnv],
+        *,
+        observers: list[int] | None = None,
+        aux_heads: bool | Collection[str] = ("suit", "bid_hit"),
+    ) -> "SeqPredictions":
+        """Predict the current state for arbitrary environment observers."""
+
+        if not envs:
+            raise ValueError("predict_many requires at least one environment.")
+        if observers is None:
+            observers = [env.current_player() for env in envs]
+        if len(observers) != len(envs):
+            raise ValueError("observers must match envs.")
+
+        token_rows = [
+            self._tokens_for_observer(env, observer)
+            for env, observer in zip(envs, observers)
+        ]
+        lengths = [rows.shape[0] for rows in token_rows]
+        batch = np.zeros(
+            (len(envs), max(lengths), TOKEN_WIDTH),
+            dtype=np.int64,
+        )
+        for row, tokens in enumerate(token_rows):
+            batch[row, : tokens.shape[0]] = tokens
+
+        with torch.inference_mode():
+            output = self.model.forward_full(
+                torch.from_numpy(batch).to(self.device),
+                aux_heads=aux_heads,
+            )
+        self.forward_passes += len(envs)
+        last = torch.tensor(lengths, device=self.device) - 1
+        rows = torch.arange(len(envs), device=self.device)
+
+        def selected(value):
+            return None if value is None else value[rows, last].float().cpu()
+
+        return SeqPredictions(
+            observers=tuple(observers),
+            lengths=tuple(lengths),
+            bid_logits=selected(output.bid_logits),
+            card_logits=selected(output.card_logits),
+            value=selected(output.value),
+            trick_logits=selected(output.trick_logits),
+            suit_logits=selected(output.suit_logits),
+            bid_hit_logits=selected(output.bid_hit_logits),
+        )
+
     def act(
         self, env: PlumpEnv, *, rng: random.Random | None = None
     ) -> BidAction | PlayCardAction:
@@ -176,6 +250,20 @@ class SeqModelPolicy:
                     choice = sample_index(probabilities, rngs[index].random())
                 actions.append(PlayCardAction(player, card_from_id(choice)))
         return actions
+
+
+@dataclass(frozen=True)
+class SeqPredictions:
+    """Current-position schema-v6 predictions returned on the CPU."""
+
+    observers: tuple[int, ...]
+    lengths: tuple[int, ...]
+    bid_logits: torch.Tensor
+    card_logits: torch.Tensor
+    value: torch.Tensor
+    trick_logits: torch.Tensor | None
+    suit_logits: torch.Tensor | None
+    bid_hit_logits: torch.Tensor | None
 
 
 @dataclass

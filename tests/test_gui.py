@@ -1,11 +1,16 @@
 import unittest
+from dataclasses import asdict
+from pathlib import Path
 from types import SimpleNamespace
+from tempfile import TemporaryDirectory
 
 import torch
 
 from plump.cards import Card, Rank, Suit
 from plump.gui.app import CheckpointModel, GuiController, sort_gui_hand
-from plump.modeling.encoding import card_id
+from plump.seq.config import SEQ_SCHEMA_VERSION, SeqModelConfig
+from plump.seq.model import SeqPlumpModel
+from plump.seq.tokens import card_id
 from plump.state import Phase
 
 
@@ -156,22 +161,21 @@ class GuiControllerTest(unittest.TestCase):
             def __init__(self):
                 self.calls = 0
 
-            def predict_observations(self, observations, *, need_owner=True):
+            def predict_many(self, envs, *, observers, aux_heads):
                 self.calls += 1
-                self.observations = observations
-                self.need_owner = need_owner
-                batch = len(observations)
+                self.envs = envs
+                self.observers = observers
+                self.aux_heads = aux_heads
+                batch = len(envs)
                 bid_logits = torch.zeros(batch, 11)
                 bid_logits[0] = torch.arange(11)
-                return (
-                    [SimpleNamespace(num_players=3) for _ in observations],
-                    SimpleNamespace(
-                        masked_bid_logits=bid_logits,
-                        masked_card_logits=torch.zeros(batch, 52),
-                        masked_trick_count_logits=torch.zeros(batch, 5, 11),
-                        score_probs=torch.full((batch, 5), 0.5),
-                        suit_presence_logits=None,
-                    ),
+                return SimpleNamespace(
+                    bid_logits=bid_logits,
+                    card_logits=torch.zeros(batch, 52),
+                    value=torch.zeros(batch),
+                    trick_logits=None,
+                    suit_logits=torch.zeros(batch, 5, 4),
+                    bid_hit_logits=torch.zeros(batch, 5),
                 )
 
         checkpoint = object.__new__(CheckpointModel)
@@ -180,8 +184,12 @@ class GuiControllerTest(unittest.TestCase):
         predictions, action_policy = checkpoint.view_predictions(env)
 
         self.assertEqual(checkpoint.policy.calls, 1)
-        self.assertEqual(len(checkpoint.policy.observations), 3)
-        self.assertFalse(checkpoint.policy.need_owner)
+        self.assertEqual(len(checkpoint.policy.envs), 3)
+        self.assertEqual(checkpoint.policy.observers, [0, 1, 2])
+        self.assertEqual(
+            checkpoint.policy.aux_heads,
+            ("suit", "bid_hit"),
+        )
         self.assertEqual(set(predictions), {0, 1, 2})
         self.assertEqual(action_policy["phase"], Phase.BIDDING.value)
         self.assertEqual(
@@ -210,7 +218,7 @@ class GuiControllerTest(unittest.TestCase):
             controller.advance_bot()
         observation = controller.game.env.get_observation(0)
         card_logits = torch.arange(52, dtype=torch.float32).repeat(3, 1)
-        output = SimpleNamespace(masked_card_logits=card_logits)
+        output = SimpleNamespace(card_logits=card_logits)
 
         action_policy = CheckpointModel._action_probabilities(observation, output)
 
@@ -232,6 +240,49 @@ class GuiControllerTest(unittest.TestCase):
         self.assertEqual(
             [row["card_key"] for row in action_policy["actions"] if row["is_best"]],
             [f"{expected_best.suit.value}:{int(expected_best.rank)}"],
+        )
+
+    def test_real_schema_v6_checkpoint_produces_gui_predictions(self):
+        config = SeqModelConfig(
+            d_model=16,
+            n_layers=1,
+            n_heads=2,
+            n_kv_heads=1,
+            d_ff=32,
+        )
+        model = SeqPlumpModel(config)
+        controller = GuiController()
+        controller.new_game(
+            opponents=2,
+            hand_size=3,
+            human_bid_position=1,
+            seed=4,
+        )
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "seq.pt"
+            torch.save(
+                {
+                    "schema_version": SEQ_SCHEMA_VERSION,
+                    "model_config": asdict(config),
+                    "model_state_dict": model.state_dict(),
+                },
+                path,
+            )
+            checkpoint = CheckpointModel(path, device="cpu")
+            predictions, action_policy = checkpoint.view_predictions(
+                controller.game.env
+            )
+
+        self.assertEqual(set(predictions), {0, 1, 2})
+        self.assertEqual(
+            {row["player"] for row in predictions[0]["rows"]},
+            {0, 1, 2},
+        )
+        self.assertEqual(action_policy["phase"], Phase.BIDDING.value)
+        self.assertAlmostEqual(
+            sum(row["probability"] for row in action_policy["actions"]),
+            1.0,
+            places=6,
         )
 
     def test_no_checkpoint_omits_model_action_probabilities(self):

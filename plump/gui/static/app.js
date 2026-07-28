@@ -471,18 +471,15 @@ function predictionHtml(player) {
   const prediction = player.prediction;
   if (!prediction?.rows?.length) return "";
   const self = prediction.rows.find((row) => row.player === player.id);
-  const point = pointLabel(self?.point_prob);
+  const point = pointLabel(self?.bid_hit_prob);
   const rows = prediction.rows
     .map((row) => {
       const name = playerName(row.player);
-      const expected = Number(row.expected_tricks).toFixed(1);
-      const top = `${row.top_tricks}`;
-      const confidence = Math.round(row.top_tricks_prob * 100);
       return `
         <div class="prediction-row">
           <span>${escapeHtml(name)}</span>
-          <strong>${expected}</strong>
-          <span>${top} @ ${confidence}% · P${pointLabel(row.point_prob)}</span>
+          <strong>Bid hit</strong>
+          <span>${pointLabel(row.bid_hit_prob)}</span>
         </div>
         ${suitPresenceHtml(row.suit_presence)}
       `;
@@ -491,8 +488,8 @@ function predictionHtml(player) {
   return `
     <div class="prediction-box">
       <div class="prediction-head">
-        <span>Model POV</span>
-        <strong>P points ${point}</strong>
+        <span>Schema-v6 model POV</span>
+        <strong>Your bid hit ${point}</strong>
       </div>
       <div class="prediction-grid">
         ${rows}

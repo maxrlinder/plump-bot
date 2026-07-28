@@ -8,7 +8,7 @@ seat's KV prefix. Which focal decisions branch is decided per decision by
 ``branch_rate``; the KV row cap is the only hard limit, and hitting it means
 the rate was set too high for the budget.
 
-Terminal rewards are backed up exactly as in the v4 recursive pipeline:
+Terminal rewards are backed up through the counterfactual tree:
 exact ``V = sum pi_old(a) Q(a)`` where the candidate set covers all legal
 actions, and the control-variate estimator for capped bid sets.
 """
@@ -27,7 +27,7 @@ import torch
 from plump.env import PlumpEnv
 from plump.rounds import RoundSpec, round_game_config
 from plump.state import BidAction, EventType, GameEvent, Phase, PlayCardAction
-from plump.training.common import compute_relative_rewards
+from plump.rewards import compute_relative_rewards
 
 from .config import (
     NEXT_BID,

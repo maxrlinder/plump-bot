@@ -35,8 +35,10 @@ from __future__ import annotations
 
 import copy
 import math
+import os
 import random
 import time
+import uuid
 from collections import defaultdict
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -447,6 +449,9 @@ class SeqTrainer:
         # the LR warmup ramp. Persisted in checkpoints.
         self.optimizer_steps = 0
         self.rng = random.Random(train_config.seed)
+        # Set by the run-system wrapper. Kept outside SeqTrainingConfig so
+        # reporting/evaluation cadence cannot affect the training hot path.
+        self.resolved_config: dict | None = None
 
     # -------------------------------------------------------------- #
     # Collection                                                      #
@@ -820,7 +825,28 @@ class SeqTrainer:
     # -------------------------------------------------------------- #
 
     def save_checkpoint(self, path: str | Path) -> None:
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+
+        league = []
+        for snap in self.league.snapshots:
+            snapshot_path = Path(snap.path)
+            if snapshot_path.is_absolute():
+                stored_path = os.path.relpath(snapshot_path, path.parent)
+            else:
+                stored_path = os.path.relpath(
+                    (Path.cwd() / snapshot_path).resolve(),
+                    path.parent.resolve(),
+                )
+            league.append((snap.snapshot_id, stored_path, snap.iteration))
+
+        collector_state = {
+            "peak_rows": self.collector._peak_rows,
+            "rows_per_deal": self.collector._rows_per_deal,
+            "seat_cursor": self.collector._seat_cursor,
+        }
         payload = {
+            "checkpoint_format_version": 1,
             "schema_version": SEQ_SCHEMA_VERSION,
             "iteration": self.iteration,
             "optimizer_steps": self.optimizer_steps,
@@ -828,29 +854,105 @@ class SeqTrainer:
             "optimizer_state_dict": self.optimizer.state_dict(),
             "model_config": asdict(self.model.config),
             "training_config": asdict(self.train),
+            "resolved_config": copy.deepcopy(self.resolved_config),
             "rules_fingerprint": rules_fingerprint(),
-            "league": [
-                (snap.snapshot_id, snap.path, snap.iteration)
-                for snap in self.league.snapshots
-            ],
+            "league": league,
+            "trainer_rng_state": self.rng.getstate(),
+            "python_rng_state": random.getstate(),
+            "numpy_rng_state": np.random.get_state(),
+            "torch_rng_state": torch.get_rng_state(),
+            "collector_state": collector_state,
         }
-        path = Path(path)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        torch.save(payload, path)
+        if torch.cuda.is_available():
+            payload["cuda_rng_state"] = torch.cuda.get_rng_state_all()
+        if hasattr(torch, "mps") and hasattr(torch.mps, "get_rng_state"):
+            try:
+                payload["mps_rng_state"] = torch.mps.get_rng_state()
+            except RuntimeError:
+                pass
+
+        temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+        try:
+            torch.save(payload, temporary)
+            with temporary.open("rb") as handle:
+                os.fsync(handle.fileno())
+            check = torch.load(
+                temporary,
+                map_location="cpu",
+                weights_only=False,
+            )
+            if (
+                check.get("schema_version") != SEQ_SCHEMA_VERSION
+                or check.get("iteration") != self.iteration
+                or check.get("rules_fingerprint") != rules_fingerprint()
+            ):
+                raise RuntimeError("Checkpoint validation failed.")
+            temporary.replace(path)
+        finally:
+            if temporary.exists():
+                temporary.unlink()
 
     def load_checkpoint(self, path: str | Path) -> None:
+        path = Path(path)
         payload = torch.load(path, map_location="cpu", weights_only=False)
+        if payload.get("checkpoint_format_version") != 1:
+            raise ValueError("Checkpoint format mismatch.")
         if payload.get("schema_version") != SEQ_SCHEMA_VERSION:
             raise ValueError("Checkpoint schema mismatch.")
         if payload.get("rules_fingerprint") != rules_fingerprint():
             raise ValueError("Checkpoint rules fingerprint mismatch.")
+        if payload.get("model_config") != asdict(self.model.config):
+            raise ValueError("Checkpoint model configuration mismatch.")
+        if payload.get("training_config") != asdict(self.train):
+            raise ValueError("Checkpoint training configuration mismatch.")
+        checkpoint_config = payload.get("resolved_config")
+        if (
+            self.resolved_config is not None
+            and checkpoint_config != self.resolved_config
+        ):
+            raise ValueError("Checkpoint resolved configuration mismatch.")
+        self.resolved_config = checkpoint_config
         self.model.load_state_dict(payload["model_state_dict"])
         self.optimizer.load_state_dict(payload["optimizer_state_dict"])
         self.iteration = int(payload.get("iteration", 0))
         self.optimizer_steps = int(payload.get("optimizer_steps", 0))
+        self.league.snapshots.clear()
+        self.league._policies.clear()
         for snapshot_id, snap_path, iteration in payload.get("league", []):
-            if Path(snap_path).exists():
-                self.league.add(snapshot_id, snap_path, iteration)
+            resolved = Path(snap_path)
+            if not resolved.is_absolute():
+                resolved = (path.parent / resolved).resolve()
+            if resolved.exists():
+                self.league.add(snapshot_id, str(resolved), iteration)
+
+        if "trainer_rng_state" in payload:
+            self.rng.setstate(payload["trainer_rng_state"])
+        if "python_rng_state" in payload:
+            random.setstate(payload["python_rng_state"])
+        if "numpy_rng_state" in payload:
+            np.random.set_state(payload["numpy_rng_state"])
+        if "torch_rng_state" in payload:
+            torch.set_rng_state(payload["torch_rng_state"])
+        if torch.cuda.is_available() and "cuda_rng_state" in payload:
+            torch.cuda.set_rng_state_all(payload["cuda_rng_state"])
+        if (
+            "mps_rng_state" in payload
+            and hasattr(torch, "mps")
+            and hasattr(torch.mps, "set_rng_state")
+        ):
+            try:
+                torch.mps.set_rng_state(payload["mps_rng_state"])
+            except RuntimeError:
+                pass
+
+        collector_state = payload.get("collector_state", {})
+        self.collector._peak_rows = dict(collector_state.get("peak_rows", {}))
+        self.collector._rows_per_deal = dict(
+            collector_state.get("rows_per_deal", {})
+        )
+        self.collector._seat_cursor = dict(
+            collector_state.get("seat_cursor", {})
+        )
 
     def maybe_snapshot(self, checkpoint_dir: str | Path) -> Optional[str]:
         if self.iteration % self.train.snapshot_every != 0:

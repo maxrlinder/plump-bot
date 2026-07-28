@@ -31,7 +31,7 @@ from plump.seq.model import SeqPlumpModel
 from plump.seq.policy import masked_probabilities
 from plump.seq.rollout import SeqRolloutCollector
 from plump.seq.tokens import build_seat_tokens
-from plump.training.common import compute_relative_rewards
+from plump.rewards import compute_relative_rewards
 
 MODEL_CONFIG = SeqModelConfig(d_model=64, n_layers=2, n_heads=4, d_ff=128)
 

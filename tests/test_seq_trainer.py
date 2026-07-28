@@ -108,7 +108,7 @@ def test_kl_cap_rolls_back_the_epoch():
 
 
 def test_update_with_belief_losses_disabled_is_policy_value_only():
-    """The initial objective: PPO + NeuRD + value, aux heads never run."""
+    """NeuRD plus value only: disabled auxiliary heads never run."""
 
     trainer = make_trainer(
         suit_coef=0.0, trick_coef=0.0, bid_hit_coef=0.0

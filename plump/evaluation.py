@@ -9,7 +9,7 @@ from dataclasses import dataclass, field
 
 from plump.cards import Card, make_deck
 from plump.env import PlumpEnv
-from plump.policies import ActionPolicy, ModelPolicy
+from plump.policies import ActionPolicy, BatchedActionPolicy
 from plump.rounds import (
     RoundSpec,
     descending_ascending_schedule,
@@ -554,7 +554,7 @@ def _policy_actions(
 ) -> tuple[list[object], list[int]]:
     if not rows:
         return [], []
-    if isinstance(policy, ModelPolicy):
+    if isinstance(policy, BatchedActionPolicy):
         return (
             policy.act_many(
                 [row.env for row in rows],
