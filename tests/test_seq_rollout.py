@@ -773,6 +773,25 @@ def test_auto_batching_scales_deals_to_the_shape():
     assert small <= 64
 
 
+def test_one_rollout_per_hand_gives_each_tree_the_whole_row_cap():
+    """Auto-batching off means a shape's deals never share a wave loop.
+
+    Same-shape deals batched together share one KV pool, so the widest shape
+    -- the one that most needs the rows -- is the one that gets to use the
+    smallest fraction of them. Running each deal as its own decode trades GPU
+    utilisation for letting a 10-card tree branch to its full width.
+    """
+
+    options = RolloutOptions(auto_deals_per_batch=False, deals_per_batch=1)
+    cell = GameScheduleCell(hand_size=10, num_players=5, games=2)
+    collector = options_collector(cells=[cell], options=options)
+    # However many deals are left in the cell, one wave loop takes one.
+    assert collector._deals_for(cell, 5, remaining=2) == 1
+    assert collector._deals_for(cell, 5, remaining=1000) == 1
+    # And with one arm that lone tree faces the entire cap, not a share of it.
+    assert collector._policy_row_cap(arms=1) == collector._row_cap()
+
+
 def test_cycle_balances_bidding_position_not_absolute_seat():
     """Absolute seat is a relabeling; bidding position is what the model sees."""
 

@@ -128,6 +128,7 @@ def resolve_training_config(raw: dict[str, Any]) -> ResolvedTraining:
             auto_deals_per_batch=bool(
                 rollout_raw["auto_deals_per_batch"]
             ),
+            deals_per_batch=int(rollout_raw.get("deals_per_batch", 1)),
             cache_budget_gb=float(rollout_raw["cache_budget_gb"]),
             max_cache_rows=int(rollout_raw["max_cache_rows"]),
             historical_arm=str(rollout_raw["historical_arm"]),
