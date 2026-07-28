@@ -207,7 +207,7 @@ def test_aux_head_shapes():
     assert output.trick_logits.shape == (
         batch, length, config.max_players, config.bid_count
     )
-    assert output.suit_logits.shape == (batch, length, config.max_players, 4)
+    assert output.suit_logits.shape == (batch, length, config.belief_opponents, 4)
     assert output.bid_hit_logits.shape == (batch, length, config.max_players)
 
 

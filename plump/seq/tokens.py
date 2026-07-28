@@ -415,7 +415,7 @@ class ReplayArrays:
     action_targets: np.ndarray    # [D] int64 — bid value or card id actually taken
     trick_targets: np.ndarray     # [max_players] int64, IGNORE_LABEL padding
     trick_masks: np.ndarray       # [L, max_players, bid_count] bool
-    suit_targets: np.ndarray      # [L, max_players, 4] int64, IGNORE_LABEL masked
+    suit_targets: np.ndarray      # [L, belief_opponents, 4], column j is rel seat j+1
     bid_hit_targets: np.ndarray   # [max_players] int64 in {0,1}, IGNORE_LABEL padding
     final_tricks_won: dict[int, int]
 
@@ -483,7 +483,7 @@ def build_replay_arrays(
     bid_count = config.bid_count
     trick_masks = np.zeros((total_len, config.max_players, bid_count), dtype=bool)
     suit_targets = np.full(
-        (total_len, config.max_players, len(SUITS)), IGNORE_LABEL, dtype=np.int64
+        (total_len, config.belief_opponents, len(SUITS)), IGNORE_LABEL, dtype=np.int64
     )
 
     # Vectorized replay state (rel-indexed): holder_rel[card] is the current
@@ -516,13 +516,12 @@ def build_replay_arrays(
                 count_range[None, :] >= tricks_won_rel[:, None]
             ) & (count_range[None, :] <= upper[:, None])
         if suit_labels:
-            # Every seat including the observer's own (rel 0). Own suit presence
-            # is derivable from the prefix rather than a belief, but it costs one
-            # column and makes "do I still hold a spade" an explicit, supervised
-            # part of the representation instead of something the policy has to
-            # rediscover; it also keeps the head's seat axis uniform.
-            suit_targets[position, :num_players] = (
-                suit_count_rel[:num_players] > 0
+            # Opponents only, so column j is relative seat j + 1. The observer's
+            # own suits (rel 0) are not a belief: its dealt hand and every card
+            # it has played are both in its own token stream, so the answer is
+            # already in the prefix verbatim.
+            suit_targets[position, : num_players - 1] = (
+                suit_count_rel[1:num_players] > 0
             ).astype(np.int64)
 
     prefix_len = config.prefix_len(hand_size)

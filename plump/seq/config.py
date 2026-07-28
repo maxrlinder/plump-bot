@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Literal, Optional
+from typing import Literal, Optional, get_args
 
 SEQ_SCHEMA_VERSION = 6
 
@@ -147,6 +147,23 @@ class SeqModelConfig:
     def bid_count(self) -> int:
         return self.max_hand_size + 1
 
+    @property
+    def belief_opponents(self) -> int:
+        """Seat axis for opponent-only beliefs: relative seats 1..max_players-1.
+
+        Suit presence is asked of opponents only. The observer's own suits are
+        a deterministic function of the prefix -- its dealt hand is in the token
+        stream and so is every card it has played -- so a head predicting them
+        is fitting an identity, not a belief, and the supervision it consumes is
+        supervision the opponents' columns do not get.
+
+        Beliefs about the observer's own *outcome* are a different question and
+        keep the full ``max_players`` axis: what the observer will finish with
+        is not derivable from what it holds.
+        """
+
+        return self.max_players - 1
+
     # NA ids used to pad token slots.
     @property
     def player_na_id(self) -> int:
@@ -222,8 +239,20 @@ PlayBranchMode = Literal[
     # tree -- a second copy of an action costs a full subtree and adds no
     # counterfactual -- so this dominates ``sample_k`` at equal k.
     "gumbel_top_k",
+    # ``gumbel_top_k`` plus one extra arm drawn uniformly from the legal actions
+    # the Gumbel pass did *not* take. Two different jobs: the k policy-weighted
+    # arms are what the value backup is built from, and the uniform arm is there
+    # so the policy loss occasionally sees a Q-value at an action the current
+    # policy has written off. Drawing it from the complement rather than from
+    # all legal actions is what makes the extra arm always a new subtree instead
+    # of sometimes a duplicate of one already expanded. It carries zero backup
+    # weight, so it cannot tilt the parent's value toward off-policy actions.
+    "gumbel_top_k_plus_random",
     "none",
 ]
+
+# Literal is erased at runtime, so validate() checks membership against this.
+PLAY_BRANCH_MODES: frozenset[str] = frozenset(get_args(PlayBranchMode))
 
 
 @dataclass(frozen=True)
@@ -788,6 +817,19 @@ class SeqTrainingConfig:
             raise ValueError("player_count_weights must have positive mass.")
         if self.branch_rule.bid_top_k < 0:
             raise ValueError("bid_top_k must be >= 0.")
+        # PlayBranchMode is only a type hint, and an unrecognized mode falls
+        # through the dispatch in _branch_candidates to the plain top-k path --
+        # a typo in a TOML preset would silently train under a different
+        # branching rule than the one it names.
+        for mode in (
+            self.branch_rule.play_mode,
+            *(rule.play_mode for rule in self.branch_rule.stage_rules),
+        ):
+            if mode not in PLAY_BRANCH_MODES:
+                raise ValueError(
+                    f"Unknown play_mode {mode!r}; expected one of "
+                    f"{sorted(PLAY_BRANCH_MODES)}."
+                )
         budget = self.branch_budget
         if budget.branch_rate is not None and not 0.0 <= budget.branch_rate <= 1.0:
             raise ValueError("branch_rate must be in [0, 1].")

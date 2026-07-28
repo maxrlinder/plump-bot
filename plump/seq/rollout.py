@@ -15,6 +15,7 @@ actions, and the control-variate estimator for capped bid sets.
 
 from __future__ import annotations
 
+import bisect
 import math
 import random
 import time
@@ -1301,10 +1302,17 @@ class SeqRolloutCollector:
             ]
             return candidates, weights, len(candidates), inclusion
 
-        if mode == "gumbel_top_k":
+        if mode in ("gumbel_top_k", "gumbel_top_k_plus_random"):
             if top_k < 1:
                 raise ValueError("play_top_k must be >= 1 for gumbel_top_k.")
-            return self._gumbel_candidates(leaf, legal, probs, sampled, top_k)
+            return self._gumbel_candidates(
+                leaf,
+                legal,
+                probs,
+                sampled,
+                top_k,
+                uniform_extra=mode == "gumbel_top_k_plus_random",
+            )
 
         if mode == "all_legal" or len(legal) <= top_k:
             ordered = sorted(legal, key=lambda index: (-probs[index], index))
@@ -1335,6 +1343,7 @@ class SeqRolloutCollector:
         probs: np.ndarray,
         sampled: int,
         top_k: int,
+        uniform_extra: bool = False,
     ) -> tuple[list[int], Optional[list[float]], int, list[float]]:
         """``top_k`` distinct actions: the realized one plus a Gumbel top-k-1.
 
@@ -1350,6 +1359,15 @@ class SeqRolloutCollector:
         weighting ``sample_k`` uses is meaningless -- every candidate appears
         once -- so the correction for over- or under-representation has to come
         from the inclusion probabilities instead.
+
+        ``uniform_extra`` adds one more arm, drawn uniformly from the legal
+        actions this pass did not already take. It gets backup weight zero: it
+        was reached by exploring, not by the policy, so letting it into the
+        weighted average would pull the parent's value toward actions the policy
+        does not play. Its inclusion probability is real, though, and that is
+        the point -- it puts a floor under q for every legal action, which is
+        what keeps the NeuRD 1/q correction bounded on actions the policy has
+        driven to near-zero probability.
         """
 
         rest = [index for index in legal if index != sampled]
@@ -1358,6 +1376,8 @@ class SeqRolloutCollector:
             index: math.log(max(float(probs[index]), 1e-12)) for index in legal
         }
         if want <= 0:
+            # Nothing left to draw without replacement, so there is nothing for
+            # the uniform arm to draw either.
             return [sampled], None, 1, [1.0]
 
         perturbed = {
@@ -1386,14 +1406,14 @@ class SeqRolloutCollector:
         # Gumbel pass over the complement. The second term is a plug-in: it
         # uses the kappa from the complement actually drawn rather than
         # marginalizing over which action was realized.
-        inclusion = [
-            min(
+        def policy_inclusion(index: int) -> float:
+            return min(
                 1.0,
                 float(probs[index])
                 + (1.0 - float(probs[index])) * q_gumbel[index],
             )
-            for index in candidates
-        ]
+
+        inclusion = [policy_inclusion(index) for index in candidates]
         hajek = [
             float(probs[index]) / max(q, 1e-6)
             for index, q in zip(candidates, inclusion)
@@ -1403,6 +1423,26 @@ class SeqRolloutCollector:
             weights = [1.0 / len(candidates)] * len(candidates)
         else:
             weights = [value / total for value in hajek]
+
+        if uniform_extra:
+            extras = [index for index in legal if index not in candidates]
+            if extras:
+                chosen_extra = leaf.rng.choice(extras)
+                # Reached either by the policy pass above or, failing that, by
+                # this uniform draw over whatever the policy pass left. len is
+                # the realized leftover count, matching the plug-in convention
+                # the Gumbel term above already uses.
+                q_policy = policy_inclusion(chosen_extra)
+                extra_q = min(
+                    1.0, q_policy + (1.0 - q_policy) / len(extras)
+                )
+                # Weight zero -- see the docstring. The backup stays the
+                # on-policy estimate over the Gumbel arms alone.
+                position = bisect.bisect_left(candidates, chosen_extra)
+                candidates.insert(position, chosen_extra)
+                inclusion.insert(position, extra_q)
+                weights.insert(position, 0.0)
+
         return candidates, weights, len(candidates), inclusion
 
     @staticmethod

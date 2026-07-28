@@ -157,8 +157,14 @@ def test_belief_gradients_reach_only_the_heads_the_loss_weights():
     assert model.trick_count_head.weight.grad is None
 
 
-def test_belief_labels_cover_every_seat_and_stop_at_the_table_size():
-    """Both beliefs label the observer's own seat; padding seats stay masked."""
+def test_belief_labels_cover_the_right_seats_and_stop_at_the_table_size():
+    """Outcome beliefs label the observer too; suit presence labels opponents only.
+
+    The two seat axes differ on purpose, so this pins both: bid hit and trick
+    count run over all ``num_players`` seats including relative seat 0, while
+    suit presence starts at relative seat 1 -- the observer's own suits are in
+    its prefix verbatim, so a column for them would supervise an identity.
+    """
 
     trainer = make_trainer()
     trees, _ = trainer.collect()
@@ -167,14 +173,16 @@ def test_belief_labels_cover_every_seat_and_stop_at_the_table_size():
         players = group.num_players
         owned = group.owned
 
-        assert (group.bid_hit_targets[:, :players] != IGNORE_LABEL).all()
-        assert (group.bid_hit_targets[:, players:] == IGNORE_LABEL).all()
+        for outcome in (group.bid_hit_targets, group.trick_targets):
+            assert (outcome[:, :players] != IGNORE_LABEL).all()
+            assert (outcome[:, players:] == IGNORE_LABEL).all()
         assert np.isin(group.bid_hit_targets[:, :players], (0, 1)).all()
 
         # Suit presence is per position, so check it only where a leaf owns the
         # position -- unowned rows are never read by the loss.
-        real = group.suit_targets[:, :, :players, :][owned]
-        padding = group.suit_targets[:, :, players:, :][owned]
+        opponents = players - 1
+        real = group.suit_targets[:, :, :opponents, :][owned]
+        padding = group.suit_targets[:, :, opponents:, :][owned]
         assert (real != IGNORE_LABEL).all()
         assert (padding == IGNORE_LABEL).all()
 

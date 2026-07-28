@@ -22,12 +22,21 @@ from plump.seq.model import SeqPlumpModel
 from plump.seq.trainer import SeqTrainer, build_training_groups
 
 
+# Regenerated when suit presence became opponent-only. Note that *every* hash
+# moves on a change like that, including ``trees``, even though collection was
+# not touched: the suit head is one Linear narrower, so it draws less from the
+# init RNG stream, and every parameter constructed after it gets different
+# initial weights. Different weights, different rollout.
+#
+# So a moved hash is not by itself evidence that behaviour changed. To tell the
+# two apart, force the changed module back to its old width and re-hash: if the
+# old value returns, the difference was only the init stream.
 EXPECTED = {
-    "groups": "4bcd6ae49213d9a3743d906e74a10024a51614040a010d583ac3ac8f8f43e796",
-    "summary": "d37875f56712b446caa2a77da516e3b8edb95a5216d457b6824f8118bfa260f5",
-    "trees": "a03e81035014d4387d22197bcefd4c065094a03bc56e64c6af4cb3a0b88fdddd",
-    "update": "5fcc9c7d1c6647a37a11db8e35d0dd34529b10588a45ffe920a20ec87f7a1e44",
-    "weights": "45be7cbe8235876cfec99050861559b9fb43c2e77c4344852f62ecca7b50dcc3",
+    "groups": "93ba644d814244a060c4bed8b19014d5f7afa4118e96c18e2bff0ffd4de45644",
+    "summary": "b693288522648cbab51bfae6803728b4d9acdfe0811f5d690b4f60b48e7e042a",
+    "trees": "433aeca3c04587fb2c1254f225b14955dc413b8f41515d90496f57bb34599d07",
+    "update": "72bb0a1154498a29eceb31d499383f92a8fa10f2c42da0374a11e02ddf96f260",
+    "weights": "7e5ad4a32f4c06e13a4b99b18285291c575d3c15fdd08475bd084b7aa11cff0f",
 }
 
 

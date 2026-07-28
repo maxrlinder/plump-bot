@@ -65,8 +65,11 @@ def play_random_round(num_players, hand_size, seed, observer):
                 (CONFIG.max_players, CONFIG.bid_count),
                 dtype=bool,
             )
+            # Opponents only, so row j is relative seat j + 1. Trick counts do
+            # cover the observer (rel 0) -- what it ends up winning is not
+            # readable off its own hand.
             suit_targets = np.full(
-                (CONFIG.max_players, len(seq_tokens.SUITS)),
+                (CONFIG.belief_opponents, len(seq_tokens.SUITS)),
                 seq_tokens.IGNORE_LABEL,
                 dtype=np.int64,
             )
@@ -77,10 +80,12 @@ def play_random_round(num_players, hand_size, seed, observer):
                     (count_range >= wins)
                     & (count_range <= wins + unresolved)
                 )
+                if rel == 0:
+                    continue
                 held = {
                     card.suit for card in round_state.current_hands[player]
                 }
-                suit_targets[rel] = [
+                suit_targets[rel - 1] = [
                     int(suit in held) for suit in seq_tokens.SUITS
                 ]
             oracles.append(

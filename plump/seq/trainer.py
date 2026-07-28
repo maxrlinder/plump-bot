@@ -285,7 +285,7 @@ def build_training_groups(
             dtype=bool,
         )
         suit_targets = np.full(
-            (batch, length, model_config.max_players, 4), IGNORE_LABEL, np.int64
+            (batch, length, model_config.belief_opponents, 4), IGNORE_LABEL, np.int64
         )
         bid_hit_targets = np.full(
             (batch, model_config.max_players), IGNORE_LABEL, np.int64

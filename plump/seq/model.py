@@ -38,7 +38,7 @@ class SeqOutput:
     card_logits: torch.Tensor  # [B, L, NUM_CARDS]
     value: torch.Tensor        # [B, L]
     trick_logits: Optional[torch.Tensor] = None  # [B, L, max_players, bid_count]
-    suit_logits: Optional[torch.Tensor] = None   # [B, L, max_players, 4]
+    suit_logits: Optional[torch.Tensor] = None   # [B, L, belief_opponents, 4]
     bid_hit_logits: Optional[torch.Tensor] = None  # [B, L, max_players]
 
 
@@ -199,13 +199,17 @@ class SeqPlumpModel(nn.Module):
         self.value_head = nn.Sequential(
             nn.Linear(d, d), nn.GELU(), nn.Linear(d, 1)
         )
+        # Every seat including the observer's own (relative seat 0): how many
+        # tricks the observer itself ends up taking is a genuine prediction
+        # about how the rest of the round plays out, not a readback of its hand.
         self.trick_count_head = nn.Linear(d, config.max_players * config.bid_count)
-        # Both belief heads emit one logit per (relative seat, class) and let the
+        # The belief heads emit one logit per (relative seat, class) and let the
         # loss mask seats a shape does not have. The alternative -- 4 (resp. 1)
         # logits plus a seat embedding, evaluated once per seat -- would turn a
-        # single d x 20 matmul into P passes over [B, L, d] for at most five
+        # single d x 16 matmul into P passes over [B, L, d] for at most five
         # seats that are already distinguishable by their relative index.
-        self.suit_presence_head = nn.Linear(d, config.max_players * 4)
+        # Opponents only: see SeqModelConfig.belief_opponents.
+        self.suit_presence_head = nn.Linear(d, config.belief_opponents * 4)
         # An MLP, where suit presence is linear, because the two ask structurally
         # different questions of the trunk. "Does seat p still hold a spade" is
         # monotone in an accumulated feature, so a linear readout suffices. "Did
@@ -306,7 +310,7 @@ class SeqPlumpModel(nn.Module):
             )
         if "suit" in wanted:
             output.suit_logits = self.suit_presence_head(hidden).view(
-                batch, length, config.max_players, 4
+                batch, length, config.belief_opponents, 4
             )
         if "bid_hit" in wanted:
             output.bid_hit_logits = self.bid_hit_head(hidden)

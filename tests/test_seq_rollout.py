@@ -986,3 +986,74 @@ def test_gumbel_top_k_never_repeats_a_candidate():
                 # so the parent's value stays inside the children's range.
                 assert sum(branch.prior_probs) == pytest.approx(1.0)
     assert seen > 0
+
+
+def test_gumbel_top_k_plus_random_adds_one_zero_weight_explorer():
+    """The uniform arm widens the policy loss without moving the backup.
+
+    It is drawn from what the Gumbel pass left, so it is always a new subtree,
+    never a duplicate. It carries backup weight zero: it was reached by
+    exploring rather than by the policy, so letting it into the weighted average
+    would pull the parent's value toward actions the policy does not play. Its
+    inclusion probability is still real, and that is the point -- it is what
+    puts a floor under q for actions the policy has driven toward zero.
+    """
+
+    from plump.seq.config import BranchRuleConfig, BranchBudgetConfig
+    from plump.seq.trainer import SeqTrainer
+    from plump.seq.model import SeqPlumpModel
+    from plump.seq.config import GameScheduleCell, SeqModelConfig, SeqTrainingConfig
+
+    torch.manual_seed(0)
+    train = SeqTrainingConfig(
+        schedule_cells=(
+            GameScheduleCell(hand_size=6, num_players=4),
+            GameScheduleCell(hand_size=8, num_players=5),
+        ),
+        branch_rule=BranchRuleConfig(
+            play_mode="gumbel_top_k_plus_random", play_top_k=3
+        ),
+        branch_budget=BranchBudgetConfig(branch_rate=1.0),
+    )
+    model = SeqPlumpModel(SeqModelConfig(d_model=64, n_layers=2, n_heads=4, d_ff=128))
+    trees, _ = SeqTrainer(model, train, device="cpu").collect()
+
+    seen = widened = 0
+    for tree in trees:
+        for leaf in tree.leaves:
+            for record in leaf.decisions:
+                branch = record.branch
+                if branch is None or record.phase == NEXT_BID:
+                    continue
+                seen += 1
+                indices = branch.candidate_indices
+                assert len(set(indices)) == len(indices)
+                # One more arm than gumbel_top_k, and never more than that.
+                assert len(indices) <= 4
+                assert len(branch.inclusion_probs) == len(indices)
+                assert all(0.0 < q <= 1.0 for q in branch.inclusion_probs)
+                assert sum(branch.prior_probs) == pytest.approx(1.0)
+                zero_weight = [
+                    weight for weight in branch.prior_probs if weight == 0.0
+                ]
+                # A set that reached 4 can only have done so via the extra arm,
+                # and that arm is the one carrying no backup weight.
+                if len(indices) == 4:
+                    widened += 1
+                    assert len(zero_weight) == 1
+                assert len(zero_weight) <= 1
+    assert seen > 0
+    assert widened > 0, "the uniform arm never fired"
+
+
+def test_unknown_play_mode_is_rejected_rather_than_silently_downgraded():
+    """PlayBranchMode is erased at runtime; a typo must not become top_k."""
+
+    from plump.seq.config import BranchRuleConfig, GameScheduleCell, SeqTrainingConfig
+
+    train = SeqTrainingConfig(
+        schedule_cells=(GameScheduleCell(hand_size=3, num_players=3),),
+        branch_rule=BranchRuleConfig(play_mode="gumbel_topk"),
+    )
+    with pytest.raises(ValueError, match="Unknown play_mode"):
+        train.validate()
