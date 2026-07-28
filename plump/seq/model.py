@@ -245,8 +245,11 @@ class SeqPlumpModel(nn.Module):
         capacity: int,
         dtype: torch.dtype = torch.float32,
         max_len: int | None = None,
+        stacked: bool | None = None,
     ) -> KVCache:
-        return KVCache(self.config, capacity, self.device, dtype, max_len)
+        return KVCache(
+            self.config, capacity, self.device, dtype, max_len, stacked=stacked
+        )
 
     def embed(self, tokens: torch.Tensor, start: int = 0) -> torch.Tensor:
         """Sum slot embeddings + absolute positions for tokens [B, T, WIDTH]."""

@@ -143,7 +143,14 @@ def test_multi_token_append_matches_stepping_one_at_a_time(kv_heads, run):
             )
 
 
-def test_branch_copy_matches_independent_full_forwards():
+@pytest.mark.parametrize("stacked", [False, True])
+def test_branch_copy_matches_independent_full_forwards(stacked):
+    """Both cache layouts must branch-copy identically.
+
+    A stacked pool copies every layer in one indexed op and a per-layer pool
+    does one op per layer, so this is the path where the two could diverge.
+    """
+
     torch.manual_seed(1)
     config = small_config()
     model = SeqPlumpModel(config).eval()
@@ -163,7 +170,8 @@ def test_branch_copy_matches_independent_full_forwards():
         full_parent = model.forward_full(parent_tokens, aux_heads=False)
         full_child = model.forward_full(child_tokens, aux_heads=False)
 
-        cache = model.new_cache(capacity=4)
+        cache = model.new_cache(capacity=4, stacked=stacked)
+        assert cache.stacked is stacked
         parent_slot = torch.tensor(cache.alloc(1), dtype=torch.long)
         model.forward_prefill(parent_tokens[:, :prefix_len], cache, parent_slot)
         for position in range(prefix_len, split):
@@ -226,6 +234,48 @@ def test_aux_heads_are_individually_selectable():
     assert none.suit_logits is none.bid_hit_logits is None
     with pytest.raises(ValueError):
         model.forward_full(tokens, aux_heads={"beliefs"})
+
+
+def test_cache_layout_follows_the_element_limit():
+    """Stack when it fits, split when it does not, decided on max_capacity."""
+
+    from plump.seq.kv import MAX_TENSOR_ELEMENTS, KVCache
+
+    config = small_config()
+    row = config.kv_heads * config.max_seq_len * config.head_dim
+    fits = MAX_TENSOR_ELEMENTS // (config.n_layers * row)
+
+    assert KVCache.fits_stacked(config, fits, config.max_seq_len)
+    assert not KVCache.fits_stacked(config, fits + 1, config.max_seq_len)
+
+    small = KVCache(config, 8, "cpu")
+    assert small.stacked
+
+    # The pool that would overflow never allocates one: the choice is made from
+    # max_capacity, not from the rows it starts with.
+    huge = KVCache(config, 8, "cpu", max_capacity=fits + 1)
+    assert not huge.stacked
+
+    # And a pool whose ceiling is raised after construction drops to per-layer
+    # rather than growing into a tensor that overflows.
+    grown = KVCache(config, 8, "cpu", max_capacity=16)
+    assert grown.stacked
+    grown.max_capacity = fits + 1
+    grown.ensure_capacity(fits + 1)
+    assert not grown.stacked
+    assert grown.capacity >= fits + 1
+
+
+def test_stacked_views_write_through_to_the_shared_base():
+    """self.k[layer] is a view of the stacked tensor, not a copy of it."""
+
+    from plump.seq.kv import KVCache
+
+    config = small_config()
+    cache = KVCache(config, 4, "cpu", stacked=True)
+    cache.k[1][2, :, :3] = 5.0
+    assert (cache._base_k[1, 2, :, :3] == 5.0).all()
+    assert (cache._base_k[0, 2, :, :3] == 0.0).all()
 
 
 def test_cache_alloc_free_bookkeeping():
