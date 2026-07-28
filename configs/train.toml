@@ -9,7 +9,7 @@ d_model = 384
 n_layers = 6
 n_heads = 12
 n_kv_heads = 2
-d_ff = 1024
+d_ff = 1152
 trick_win_token = true
 turn_token = "bid"
 
@@ -24,7 +24,7 @@ reference_rate = 0.5
 branch_rate_player_exponent = 0.0
 exhaustive_until = 7
 bid_top_k = 4
-play_mode = "gumbel_top_k"
+play_mode = "gumbel_top_k_plus_random"
 play_top_k = 3
 learning_rate = 0.0002
 lr_warmup_updates = 100
@@ -36,8 +36,8 @@ neurd_advantage_clip = 10.0
 neurd_inclusion_exponent = 1.0
 value_coef = 0.5
 suit_coef = 0.25
-bid_hit_coef = 0.25
-trick_coef = 0.0
+bid_hit_coef = 0.0
+trick_coef = 0.25
 entropy_coef = 0.0
 league_max_snapshots = 8
 league_min_iteration = 0
@@ -47,7 +47,7 @@ max_cache_rows = 65536
 cache_budget_gb = 10.0
 auto_deals_per_batch = true
 historical_arm = "paired"
-kv_dtype = "fp32"
+kv_dtype = "fp16"
 
 [evaluation]
 every = 100

@@ -12,9 +12,19 @@ L_policy = -sum_a weight(a) * stop_gradient(Q(a) - V) * logit(a)
 
 Candidate inclusion probabilities correct sampled action sets. Per-tree
 weighting prevents large long-game trees from silently dominating the
-objective. The optimizer also trains relative value, suit-presence, and
-bid-hit heads; trick count and entropy are available but disabled in the
-versioned preset.
+objective. The optimizer also trains relative value and two beliefs:
+suit presence over opponents, and final trick count over every seat including
+the observer's own. Bid hit and the entropy bonus are available but disabled in
+the versioned preset.
+
+The beliefs are chosen so each asks something the prefix does not already
+answer. Own suit presence is excluded because the observer's hand and its plays
+are both in its own token stream — supervising it would fit an identity. Own
+trick count is included because the observer's final total depends on how the
+rest of the round resolves. Bid hit is off by default: measured against a
+per-position base rate it is the weakest of the three, and unlike the others it
+needs a hidden layer, since `won == bid` is a bump rather than a threshold and
+a linear readout cannot express two decision boundaries.
 
 The KL guard snapshots model and Adam state before an epoch. An update that
 exceeds the configured full-policy KL cap is rolled back, and a kept-step
