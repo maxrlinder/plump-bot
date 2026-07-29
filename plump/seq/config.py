@@ -742,7 +742,7 @@ class SeqTrainingConfig:
     # learning_rate. Adam's first steps are sign steps (m_hat/sqrt(v_hat) is
     # +/-1 whatever the gradient scale, so gradient clipping cannot soften
     # them): measured on a cold start, one full-LR step moved branch KL to
-    # 0.16 against a 0.005 cap, which under rollback means no update ever
+    # 0.16 against a 0.01 cap, which under rollback means no update ever
     # survives. 0 disables.
     lr_warmup_updates: int = 100
     epochs: int = 1
@@ -773,11 +773,11 @@ class SeqTrainingConfig:
     policy_coef: float = 1.0
     neurd_regret_coef: float = 1.0
     neurd_kl_coef: float = 1.0
-    policy_kl_cap: float = 0.005
+    policy_kl_cap: float = 0.01
     # The mean guard can hide a small tail of badly moved states. The proposed
     # step must satisfy both caps; max KL is reported but deliberately not a
     # hard guard because one nearly-degenerate row is too noisy.
-    policy_kl_p99_cap: float = 0.02
+    policy_kl_p99_cap: float = 0.05
     # Clamp on A(a) = Q(a) - V. Relative rewards reach ~+/-20 at five players
     # and the value baseline is untrained early, so one outlier row could
     # otherwise dominate the normalized weight sum. 0 disables.

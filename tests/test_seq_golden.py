@@ -227,6 +227,13 @@ def test_schema_v6_collection_and_update_match_corrected_golden_hashes():
                         # below still freeze the accepted model update itself.
                         "backtracks",
                         "step_scale",
+                        "loss_value_zero",
+                        "proposed_policy_kl",
+                        "proposed_policy_kl_p95",
+                        "proposed_policy_kl_p99",
+                        "proposed_policy_kl_max",
+                        "proposed_mean_exceeded",
+                        "proposed_p99_exceeded",
                     }
                 }
             ),

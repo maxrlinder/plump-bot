@@ -51,6 +51,13 @@ from .policy import SeqLeague, best_seq_device
 from .rollout import SeqRolloutCollector, SeqTree
 from .tokens import IGNORE_LABEL, build_replay_arrays, build_seat_tokens
 
+_AUXILIARY_HEAD_PREFIXES = (
+    "value_head.",
+    "trick_count_head.",
+    "suit_presence_head.",
+    "bid_hit_head.",
+)
+
 # --------------------------------------------------------------------- #
 # Batch containers                                                       #
 # --------------------------------------------------------------------- #
@@ -98,6 +105,7 @@ class SeqTrainingGroup:
 class SeqUpdateStats:
     loss_policy: float = 0.0
     loss_value: float = 0.0
+    loss_value_zero: float = 0.0
     loss_suit: float = 0.0
     loss_trick: float = 0.0
     loss_bid_hit: float = 0.0
@@ -106,6 +114,15 @@ class SeqUpdateStats:
     policy_kl_p95: float = 0.0
     policy_kl_p99: float = 0.0
     policy_kl_max: float = 0.0
+    # Exact KL of the nominal Adam proposal before any learning-rate
+    # backtracking. These remain distinct from the accepted policy_kl fields
+    # so a small accepted KL cannot hide an initially oversized proposal.
+    proposed_policy_kl: float = 0.0
+    proposed_policy_kl_p95: float = 0.0
+    proposed_policy_kl_p99: float = 0.0
+    proposed_policy_kl_max: float = 0.0
+    proposed_mean_exceeded: bool = False
+    proposed_p99_exceeded: bool = False
     rolled_back: bool = False
     backtracks: int = 0
     step_scale: float = 1.0
@@ -585,8 +602,29 @@ class SeqTrainer:
         self.device = torch.device(device) if device is not None else best_seq_device()
         self.model = model.to(self.device)
         self.train = train_config
+        core_parameters = []
+        auxiliary_parameters = []
+        for name, parameter in self.model.named_parameters():
+            target = (
+                auxiliary_parameters
+                if name.startswith(_AUXILIARY_HEAD_PREFIXES)
+                else core_parameters
+            )
+            target.append(parameter)
         self.optimizer = torch.optim.Adam(
-            self.model.parameters(),
+            (
+                {
+                    "params": core_parameters,
+                    # Shared trunk plus action heads: these parameters can
+                    # move the policy and must follow KL backtracking.
+                    "kl_sensitive": True,
+                },
+                {
+                    "params": auxiliary_parameters,
+                    # Readout-only heads cannot change bid/card logits.
+                    "kl_sensitive": False,
+                },
+            ),
             lr=train_config.learning_rate,
             betas=train_config.adam_betas,
         )
@@ -658,21 +696,37 @@ class SeqTrainer:
                     self.optimizer.load_state_dict(snapshot[1])
                 scale = self.train.kl_backtrack_factor**attempt
                 for group, nominal_lr in zip(self.optimizer.param_groups, nominal_lrs):
-                    group["lr"] = nominal_lr * scale
+                    group["lr"] = (
+                        nominal_lr * scale
+                        if group.get("kl_sensitive", True)
+                        else nominal_lr
+                    )
                 self.optimizer.step()
                 policy_kl, kl_p95, kl_p99, kl_max = self._evaluate_policy_kl(
                     groups,
-                    # A rejected non-final attempt is immediately restored, so
-                    # stop its guard pass as soon as enough above-cap weight
-                    # proves that the final weighted p99 must fail. The last
-                    # attempt always runs in full so a rollback still reports
-                    # its exact diagnostics.
+                    # The nominal proposal is always measured in full for
+                    # durable diagnostics. A rejected intermediate retry is
+                    # immediately restored, so those passes may stop once
+                    # enough above-cap weight proves weighted p99 must fail.
+                    # The last attempt also runs in full so a rollback reports
+                    # exact final diagnostics.
                     reject_p99_above=(
                         self.train.policy_kl_p99_cap
-                        if attempt + 1 < attempts
+                        if attempt > 0 and attempt + 1 < attempts
                         else None
                     ),
                 )
+                if attempt == 0:
+                    stats.proposed_policy_kl = policy_kl
+                    stats.proposed_policy_kl_p95 = kl_p95
+                    stats.proposed_policy_kl_p99 = kl_p99
+                    stats.proposed_policy_kl_max = kl_max
+                    stats.proposed_mean_exceeded = (
+                        policy_kl > self.train.policy_kl_cap
+                    )
+                    stats.proposed_p99_exceeded = (
+                        kl_p99 > self.train.policy_kl_p99_cap
+                    )
                 stats.policy_kl = policy_kl
                 stats.policy_kl_p95 = kl_p95
                 stats.policy_kl_p99 = kl_p99
@@ -751,6 +805,7 @@ class SeqTrainer:
             totals[key] += subtotal
         stats.loss_policy = totals["policy"]
         stats.loss_value = totals["value"]
+        stats.loss_value_zero = totals["value_zero"]
         stats.loss_suit = totals["suit"]
         stats.loss_trick = totals["trick"]
         stats.loss_bid_hit = totals["bid_hit"]
@@ -789,8 +844,18 @@ class SeqTrainer:
             F.smooth_l1_loss(output.value, value_targets, reduction="none")
             * position_weight
         ).sum()
+        target_magnitude = value_targets.abs()
+        value_zero_loss = (
+            torch.where(
+                target_magnitude < 1.0,
+                0.5 * target_magnitude.square(),
+                target_magnitude - 0.5,
+            )
+            * position_weight
+        ).sum()
         loss = loss + train.value_coef * value_loss
         term_parts["value"].append(value_loss.detach())
+        term_parts["value_zero"].append(value_zero_loss.detach())
 
         # Suit presence.
         suit_labeled = None
@@ -1229,7 +1294,12 @@ class SeqTrainer:
             else checkpoint_config
         )
         self.model.load_state_dict(payload["model_state_dict"])
-        self.optimizer.load_state_dict(payload["optimizer_state_dict"])
+        optimizer_state = payload["optimizer_state_dict"]
+        if len(optimizer_state["param_groups"]) == 1 and len(
+            self.optimizer.param_groups
+        ) == 2:
+            optimizer_state = self._split_legacy_optimizer_group(optimizer_state)
+        self.optimizer.load_state_dict(optimizer_state)
         self.iteration = int(payload.get("iteration", 0))
         self.optimizer_steps = int(payload.get("optimizer_steps", 0))
         self.league.snapshots.clear()
@@ -1265,6 +1335,36 @@ class SeqTrainer:
         self.collector._peak_rows = dict(collector_state.get("peak_rows", {}))
         self.collector._rows_per_deal = dict(collector_state.get("rows_per_deal", {}))
         self.collector._seat_cursor = dict(collector_state.get("seat_cursor", {}))
+
+    def _split_legacy_optimizer_group(self, state: dict) -> dict:
+        """Migrate the former flat Adam group without changing its tensors.
+
+        The model registers all policy-sensitive parameters before the four
+        auxiliary heads. Splitting that original ordered parameter list at the
+        current group boundary therefore preserves every serialized Adam state
+        identifier exactly.
+        """
+
+        migrated = copy.deepcopy(state)
+        old_group = migrated["param_groups"][0]
+        old_parameters = list(old_group["params"])
+        templates = self.optimizer.state_dict()["param_groups"]
+        expected = sum(len(group["params"]) for group in templates)
+        if len(old_parameters) != expected:
+            raise ValueError(
+                "Legacy optimizer parameter count does not match the model."
+            )
+        offset = 0
+        groups = []
+        for template in templates:
+            count = len(template["params"])
+            group = copy.deepcopy(old_group)
+            group["params"] = old_parameters[offset : offset + count]
+            group["kl_sensitive"] = template["kl_sensitive"]
+            groups.append(group)
+            offset += count
+        migrated["param_groups"] = groups
+        return migrated
 
     def maybe_snapshot(self, checkpoint_dir: str | Path) -> Optional[str]:
         if self.iteration % self.train.snapshot_every != 0:

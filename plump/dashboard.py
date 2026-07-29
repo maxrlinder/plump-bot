@@ -6,6 +6,7 @@ import csv
 import json
 import math
 import re
+import tomllib
 import uuid
 from pathlib import Path
 
@@ -73,42 +74,21 @@ def render_dashboard(
         right_label="bid accuracy",
         omit_zero=True,
     )
-    trust_region = (
-        ("policy_kl", "mean KL"),
-        ("policy_kl_p99", "p99 KL"),
-        ("policy_kl_max", "max KL"),
+    _trust_region(
+        axes[0, 2],
+        iteration,
+        rows,
+        metrics_path=metrics_path,
+        smooth=min(smooth, 5),
+        include_learning_rate=include_learning_rate,
     )
-    if include_learning_rate:
-        _dual_lines(
-            axes[0, 2],
-            iteration,
-            rows,
-            left=trust_region,
-            right=(("learning_rate", "learning rate"),),
-            smooth=min(smooth, 5),
-            right_smooth=1,
-            title="Policy trust region",
-            left_label="old → new KL",
-            right_label="learning rate",
-            omit_zero=True,
-        )
-    else:
-        _lines(
-            axes[0, 2],
-            iteration,
-            rows,
-            trust_region,
-            smooth=min(smooth, 5),
-            title="Policy trust region",
-            ylabel="old → new KL",
-            omit_zero=True,
-        )
     _lines(
         axes[1, 0],
         iteration,
         rows,
         (
             ("loss_value", "value"),
+            ("loss_value_zero", "value: predict zero"),
             ("loss_suit", "suit presence"),
             ("loss_trick", "trick count"),
             ("loss_bid_hit", "bid-hit belief"),
@@ -438,6 +418,124 @@ def _lines(
         ax.legend(handles=handles, fontsize=8, loc="best")
     else:
         _no_data(ax)
+
+
+def _trust_region(
+    ax,
+    iteration: np.ndarray,
+    rows: list[dict[str, str]],
+    *,
+    metrics_path: Path,
+    smooth: int,
+    include_learning_rate: bool,
+) -> None:
+    """Show the nominal proposal separately from the accepted guarded step."""
+
+    accepted = (
+        ("policy_kl", "accepted mean KL"),
+        ("policy_kl_p99", "accepted p99 KL"),
+        ("policy_kl_max", "accepted max KL"),
+    )
+    handles = _plot_fields(
+        ax,
+        iteration,
+        rows,
+        accepted,
+        smooth=smooth,
+        omit_zero=True,
+    )
+    proposed = _series(rows, "proposed_policy_kl")
+    proposed_signal = _has_signal(proposed, omit_zero=True)
+    if proposed_signal:
+        rendered = _smooth(proposed, smooth)
+        valid = (
+            np.isfinite(iteration)
+            & np.isfinite(rendered)
+            & (rendered > 0)
+        )
+        if valid.any():
+            (line,) = ax.plot(
+                iteration[valid],
+                rendered[valid],
+                linewidth=1.8,
+                linestyle="--",
+                color="C3",
+                label="proposed mean KL (before backtracking)",
+            )
+            handles.append(line)
+
+    if handles:
+        caps = _current_kl_caps(metrics_path)
+        if caps is not None:
+            mean_cap, p99_cap = caps
+            handles.extend(
+                (
+                    ax.axhline(
+                        mean_cap,
+                        linewidth=1.0,
+                        linestyle=":",
+                        color="C0",
+                        alpha=0.8,
+                        label=f"current mean cap ({mean_cap:g})",
+                    ),
+                    ax.axhline(
+                        p99_cap,
+                        linewidth=1.0,
+                        linestyle=":",
+                        color="C1",
+                        alpha=0.8,
+                        label=f"current p99 cap ({p99_cap:g})",
+                    ),
+                )
+            )
+        # Nominal proposals can be orders of magnitude above accepted KL, and
+        # even accepted mean/p99/max differ materially in scale. Keep this
+        # panel logarithmic with or without proposal telemetry.
+        ax.set_yscale("log")
+
+    if include_learning_rate:
+        right_ax = ax.twinx()
+        lr_handles = _plot_fields(
+            right_ax,
+            iteration,
+            rows,
+            (("learning_rate", "learning rate"),),
+            smooth=1,
+            omit_zero=True,
+            color_offset=4,
+        )
+        handles.extend(lr_handles)
+        if lr_handles:
+            right_ax.set_ylabel("learning rate")
+            right_ax.grid(False)
+        else:
+            right_ax.set_yticks([])
+            right_ax.spines["right"].set_visible(False)
+
+    ax.set_title("Policy trust region")
+    if handles:
+        ax.set_ylabel("old → new KL")
+        ax.legend(handles=handles, fontsize=7, loc="best")
+    else:
+        _no_data(ax)
+
+
+def _current_kl_caps(metrics_path: Path) -> tuple[float, float] | None:
+    """Read current run caps for dashboard reference lines, if available."""
+
+    config_path = metrics_path.parent / "config.toml"
+    if not config_path.is_file():
+        return None
+    try:
+        with config_path.open("rb") as handle:
+            training = tomllib.load(handle)["training"]
+        mean_cap = float(training["policy_kl_cap"])
+        p99_cap = float(training["policy_kl_p99_cap"])
+    except (KeyError, OSError, TypeError, ValueError, tomllib.TOMLDecodeError):
+        return None
+    if mean_cap <= 0 or p99_cap <= 0:
+        return None
+    return mean_cap, p99_cap
 
 
 def _dual_lines(

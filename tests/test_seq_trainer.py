@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import dataclasses
 
 import numpy as np
@@ -105,12 +106,14 @@ def test_update_produces_finite_losses_and_changes_weights():
     before = [p.detach().clone() for p in trainer.model.parameters()]
     stats = trainer.update(trees)
     assert np.isfinite(stats.loss_value)
+    assert np.isfinite(stats.loss_value_zero)
     assert np.isfinite(stats.loss_trick)
     assert np.isfinite(stats.loss_suit)
     assert np.isfinite(stats.loss_bid_hit)
     assert stats.loss_trick > 0.0
     assert stats.loss_suit > 0.0
     assert stats.loss_bid_hit > 0.0
+    assert stats.loss_value_zero > 0.0
     assert np.isfinite(stats.policy_kl)
     assert stats.policy_rows > 0
     assert stats.policy_rows == stats.branched_rows + stats.unbranched_rows
@@ -319,7 +322,7 @@ def test_unknown_policy_objective_is_rejected():
         make_trainer(policy_objective="ppo")
 
 
-def test_kl_backtracking_accepts_a_smaller_adam_step():
+def test_kl_backtracking_accepts_a_smaller_adam_step(monkeypatch):
     trainer = make_trainer(
         policy_objective="sampled_mirror",
         learning_rate=0.1,
@@ -334,13 +337,30 @@ def test_kl_backtracking_accepts_a_smaller_adam_step():
         bid_hit_coef=0.0,
     )
     trees, _ = trainer.collect()
+    attempted_lrs = []
+    optimizer_step = trainer.optimizer.step
+
+    def record_lrs(*args, **kwargs):
+        attempted_lrs.append(
+            tuple(float(group["lr"]) for group in trainer.optimizer.param_groups)
+        )
+        return optimizer_step(*args, **kwargs)
+
+    monkeypatch.setattr(trainer.optimizer, "step", record_lrs)
     stats = trainer.update(trees)
     assert not stats.rolled_back
     assert stats.backtracks > 0
     assert 0.0 < stats.step_scale < 1.0
+    assert stats.proposed_policy_kl >= stats.policy_kl
+    assert stats.proposed_policy_kl_p99 >= stats.policy_kl_p99
+    assert stats.proposed_mean_exceeded or stats.proposed_p99_exceeded
     assert stats.policy_kl <= trainer.train.policy_kl_cap
     assert stats.policy_kl_p99 <= trainer.train.policy_kl_p99_cap
     assert trainer.optimizer_steps == 1
+    assert attempted_lrs[-1][0] == pytest.approx(
+        trainer.train.learning_rate * stats.step_scale
+    )
+    assert attempted_lrs[-1][1] == pytest.approx(trainer.train.learning_rate)
 
 
 def test_proven_early_p99_rejection_matches_full_backtracking(monkeypatch):
@@ -429,6 +449,37 @@ def test_optimizer_steps_survive_a_checkpoint_roundtrip(tmp_path):
     fresh = make_trainer(lr_warmup_updates=10)
     fresh.load_checkpoint(path)
     assert fresh.optimizer_steps == steps
+
+
+def test_legacy_flat_optimizer_group_migrates_without_losing_state(tmp_path):
+    trainer = make_trainer(lr_warmup_updates=0)
+    trees, _ = trainer.collect()
+    trainer.update(trees)
+    current = tmp_path / "current.pt"
+    trainer.save_checkpoint(current)
+    payload = torch.load(current, map_location="cpu", weights_only=False)
+
+    optimizer = payload["optimizer_state_dict"]
+    assert len(optimizer["param_groups"]) == 2
+    legacy_group = copy.deepcopy(optimizer["param_groups"][0])
+    legacy_group["params"] = [
+        parameter
+        for group in optimizer["param_groups"]
+        for parameter in group["params"]
+    ]
+    legacy_group.pop("kl_sensitive", None)
+    optimizer["param_groups"] = [legacy_group]
+    legacy = tmp_path / "legacy.pt"
+    torch.save(payload, legacy)
+
+    fresh = make_trainer(lr_warmup_updates=0)
+    fresh.load_checkpoint(legacy)
+
+    assert [group["kl_sensitive"] for group in fresh.optimizer.param_groups] == [
+        True,
+        False,
+    ]
+    assert len(fresh.optimizer.state) == len(trainer.optimizer.state)
 
 
 def test_inclusion_exponent_changes_the_gradient_it_does_not_break_it():

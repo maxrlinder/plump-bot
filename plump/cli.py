@@ -61,6 +61,7 @@ METRIC_COLUMNS = (
     "spine_entropy",
     "loss_policy",
     "loss_value",
+    "loss_value_zero",
     "loss_suit",
     "loss_trick",
     "loss_bid_hit",
@@ -69,6 +70,12 @@ METRIC_COLUMNS = (
     "policy_kl_p95",
     "policy_kl_p99",
     "policy_kl_max",
+    "proposed_policy_kl",
+    "proposed_policy_kl_p95",
+    "proposed_policy_kl_p99",
+    "proposed_policy_kl_max",
+    "proposed_mean_exceeded",
+    "proposed_p99_exceeded",
     "backtracks",
     "step_scale",
     "rolled_back",
@@ -586,6 +593,7 @@ def _metric_row(
         "spine_entropy": summary.spine_entropy,
         "loss_policy": stats.loss_policy,
         "loss_value": stats.loss_value,
+        "loss_value_zero": stats.loss_value_zero,
         "loss_suit": stats.loss_suit,
         "loss_trick": stats.loss_trick,
         "loss_bid_hit": stats.loss_bid_hit,
@@ -594,6 +602,12 @@ def _metric_row(
         "policy_kl_p95": stats.policy_kl_p95,
         "policy_kl_p99": stats.policy_kl_p99,
         "policy_kl_max": stats.policy_kl_max,
+        "proposed_policy_kl": stats.proposed_policy_kl,
+        "proposed_policy_kl_p95": stats.proposed_policy_kl_p95,
+        "proposed_policy_kl_p99": stats.proposed_policy_kl_p99,
+        "proposed_policy_kl_max": stats.proposed_policy_kl_max,
+        "proposed_mean_exceeded": int(stats.proposed_mean_exceeded),
+        "proposed_p99_exceeded": int(stats.proposed_p99_exceeded),
         "backtracks": stats.backtracks,
         "step_scale": stats.step_scale,
         "rolled_back": int(stats.rolled_back),
@@ -623,22 +637,29 @@ def _ensure_metrics_header(path: Path) -> None:
             header = tuple(reader.fieldnames or ())
             rows = list(reader)
         if header != METRIC_COLUMNS:
-            expected_legacy = tuple(
-                column
-                for column in METRIC_COLUMNS
-                if column
-                not in {
-                    "bid_hit_focal",
-                    "bid_hit_non_focal",
-                    "reward_focal",
-                    "reward_non_focal",
-                }
+            upgradable = {
+                "bid_hit_focal",
+                "bid_hit_non_focal",
+                "reward_focal",
+                "reward_non_focal",
+                "loss_value_zero",
+                "proposed_policy_kl",
+                "proposed_policy_kl_p95",
+                "proposed_policy_kl_p99",
+                "proposed_policy_kl_max",
+                "proposed_mean_exceeded",
+                "proposed_p99_exceeded",
+            }
+            missing = set(METRIC_COLUMNS) - set(header)
+            expected_existing = tuple(
+                column for column in METRIC_COLUMNS if column in header
             )
-            if header != expected_legacy:
+            if header != expected_existing or not missing <= upgradable:
                 raise ValueError("Existing metrics.csv has an incompatible header.")
             # Reporting-schema upgrade only. Historical rows did not retain
-            # enough information to reconstruct the focal split, so leave the
-            # new cells blank and begin their series after resume.
+            # enough information to reconstruct added outcome or proposal
+            # diagnostics, so leave those cells blank and start each series
+            # after resume.
             temporary = path.with_name(f".{path.name}.upgrade.tmp")
             try:
                 with temporary.open("w", newline="") as handle:

@@ -54,13 +54,20 @@ def _train_args(name: str) -> list[str]:
     return args
 
 
-def test_legacy_metrics_header_is_upgraded_for_outcome_split(tmp_path):
+def test_legacy_metrics_header_is_upgraded_for_reporting_fields(tmp_path):
     metrics = tmp_path / "metrics.csv"
     new_fields = {
         "bid_hit_focal",
         "bid_hit_non_focal",
         "reward_focal",
         "reward_non_focal",
+        "loss_value_zero",
+        "proposed_policy_kl",
+        "proposed_policy_kl_p95",
+        "proposed_policy_kl_p99",
+        "proposed_policy_kl_max",
+        "proposed_mean_exceeded",
+        "proposed_p99_exceeded",
     }
     legacy = tuple(column for column in METRIC_COLUMNS if column not in new_fields)
     with metrics.open("w", newline="") as handle:

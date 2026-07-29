@@ -39,9 +39,29 @@ and descendant policy losses are weighted by that reach. Cache blocking
 changes estimator variance, not the expected objective.
 
 After Adam proposes an update, KL is measured on every policy row. Both
-weighted mean and weighted p99 caps must pass; p95, p99, and max are reported.
-Failed proposals restore the exact model and optimizer state and retry at a
-geometrically smaller learning rate.
+weighted mean and weighted p99 caps must pass; the current preset uses `0.01`
+and `0.05`, respectively. Failed proposals restore the exact model and
+optimizer state and retry at a geometrically smaller learning rate.
+
+The first, nominal Adam proposal is always evaluated over the complete policy
+row set before any reduction. Metrics retain its weighted mean, p95, p99, and
+max KL plus booleans for which caps it exceeded. The existing `policy_kl*`
+fields describe the final accepted proposal, not the rejected one. Intermediate
+retries may still use the proof-only p99 early exit because they are immediately
+discarded and are not used as the durable pre-backtrack diagnostic.
+
+KL percentiles use the same objective weights as the loss. With equal
+per-tree weighting and negative branch-depth weighting, a shallow decision can
+carry at least one percent of total weight; weighted p99 can therefore equal
+the maximum. This is intentional in the current implementation and should be
+remembered when interpreting or changing the tail cap.
+
+Backtracking scales the shared trunk and bid/card action heads because those
+parameters can move the policy. It does not scale the value, suit-presence,
+trick-count, or bid-hit readout heads: those heads only consume the shared
+representation and cannot change policy KL. Their Adam moments, clipping, and
+nominal learning-rate schedule are otherwise unchanged. Older one-group
+checkpoints are split losslessly at load time.
 
 ### Sampled mirror target
 
@@ -55,12 +75,22 @@ unbiased full-information mirror-descent update.
 For both objectives, per-tree weighting prevents large long-game trees from
 silently dominating. A negative branch-depth exponent keeps bidding and early
 play meaningful despite the multiplicity of deep branch nodes. The preset uses
-five distinct bid strata and four distinct play strata. Smaller legal sets are
-fully enumerated.
+`(1 + branch_depth)^-0.5`, a moderate early-decision preference, plus five
+distinct bid strata and four distinct play strata. Smaller legal sets are fully
+enumerated. The depth factors are normalized within each tree, so this changes
+where its policy weight lands without changing that tree's total weight.
 
 The optimizer also trains relative value plus suit-presence and final
 trick-count auxiliaries. Both auxiliaries use coefficient `0.05`; value remains
 `0.5`. Bid hit and entropy remain disabled.
+
+Counterfactual branches do not turn these into off-policy labels. Descendant
+positions carry their represented old-policy reach; the reaches sum to the
+ordinary live-policy state distribution in expectation. Prefix values use the
+recursive unbiased branch backup, while outcome beliefs use the originally
+sampled on-policy continuation. Consequently, large value loss can reflect
+reward scale, partial observability, and Monte Carlo variance rather than an
+unweighted exploratory policy.
 
 The beliefs are chosen so each asks something the prefix does not already
 answer. Own suit presence is excluded because the observer's hand and its plays

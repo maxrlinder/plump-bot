@@ -29,6 +29,10 @@ def test_dashboard_renders_sparse_partial_and_resumed_rows(tmp_path):
                 "reward_non_focal",
                 "bid_hit_focal",
                 "bid_hit_non_focal",
+                "policy_kl",
+                "policy_kl_p99",
+                "policy_kl_max",
+                "proposed_policy_kl",
                 "rolled_back",
             ),
         )
@@ -43,6 +47,10 @@ def test_dashboard_renders_sparse_partial_and_resumed_rows(tmp_path):
                 "reward_non_focal": 0.1,
                 "bid_hit_focal": 0.25,
                 "bid_hit_non_focal": 0.4,
+                "policy_kl": 0.001,
+                "policy_kl_p99": 0.004,
+                "policy_kl_max": 0.006,
+                "proposed_policy_kl": 0.08,
                 "rolled_back": 0,
             }
         )
@@ -56,6 +64,10 @@ def test_dashboard_renders_sparse_partial_and_resumed_rows(tmp_path):
                 "reward_non_focal": -0.15,
                 "bid_hit_focal": 0.5,
                 "bid_hit_non_focal": 0.45,
+                "policy_kl": 0.002,
+                "policy_kl_p99": 0.007,
+                "policy_kl_max": 0.009,
+                "proposed_policy_kl": 0.12,
                 "rolled_back": 1,
             }
         )

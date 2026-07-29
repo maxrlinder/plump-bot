@@ -50,7 +50,7 @@ def test_run_creation_records_config_and_rejects_field_changes(tmp_path):
     assert CHECKOUT_CONFIG_PATH.read_bytes() == PACKAGED_CONFIG_PATH.read_bytes()
     resolved = load_training_config()
     assert resolved.training.policy_objective == "neurd"
-    assert resolved.training.branch_depth_exponent == -1.0
+    assert resolved.training.branch_depth_exponent == -0.5
     assert resolved.training.kl_backtrack_attempts == 8
     assert resolved.training.branch_rule.bid_rule() == (
         "stratified",

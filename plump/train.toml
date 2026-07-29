@@ -39,8 +39,8 @@ epochs = 1
 microbatch_positions = 16384
 policy_objective = "neurd"
 policy_coef = 1.0
-policy_kl_cap = 0.005
-policy_kl_p99_cap = 0.02
+policy_kl_cap = 0.01
+policy_kl_p99_cap = 0.05
 neurd_regret_coef = 1.0
 neurd_kl_coef = 1.0
 neurd_advantage_clip = 0.0
@@ -56,7 +56,7 @@ kl_backtrack_attempts = 8
 kl_backtrack_factor = 0.5
 # Counterfactual nodes multiply with depth. Pull policy weight toward the root
 # so bidding and early plays are not drowned out by thousands of deep leaves.
-branch_depth_exponent = -1.0
+branch_depth_exponent = -0.5
 value_coef = 0.5
 suit_coef = 0.05
 bid_hit_coef = 0.0
