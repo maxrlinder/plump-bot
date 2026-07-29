@@ -27,4 +27,5 @@ uv run python tools/benchmarks/benchmark_stratified_shape_grid.py \
 
 Matched reports classify doubling the batch as sublinear below `1.9x`
 forward-row throughput, linear from `1.9x` through `2.1x`, and superlinear
-above `2.1x`.
+above `2.1x`. `--branch-rate-override` changes placement probability for the
+benchmark only and never rewrites the training configuration.

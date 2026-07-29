@@ -50,6 +50,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--timeout", type=float, default=900.0)
     parser.add_argument("--output", type=Path, default=None)
     parser.add_argument(
+        "--branch-rate-override",
+        type=float,
+        default=None,
+        help="benchmark-only branch-placement rate for every selected shape",
+    )
+    parser.add_argument(
         "--matched-two-deal",
         action="store_true",
         help=(
@@ -214,8 +220,12 @@ def run_one_case(args: argparse.Namespace) -> dict[str, Any]:
     checkpoint = run.resolve_checkpoint(args.checkpoint)
     resolved = load_training_config(args.config)
     rate = resolved.training.branch_budget.rate_for_shape(players, hand_size)
+    if args.branch_rate_override is not None:
+        rate = args.branch_rate_override
     if rate is None:
         raise RuntimeError(f"No branch rate for {players}p/{hand_size}c.")
+    if not 0.0 <= rate <= 1.0:
+        raise ValueError("--branch-rate-override must be in [0, 1].")
 
     device = torch.device(args.device) if args.device else best_seq_device()
     seed = 91_000 + args.repeat * 1_000 + players * 100 + hand_size
@@ -455,6 +465,10 @@ def _write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
 def run_grid(args: argparse.Namespace) -> None:
     if args.repeats < 1:
         raise ValueError("--repeats must be >= 1.")
+    if args.branch_rate_override is not None and not (
+        0.0 <= args.branch_rate_override <= 1.0
+    ):
+        raise ValueError("--branch-rate-override must be in [0, 1].")
     run = RunDirectory(args.run)
     checkpoint = run.resolve_checkpoint(args.checkpoint)
     output = args.output
@@ -481,6 +495,7 @@ def run_grid(args: argparse.Namespace) -> None:
         "players": list(players),
         "hand_sizes": list(hand_sizes),
         "matched_two_deal": args.matched_two_deal,
+        "branch_rate_override": args.branch_rate_override,
         "started_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }
 
@@ -513,6 +528,13 @@ def run_grid(args: argparse.Namespace) -> None:
                     ]
                     if args.device:
                         command.extend(("--device", args.device))
+                    if args.branch_rate_override is not None:
+                        command.extend(
+                            (
+                                "--branch-rate-override",
+                                str(args.branch_rate_override),
+                            )
+                        )
                     started = time.perf_counter()
                     try:
                         process = subprocess.run(
