@@ -19,17 +19,24 @@ With exponent one and no clip/cap, every component has expectation
 variate rather than a fabricated zero. This is the sampled NeuRD update, not a
 policy-gradient or self-normalized mirror approximation.
 
-The collector uses iid old-policy action draws. Duplicate actions collapse
-into empirical multiplicities, so the recursive value backup is the ordinary
-unbiased Monte Carlo mean. One independent legal-uniform draw provides
-exploration and a floor on `q(a)`; when it was not also policy-sampled it has
-zero parent-backup and downstream reach weight.
+The collector uses fixed-width stratified old-policy sampling. If the legal
+set fits the branch budget it is fully enumerated. Otherwise legal actions are
+partitioned into disjoint, policy-mass-balanced strata and one action is drawn
+from each stratum under `pi_old(. | stratum)`. For stratum mass `M_g`:
 
-Every branch child carries its empirical old-policy reach. Value, belief, and
-descendant policy losses are weighted by that reach, so uniform-only
-descendants can estimate their parent's counterfactual action value without
-changing the on-policy state distribution. Cache blocking changes estimator
-variance, not the expected objective.
+```text
+backup/reach weight = M_g
+q(a) = pi_old(a) / M_g
+V_hat = sum_g M_g Q(a_g)
+```
+
+The representatives are exactly distinct, their weights sum to one, and the
+backup and represented descendant distribution are unbiased under the old
+policy. Full enumeration has `q(a)=1` and weight `pi_old(a)`.
+
+Every branch child carries its represented old-policy reach. Value, belief,
+and descendant policy losses are weighted by that reach. Cache blocking
+changes estimator variance, not the expected objective.
 
 After Adam proposes an update, KL is measured on every policy row. Both
 weighted mean and weighted p99 caps must pass; p95, p99, and max are reported.
@@ -47,9 +54,9 @@ unbiased full-information mirror-descent update.
 
 For both objectives, per-tree weighting prevents large long-game trees from
 silently dominating. A negative branch-depth exponent keeps bidding and early
-play meaningful despite the multiplicity of deep branch nodes. The preset
-uses four iid policy bid draws and three iid policy play draws, plus one
-independent uniform draw at each expanded decision.
+play meaningful despite the multiplicity of deep branch nodes. The preset uses
+five distinct bid strata and four distinct play strata. Smaller legal sets are
+fully enumerated.
 
 The optimizer also trains relative value plus suit-presence and final
 trick-count auxiliaries. Both auxiliaries use coefficient `0.05`; value remains
@@ -114,5 +121,5 @@ run and must match on resume.
 
 Measurement-only tools live in `tools/benchmarks/`. They cover collect/update
 throughput, KV-cache scaling, schedule calibration, per-shape cost, branch
-rate grids, and rollout sweeps. They do not write into a training run unless
-given an explicit output.
+rate grids, rollout sweeps, and isolated solo-versus-paired shape grids.
+Generated results are explicitly scoped to a selected run or output path.

@@ -222,6 +222,11 @@ class SeqModelConfig:
 
 PlayBranchMode = Literal[
     "all_legal",
+    # Exactly k distinct representatives from disjoint policy-mass strata.
+    # One action is drawn from each stratum under pi(. | stratum), its backup
+    # and reach weight is the stratum mass, and q(a) = pi(a) / mass(stratum).
+    # When there are at most k legal actions this becomes full enumeration.
+    "stratified",
     # k i.i.d. draws from the masked policy (the realized action is the first
     # draw). Duplicates collapse into multiplicity weights, so the backup is
     # the unbiased Monte-Carlo value estimate rather than a top-k truncation.
@@ -245,6 +250,7 @@ BidBranchMode = Literal[
     # noticing the bid has its own copy of the numbers.
     "same_as_play",
     "all_legal",
+    "stratified",
     "sample_k",
     "sample_k_plus_uniform",
 ]
@@ -291,19 +297,16 @@ class ShapeBranchRate:
 class BranchRuleConfig:
     """Pluggable branching restrictions; tunable without code changes."""
 
-    # Bidding. ``bid_top_k`` is the number of iid old-policy action draws.
-    # Duplicates collapse into empirical multiplicities. ``plus_uniform`` adds
-    # one independent uniform draw with zero value-backup/reach weight. Both
-    # are ignored under "same_as_play", which takes the play rule's mode and k.
+    # Under ``stratified``, top_k is the number of distinct policy-mass strata
+    # and therefore the exact candidate count whenever at least that many
+    # actions are legal. Under sample_k it is the number of iid old-policy
+    # draws; duplicates collapse into empirical multiplicities.
     #
-    # Sharing the play rule is usually right. The bid is the root of the tree
-    # and the only decision expanded unconditionally, so a truncation there is
-    # not one missed counterfactual -- it is a whole subtree of the round that
-    # never gets played out. The uniform draw keeps every legal bid observable
-    # with known nonzero inclusion probability.
-    bid_mode: BidBranchMode = "sample_k_plus_uniform"
-    bid_top_k: int = 4
-    play_mode: PlayBranchMode = "all_legal"
+    # The bid is the root and is expanded unconditionally. Give it one more
+    # stratum than play so the whole-round choice receives broader coverage.
+    bid_mode: BidBranchMode = "stratified"
+    bid_top_k: int = 5
+    play_mode: PlayBranchMode = "stratified"
     play_top_k: int = 4
     stage_rules: tuple[StageBranchRule, ...] = ()
 
@@ -938,7 +941,11 @@ class SeqTrainingConfig:
                 f"Unknown bid_mode {self.branch_rule.bid_mode!r}; expected one "
                 f"of {sorted(BID_BRANCH_MODES)}."
             )
-        if self.branch_rule.bid_mode in ("sample_k", "sample_k_plus_uniform"):
+        if self.branch_rule.bid_mode in (
+            "stratified",
+            "sample_k",
+            "sample_k_plus_uniform",
+        ):
             if self.branch_rule.bid_top_k < 1:
                 raise ValueError(
                     f"bid_top_k must be >= 1 for bid_mode "

@@ -26,13 +26,13 @@ games_per_cell = 0
 reference_rate = 0.5
 branch_rate_player_exponent = 0.0
 exhaustive_until = 7
-# Bidding is the root of every counterfactual tree: take four iid policy draws
-# plus one independent uniform draw. Duplicates collapse with multiplicity, so
-# both the backup and inclusion probabilities remain exact.
-bid_mode = "sample_k_plus_uniform"
-bid_top_k = 4
-play_mode = "sample_k_plus_uniform"
-play_top_k = 3
+# Bidding uses five distinct policy-mass strata and play uses four. When fewer
+# actions are legal they are all evaluated. Otherwise one conditional-policy
+# representative per stratum gives exact inclusion, backup, and reach weights.
+bid_mode = "stratified"
+bid_top_k = 5
+play_mode = "stratified"
+play_top_k = 4
 learning_rate = 0.0002
 lr_warmup_updates = 100
 epochs = 1

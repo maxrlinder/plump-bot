@@ -1077,6 +1077,143 @@ def test_sample_k_reports_true_inclusion_and_unbiased_value_backup():
     assert zero_weight_explorers > 0
 
 
+def test_stratified_sampling_is_distinct_and_unbiased():
+    """Pin fixed width, q(a), V_pi, and represented policy reach."""
+
+    collector = make_collector(cells=[GameScheduleCell(hand_size=3, num_players=3)])
+    probs = np.asarray(
+        [0.42, 0.20, 0.12, 0.09, 0.07, 0.05, 0.03, 0.02],
+        dtype=np.float64,
+    )
+    values = np.asarray([-3.0, -1.0, 0.5, 1.0, 2.0, 4.0, 7.0, 10.0])
+    legal = list(range(len(probs)))
+    count = 4
+    groups = collector._policy_mass_strata(legal, probs, count)
+    mass_by_action = {
+        action: float(probs[group].sum()) for group in groups for action in group
+    }
+    expected_q = np.asarray(
+        [probs[action] / mass_by_action[action] for action in legal]
+    )
+
+    draws = 50_000
+    rng = random.Random(3819)
+    leaf = SimpleNamespace(rng=rng)
+    included = np.zeros(len(probs))
+    represented_reach = np.zeros(len(probs))
+    backups = 0.0
+    for _ in range(draws):
+        sampled = collector._draw(probs, rng)
+        candidates, weights, _, reported = collector._candidates_for_mode(
+            leaf,
+            legal,
+            probs,
+            sampled,
+            "stratified",
+            count,
+        )
+        assert len(candidates) == count
+        assert len(set(candidates)) == count
+        assert sampled in candidates
+        assert weights is not None
+        assert sum(weights) == pytest.approx(1.0)
+        backups += sum(
+            weight * values[action] for action, weight in zip(candidates, weights)
+        )
+        for action, weight, q in zip(candidates, weights, reported):
+            assert weight == pytest.approx(mass_by_action[action])
+            assert q == pytest.approx(expected_q[action])
+            included[action] += 1
+            represented_reach[action] += weight
+
+    np.testing.assert_allclose(included / draws, expected_q, atol=0.006)
+    np.testing.assert_allclose(represented_reach / draws, probs, atol=0.006)
+    assert backups / draws == pytest.approx(float(probs @ values), abs=0.025)
+
+
+def test_stratified_sampling_enumerates_every_action_within_budget():
+    collector = make_collector(cells=[GameScheduleCell(hand_size=3, num_players=3)])
+    probs = np.asarray([0.7, 0.2, 0.1], dtype=np.float64)
+    leaf = SimpleNamespace(rng=random.Random(7))
+
+    candidates, weights, deterministic_count, inclusion = (
+        collector._candidates_for_mode(
+            leaf,
+            list(range(len(probs))),
+            probs,
+            sampled=0,
+            mode="stratified",
+            top_k=4,
+        )
+    )
+
+    assert candidates == [0, 1, 2]
+    assert weights is None
+    assert deterministic_count == 3
+    assert inclusion == [1.0, 1.0, 1.0]
+
+
+def test_stratified_rollout_enforces_configured_distinct_width():
+    """The configured 5-bid/4-play rule survives full tree collection."""
+
+    collector = make_collector(
+        cells=[GameScheduleCell(hand_size=5, num_players=3)],
+        bid_mode="stratified",
+        bid_top_k=5,
+        play_mode="stratified",
+        play_top_k=4,
+    )
+    trees = collect_trees(collector, seed=419)
+    checked_bid = checked_play = checked_stratum = 0
+
+    for tree in trees:
+        for leaf in tree.leaves:
+            for record in leaf.decisions:
+                branch = record.branch
+                if branch is None:
+                    continue
+                legal = np.flatnonzero(record.old_probs > 0).tolist()
+                budget = 5 if record.phase == NEXT_BID else 4
+                assert len(branch.candidate_indices) == min(len(legal), budget)
+                assert len(set(branch.candidate_indices)) == len(
+                    branch.candidate_indices
+                )
+                assert branch.sampled_index in branch.candidate_indices
+                assert sum(branch.prior_probs) == pytest.approx(1.0)
+                assert branch.candidate_mass == pytest.approx(1.0)
+
+                if len(legal) <= budget:
+                    assert branch.deterministic_count == len(legal)
+                    assert branch.inclusion_probs == (1.0,) * len(legal)
+                else:
+                    checked_stratum += 1
+                    assert branch.deterministic_count == 0
+                    groups = collector._policy_mass_strata(
+                        legal, record.old_probs, budget
+                    )
+                    group_by_action = {
+                        action: group for group in groups for action in group
+                    }
+                    for action, weight, q in zip(
+                        branch.candidate_indices,
+                        branch.prior_probs,
+                        branch.inclusion_probs,
+                    ):
+                        group = group_by_action[action]
+                        mass = float(record.old_probs[group].sum())
+                        assert weight == pytest.approx(mass)
+                        assert q == pytest.approx(record.old_probs[action] / mass)
+
+                if record.phase == NEXT_BID:
+                    checked_bid += 1
+                else:
+                    checked_play += 1
+
+    assert checked_bid > 0
+    assert checked_play > 0
+    assert checked_stratum > 0
+
+
 def test_same_as_play_gives_bids_the_identical_rule_not_a_similar_one():
     """The bid must be selected by the play rule itself.
 

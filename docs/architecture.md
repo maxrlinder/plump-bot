@@ -51,25 +51,25 @@ are copied when a focal decision branches, so siblings only decode their new
 suffixes. Opponent turns and self/historical arms are batched by model.
 
 Branch placement and candidate selection are controlled by the training
-configuration. The active preset branches bids to the top four candidates,
-fully branches games of seven cards or fewer, and tapers the rate for longer
-games under a fixed cache-row budget.
+configuration. The active preset branches every eligible decision through
+seven cards and tapers geometrically to rate `0.5` at ten cards under a fixed
+cache-row budget.
 
-Play candidates come from `sample_k_plus_uniform`: three iid old-policy draws
-plus one independent legal-uniform draw. Duplicate actions collapse into
-empirical multiplicities. The policy draws therefore give an ordinary unbiased
-Monte Carlo value backup, while the uniform-only arm has zero backup and
-downstream reach weight. For legal action `a`, its exact inclusion probability
-is:
+Bids use five distinct policy-mass strata and plays use four. If no more than
+that many actions are legal, every action is evaluated. Otherwise actions are
+partitioned deterministically into disjoint, mass-balanced strata and one
+representative is sampled from each under the old policy conditioned on its
+stratum. For stratum `G` with mass `M_G`:
 
 ```text
-q(a) = 1 - (1 - pi_old(a))^k * (1 - 1 / |legal|)
+P(a selected) = pi_old(a) / M_G
+backup/reach weight = M_G
 ```
 
-This closed form is used by the control-variate NeuRD estimator. Drawing the
-uniform arm independently means it can duplicate a policy draw; that small
-efficiency cost is what keeps both the sampling design and its correction
-exact.
+The candidate count is exactly the configured width, weights sum to one, the
+already sampled on-policy spine is retained as its stratum's representative,
+and both the recursive value backup and represented descendant distribution
+are unbiased.
 
 ## Heads
 

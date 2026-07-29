@@ -5,10 +5,10 @@ enabled, always use independent deals. Every leaf advances one public event per
 wave, so all cache slots share a single position counter. Branching a leaf
 clones its env and copies every seat's KV prefix.
 
-Terminal rewards are backed up through the counterfactual tree with empirical
-weights from iid old-policy action samples. The resulting Monte Carlo backup is
-an unbiased estimate of ``V_pi_old``; independent uniform explorer arms have
-zero backup and downstream training reach.
+Terminal rewards are backed up through the counterfactual tree with disjoint
+policy-mass strata. One conditional-policy representative per stratum carries
+that stratum's mass as its backup and downstream reach weight, giving fixed
+distinct candidate width and an unbiased estimate of ``V_pi_old``.
 """
 
 from __future__ import annotations
@@ -923,7 +923,7 @@ class SeqRolloutCollector:
         leaf.tree.decision_total += 1
         self.stats.decisions += 1
 
-        candidates, mc_weights, deterministic_count, inclusion = (
+        candidates, backup_weights, deterministic_count, inclusion = (
             self._branch_candidates(leaf, phase, legal, probs, sampled)
         )
         allow_branch = True
@@ -958,10 +958,10 @@ class SeqRolloutCollector:
             return
 
         raw = {index: float(probs[index]) for index in candidates}
-        if mc_weights is not None:
-            # Empirical frequencies of iid old-policy draws. They sum to one,
-            # so the backup is an ordinary unbiased Monte Carlo mean.
-            priors = tuple(mc_weights)
+        if backup_weights is not None:
+            # Stochastic rules supply their exact realized estimator weights:
+            # empirical frequencies for iid draws or policy masses for strata.
+            priors = tuple(backup_weights)
             mass = 1.0
         else:
             mass = float(sum(raw.values()))
@@ -1089,7 +1089,7 @@ class SeqRolloutCollector:
         first_pass = tree.split_bid_record is None
 
         if first_pass:
-            candidates, mc_weights, deterministic_count, inclusion = (
+            candidates, backup_weights, deterministic_count, inclusion = (
                 self._branch_candidates(leaf, Phase.BIDDING, legal, probs, sampled)
             )
             if len(candidates) <= 1:
@@ -1115,8 +1115,8 @@ class SeqRolloutCollector:
                     self._split_plan = (group_index, group_total)
                 return
             raw = {index: float(probs[index]) for index in candidates}
-            if mc_weights is not None:
-                priors = tuple(mc_weights)
+            if backup_weights is not None:
+                priors = tuple(backup_weights)
                 mass = 1.0
             else:
                 mass = float(sum(raw.values()))
@@ -1269,12 +1269,12 @@ class SeqRolloutCollector:
         probs: np.ndarray,
         sampled: int,
     ) -> tuple[list[int], Optional[list[float]], int, list[float]]:
-        """Return (candidates, mc weights or None, deterministic count, q).
+        """Return (candidates, backup weights or None, deterministic count, q).
 
-        Weights are returned by iid sampling rules whose duplicate draws are
-        collapsed into empirical frequencies. That is the ordinary Monte Carlo
-        estimate of the old-policy value. Deterministic rules return None and
-        the caller renormalizes their covered policy mass.
+        Stochastic rules return the weights for their realized unbiased
+        old-policy value estimator: stratum masses for stratified sampling or
+        empirical frequencies for collapsed iid draws. Deterministic rules
+        return None and the caller renormalizes their covered policy mass.
 
         ``q`` is the inclusion probability of each returned candidate -- the
         chance this rule would have expanded that action at this node. It is
@@ -1313,6 +1313,35 @@ class SeqRolloutCollector:
         if mode == "none":
             return [sampled], None, 0, [float(probs[sampled])]
 
+        if mode == "stratified":
+            if top_k < 1:
+                raise ValueError("top_k must be >= 1 for stratified.")
+            if len(legal) <= top_k:
+                ordered = sorted(legal, key=lambda index: (-probs[index], index))
+                return ordered, None, len(ordered), [1.0] * len(ordered)
+
+            groups = self._policy_mass_strata(legal, probs, top_k)
+            candidates: list[int] = []
+            weights: list[float] = []
+            inclusion: list[float] = []
+            for group in groups:
+                mass = float(sum(float(probs[action]) for action in group))
+                if sampled in group:
+                    representative = sampled
+                else:
+                    threshold = leaf.rng.random() * mass
+                    cumulative = 0.0
+                    representative = group[-1]
+                    for action in group:
+                        cumulative += float(probs[action])
+                        if threshold < cumulative:
+                            representative = action
+                            break
+                candidates.append(representative)
+                weights.append(mass)
+                inclusion.append(float(probs[representative]) / mass)
+            return candidates, weights, 0, inclusion
+
         if mode in ("sample_k", "sample_k_plus_uniform"):
             if top_k < 1:
                 raise ValueError(f"top_k must be >= 1 for {mode}.")
@@ -1348,6 +1377,30 @@ class SeqRolloutCollector:
             ordered = sorted(legal, key=lambda index: (-probs[index], index))
             return ordered, None, len(ordered), [1.0] * len(ordered)
         raise ValueError(f"Unknown branch mode {mode!r}.")
+
+    @staticmethod
+    def _policy_mass_strata(
+        legal: list[int], probs: np.ndarray, count: int
+    ) -> list[list[int]]:
+        """Partition legal actions into nonempty, disjoint mass-balanced strata.
+
+        Longest-processing-time bin packing is deterministic given the frozen
+        policy: place actions from highest to lowest probability into the
+        currently lightest stratum. Sampling one conditional-policy action per
+        stratum then gives exactly ``count`` distinct actions, backup/reach
+        weights that sum to one, and closed-form q(a) = pi(a) / mass(stratum).
+        """
+
+        if not 1 <= count <= len(legal):
+            raise ValueError("stratum count must be in [1, len(legal)].")
+        groups: list[list[int]] = [[] for _ in range(count)]
+        masses = [0.0] * count
+        ranked = sorted(legal, key=lambda action: (-probs[action], action))
+        for action in ranked:
+            group_index = min(range(count), key=lambda index: (masses[index], index))
+            groups[group_index].append(action)
+            masses[group_index] += float(probs[action])
+        return groups
 
     @staticmethod
     def _action_for(

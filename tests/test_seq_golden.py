@@ -21,21 +21,15 @@ from plump.seq.config import (
 from plump.seq.model import SeqPlumpModel
 from plump.seq.trainer import SeqTrainer, build_training_groups
 
-# Regenerated when suit presence became opponent-only. Note that *every* hash
-# moves on a change like that, including ``trees``, even though collection was
-# not touched: the suit head is one Linear narrower, so it draws less from the
-# init RNG stream, and every parameter constructed after it gets different
-# initial weights. Different weights, different rollout.
-#
-# So a moved hash is not by itself evidence that behaviour changed. To tell the
-# two apart, force the changed module back to its old width and re-hash: if the
-# old value returns, the difference was only the init stream.
+# Regenerated for the intentional switch from duplicate-collapsed iid branches
+# to fixed-width, disjoint policy-mass strata. This golden exercises stochastic
+# stratification at the bid and exhaustive-within-budget play expansion.
 EXPECTED = {
-    "groups": "48ca82562ab3bb80a55dcfce52979a4300934ecd7019632a9a6add036ebc6c25",
-    "summary": "d6a03a852b2b8b7b78397b7bd0c0f4c0d8737d71e48e5c3d3ab46a6bf2f61cb5",
-    "trees": "19f48905f997f4139cfb405b1b9260d07434d5557e57d2987aeeebe7bce19417",
-    "update": "897e620cd2bfd53bb05df45ea66e234afb313cf3c60d487e84dd96b075603cec",
-    "weights": "99f5cc4f11c753e3683fedb9dd80d54939e81f5440e6646cbee152ca1d3a6935",
+    "groups": "616c45ba26b97d053ab6b6de6ba081410a88848649fd16c03521d5e0afc26ae8",
+    "summary": "5dcdb89befa1747a1cacb8387b0d17c8fb640dac48498318f45507d8b32e15ed",
+    "trees": "fb6fdaa6b002e015c4da805826fc80e08c30f0435ce65169b2b0d8554e96d168",
+    "update": "0aa959c4e42ec2689a9b5c2e0136954b14e2c5511ffb7a0d91099931a7446d3e",
+    "weights": "7473e60b2c7403460fb35a4a67024f0b14cbe72894bcea8b9a20a80908936f55",
 }
 
 
@@ -176,8 +170,8 @@ def test_schema_v6_collection_and_update_match_corrected_golden_hashes():
         schedule_cells=(GameScheduleCell(hand_size=3, num_players=3),),
         branch_rule=BranchRuleConfig(
             bid_top_k=3,
-            play_mode="sample_k_plus_uniform",
-            play_top_k=2,
+            play_mode="stratified",
+            play_top_k=3,
         ),
         branch_budget=BranchBudgetConfig(branch_rate=0.7),
         rollout=RolloutOptions(

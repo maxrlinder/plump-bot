@@ -53,9 +53,10 @@ def test_run_creation_records_config_and_rejects_field_changes(tmp_path):
     assert resolved.training.branch_depth_exponent == -1.0
     assert resolved.training.kl_backtrack_attempts == 8
     assert resolved.training.branch_rule.bid_rule() == (
-        "sample_k_plus_uniform",
-        4,
+        "stratified",
+        5,
     )
+    assert resolved.training.branch_rule.play_rule_for_trick(0) == ("stratified", 4)
     assert resolved.training.checkpoint_every == 50
     assert resolved.training.suit_coef == 0.05
     assert resolved.training.trick_coef == 0.05
