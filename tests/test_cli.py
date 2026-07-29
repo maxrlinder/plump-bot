@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import csv
 import json
 
 import torch
 
-from plump.cli import main
+from plump.cli import METRIC_COLUMNS, _ensure_metrics_header, main
 
 TINY_OVERRIDES = (
     "run.iterations=1",
@@ -46,6 +47,30 @@ def _train_args(name: str) -> list[str]:
     for override in TINY_OVERRIDES:
         args.extend(("--set", override))
     return args
+
+
+def test_legacy_metrics_header_is_upgraded_for_outcome_split(tmp_path):
+    metrics = tmp_path / "metrics.csv"
+    new_fields = {
+        "bid_hit_focal",
+        "bid_hit_non_focal",
+        "reward_focal",
+        "reward_non_focal",
+    }
+    legacy = tuple(column for column in METRIC_COLUMNS if column not in new_fields)
+    with metrics.open("w", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=legacy)
+        writer.writeheader()
+        writer.writerow({"iteration": 1, "bid_hit_rate": 0.25})
+
+    _ensure_metrics_header(metrics)
+
+    with metrics.open(newline="") as handle:
+        reader = csv.DictReader(handle)
+        rows = list(reader)
+    assert tuple(reader.fieldnames) == METRIC_COLUMNS
+    assert rows[0]["bid_hit_rate"] == "0.25"
+    assert all(rows[0][field] == "" for field in new_fields)
 
 
 def test_cli_tiny_run_resume_and_mismatch(tmp_path, monkeypatch, capsys):

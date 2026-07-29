@@ -19,6 +19,10 @@ def test_dashboard_renders_sparse_partial_and_resumed_rows(tmp_path):
                 "elapsed_sec",
                 "loss_policy",
                 "eval_reward_vs_heuristic",
+                "reward_focal",
+                "reward_non_focal",
+                "bid_hit_focal",
+                "bid_hit_non_focal",
                 "rolled_back",
             ),
         )
@@ -29,6 +33,10 @@ def test_dashboard_renders_sparse_partial_and_resumed_rows(tmp_path):
                 "elapsed_sec": 2.0,
                 "loss_policy": 0.5,
                 "eval_reward_vs_heuristic": "",
+                "reward_focal": -0.2,
+                "reward_non_focal": 0.1,
+                "bid_hit_focal": 0.25,
+                "bid_hit_non_focal": 0.4,
                 "rolled_back": 0,
             }
         )
@@ -38,6 +46,10 @@ def test_dashboard_renders_sparse_partial_and_resumed_rows(tmp_path):
                 "elapsed_sec": 11.0,
                 "loss_policy": "",
                 "eval_reward_vs_heuristic": 0.2,
+                "reward_focal": 0.3,
+                "reward_non_focal": -0.15,
+                "bid_hit_focal": 0.5,
+                "bid_hit_non_focal": 0.45,
                 "rolled_back": 1,
             }
         )

@@ -199,7 +199,16 @@ def test_schema_v6_collection_and_update_match_corrected_golden_hashes():
             {
                 key: value
                 for key, value in dataclasses.asdict(summary).items()
-                if key != "collect_sec"
+                if key
+                not in {
+                    "collect_sec",
+                    # Reporting-only decomposition of outcomes already frozen
+                    # through the underlying trees.
+                    "bid_hit_focal",
+                    "bid_hit_non_focal",
+                    "reward_focal",
+                    "reward_non_focal",
+                }
             }
         ),
     }

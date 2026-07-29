@@ -8,6 +8,7 @@ import numpy as np
 import pytest
 import torch
 
+from plump.rewards import compute_relative_rewards
 from plump.seq.config import (
     BranchBudgetConfig,
     BranchRuleConfig,
@@ -65,6 +66,34 @@ def test_group_weights_normalize_to_one():
     # learning rate cannot drift with how the deals happened to come out.
     assert position_weight_total == pytest.approx(1.0)
     assert policy_weight_total == pytest.approx(1.0)
+
+
+def test_rollout_summary_separates_focal_and_non_focal_outcomes():
+    trainer = make_trainer()
+    trees, summary = trainer.collect()
+    focal_hits = []
+    non_focal_hits = []
+    focal_rewards = []
+    non_focal_rewards = []
+    for tree in trees:
+        spine = next(leaf for leaf in tree.leaves if leaf.on_policy_spine)
+        round_state = spine.env.state.current_round
+        relative = compute_relative_rewards(round_state.round_scores)
+        focal_rewards.append(relative[tree.focal])
+        non_focal_rewards.extend(
+            reward for player, reward in relative.items() if player != tree.focal
+        )
+        for bid in round_state.bids:
+            destination = focal_hits if bid.player == tree.focal else non_focal_hits
+            destination.append(round_state.tricks_won[bid.player] == bid.value)
+
+    assert summary.bid_hit_focal == pytest.approx(np.mean(focal_hits))
+    assert summary.bid_hit_non_focal == pytest.approx(np.mean(non_focal_hits))
+    assert summary.bid_hit_rate == pytest.approx(
+        np.mean([*focal_hits, *non_focal_hits])
+    )
+    assert summary.reward_focal == pytest.approx(np.mean(focal_rewards))
+    assert summary.reward_non_focal == pytest.approx(np.mean(non_focal_rewards))
 
 
 def test_update_produces_finite_losses_and_changes_weights():

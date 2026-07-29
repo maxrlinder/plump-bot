@@ -48,6 +48,10 @@ METRIC_COLUMNS = (
     "forward_rows",
     "branch_decisions",
     "bid_hit_rate",
+    "bid_hit_focal",
+    "bid_hit_non_focal",
+    "reward_focal",
+    "reward_non_focal",
     "reward_self",
     "reward_historical",
     "spine_entropy",
@@ -331,7 +335,8 @@ def train_command(args: argparse.Namespace) -> int:
                 f"iter {iteration:5d} | {total:6.1f}s "
                 f"(collect {summary.collect_sec:.1f} update {stats.update_sec:.1f}) "
                 f"| leaves {summary.leaves:5d} positions {stats.positions:6d} "
-                f"| bid_hit {summary.bid_hit_rate:.3f} "
+                f"| bid F/N {summary.bid_hit_focal:.3f}/"
+                f"{summary.bid_hit_non_focal:.3f} "
                 f"| kl {stats.policy_kl:.5f} "
                 f"| step {stats.step_scale:.3f}"
             )
@@ -457,6 +462,10 @@ def _metric_row(
         "forward_rows": collector.forward_rows,
         "branch_decisions": collector.branch_decisions,
         "bid_hit_rate": summary.bid_hit_rate,
+        "bid_hit_focal": summary.bid_hit_focal,
+        "bid_hit_non_focal": summary.bid_hit_non_focal,
+        "reward_focal": summary.reward_focal,
+        "reward_non_focal": summary.reward_non_focal,
         "reward_self": summary.reward_self,
         "reward_historical": summary.reward_historical,
         "spine_entropy": summary.spine_entropy,
@@ -495,9 +504,36 @@ def _metric_row(
 def _ensure_metrics_header(path: Path) -> None:
     if path.exists():
         with path.open(newline="") as handle:
-            header = tuple(next(csv.reader(handle)))
+            reader = csv.DictReader(handle)
+            header = tuple(reader.fieldnames or ())
+            rows = list(reader)
         if header != METRIC_COLUMNS:
-            raise ValueError("Existing metrics.csv has an incompatible header.")
+            expected_legacy = tuple(
+                column
+                for column in METRIC_COLUMNS
+                if column
+                not in {
+                    "bid_hit_focal",
+                    "bid_hit_non_focal",
+                    "reward_focal",
+                    "reward_non_focal",
+                }
+            )
+            if header != expected_legacy:
+                raise ValueError("Existing metrics.csv has an incompatible header.")
+            # Reporting-schema upgrade only. Historical rows did not retain
+            # enough information to reconstruct the focal split, so leave the
+            # new cells blank and begin their series after resume.
+            temporary = path.with_name(f".{path.name}.upgrade.tmp")
+            try:
+                with temporary.open("w", newline="") as handle:
+                    writer = csv.DictWriter(handle, fieldnames=METRIC_COLUMNS)
+                    writer.writeheader()
+                    writer.writerows(rows)
+                temporary.replace(path)
+            finally:
+                if temporary.exists():
+                    temporary.unlink()
         return
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", newline="") as handle:

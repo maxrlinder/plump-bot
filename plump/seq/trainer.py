@@ -37,6 +37,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
+from plump.rewards import compute_relative_rewards
 from plump.rounds import rules_fingerprint
 
 from .config import (
@@ -123,7 +124,15 @@ class SeqRolloutSummary:
     trees: int = 0
     leaves: int = 0
     decisions: int = 0
+    # Legacy pooled accuracy across every seat, retained for old metrics and
+    # consumers. The explicit focal/non-focal fields below are the useful
+    # diagnostics: opponents take ordinary policy actions without focal
+    # counterfactual branching.
     bid_hit_rate: float = 0.0
+    bid_hit_focal: float = 0.0
+    bid_hit_non_focal: float = 0.0
+    reward_focal: float = 0.0
+    reward_non_focal: float = 0.0
     reward_self: float = 0.0
     reward_historical: float = 0.0
     spine_entropy: float = 0.0
@@ -139,8 +148,12 @@ def summarize_trees(trees: list[SeqTree], collector_stats) -> SeqRolloutSummary:
         collect_sec=collector_stats.collect_sec,
         forward_rows=collector_stats.forward_rows,
     )
-    hits = 0
-    players = 0
+    focal_hits = 0
+    focal_bids = 0
+    non_focal_hits = 0
+    non_focal_bids = 0
+    focal_rewards: list[float] = []
+    non_focal_rewards: list[float] = []
     rewards: dict[str, list[float]] = defaultdict(list)
     entropies: list[float] = []
     for tree in trees:
@@ -148,13 +161,37 @@ def summarize_trees(trees: list[SeqTree], collector_stats) -> SeqRolloutSummary:
         round_state = spine.env.state.current_round
         bids = {bid.player: bid.value for bid in round_state.bids}
         for player, bid in bids.items():
-            players += 1
-            hits += int(round_state.tricks_won[player] == bid)
+            hit = int(round_state.tricks_won[player] == bid)
+            if player == tree.focal:
+                focal_bids += 1
+                focal_hits += hit
+            else:
+                non_focal_bids += 1
+                non_focal_hits += hit
+        relative_rewards = compute_relative_rewards(round_state.round_scores)
+        focal_rewards.append(relative_rewards[tree.focal])
+        non_focal_rewards.extend(
+            reward
+            for player, reward in relative_rewards.items()
+            if player != tree.focal
+        )
         rewards[tree.arm].append(spine.terminal_value)
         for record in spine.decisions:
             probs = record.old_probs[record.old_probs > 0]
             entropies.append(float(-(probs * np.log(probs)).sum()))
-    summary.bid_hit_rate = hits / players if players else 0.0
+    total_hits = focal_hits + non_focal_hits
+    total_bids = focal_bids + non_focal_bids
+    summary.bid_hit_rate = total_hits / total_bids if total_bids else 0.0
+    summary.bid_hit_focal = focal_hits / focal_bids if focal_bids else 0.0
+    summary.bid_hit_non_focal = (
+        non_focal_hits / non_focal_bids if non_focal_bids else 0.0
+    )
+    summary.reward_focal = (
+        float(np.mean(focal_rewards)) if focal_rewards else 0.0
+    )
+    summary.reward_non_focal = (
+        float(np.mean(non_focal_rewards)) if non_focal_rewards else 0.0
+    )
     summary.reward_self = float(np.mean(rewards["self"])) if rewards["self"] else 0.0
     summary.reward_historical = (
         float(np.mean(rewards["historical"])) if rewards["historical"] else 0.0

@@ -57,10 +57,13 @@ def render_dashboard(
         iteration,
         rows,
         left=(
-            ("reward_self", "self-play reward"),
-            ("reward_historical", "historical-opponent reward"),
+            ("reward_focal", "focal reward"),
+            ("reward_non_focal", "non-focal reward"),
         ),
-        right=(("bid_hit_rate", "observed bid accuracy"),),
+        right=(
+            ("bid_hit_focal", "focal bid accuracy"),
+            ("bid_hit_non_focal", "non-focal bid accuracy"),
+        ),
         smooth=smooth,
         title="Observed outcomes",
         left_label="relative reward",
