@@ -24,6 +24,7 @@ def render_dashboard(
     title: str | None = None,
     smooth: int = 20,
     dpi: int = 150,
+    include_learning_rate: bool = False,
 ) -> int:
     """Render comparable quantities together and discrete events without smoothing."""
 
@@ -70,23 +71,36 @@ def render_dashboard(
         right_label="bid accuracy",
         omit_zero=True,
     )
-    _dual_lines(
-        axes[0, 2],
-        iteration,
-        rows,
-        left=(
-            ("policy_kl", "mean KL"),
-            ("policy_kl_p99", "p99 KL"),
-            ("policy_kl_max", "max KL"),
-        ),
-        right=(("learning_rate", "learning rate"),),
-        smooth=min(smooth, 5),
-        right_smooth=1,
-        title="Policy trust region",
-        left_label="old → new KL",
-        right_label="learning rate",
-        omit_zero=True,
+    trust_region = (
+        ("policy_kl", "mean KL"),
+        ("policy_kl_p99", "p99 KL"),
+        ("policy_kl_max", "max KL"),
     )
+    if include_learning_rate:
+        _dual_lines(
+            axes[0, 2],
+            iteration,
+            rows,
+            left=trust_region,
+            right=(("learning_rate", "learning rate"),),
+            smooth=min(smooth, 5),
+            right_smooth=1,
+            title="Policy trust region",
+            left_label="old → new KL",
+            right_label="learning rate",
+            omit_zero=True,
+        )
+    else:
+        _lines(
+            axes[0, 2],
+            iteration,
+            rows,
+            trust_region,
+            smooth=min(smooth, 5),
+            title="Policy trust region",
+            ylabel="old → new KL",
+            omit_zero=True,
+        )
     _lines(
         axes[1, 0],
         iteration,

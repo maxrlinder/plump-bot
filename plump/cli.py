@@ -119,6 +119,11 @@ def build_parser() -> argparse.ArgumentParser:
     dashboard.add_argument("run")
     dashboard.add_argument("--smooth", type=int, default=20)
     dashboard.add_argument("--dpi", type=int, default=150)
+    dashboard.add_argument(
+        "--include-learning-rate",
+        action="store_true",
+        help="overlay learning rate on the trust-region panel",
+    )
     dashboard.set_defaults(handler=dashboard_command)
 
     evaluate = subparsers.add_parser(
@@ -363,6 +368,7 @@ def dashboard_command(args: argparse.Namespace) -> int:
         title=f"Plump schema-v6 · {run.name}",
         smooth=args.smooth,
         dpi=args.dpi,
+        include_learning_rate=args.include_learning_rate,
     )
     print(f"Wrote {run.dashboard} from {rows} rows.")
     return 0

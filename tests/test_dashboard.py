@@ -57,6 +57,18 @@ def test_dashboard_renders_sparse_partial_and_resumed_rows(tmp_path):
     output = tmp_path / "dashboard.png"
     assert render_dashboard(metrics, output, smooth=2, dpi=40) == 2
     assert output.read_bytes().startswith(b"\x89PNG\r\n\x1a\n")
+    with_lr = tmp_path / "dashboard-with-lr.png"
+    assert (
+        render_dashboard(
+            metrics,
+            with_lr,
+            smooth=2,
+            dpi=40,
+            include_learning_rate=True,
+        )
+        == 2
+    )
+    assert with_lr.read_bytes().startswith(b"\x89PNG\r\n\x1a\n")
     assert not list(tmp_path.glob(".*.tmp.png"))
 
 
