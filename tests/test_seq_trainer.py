@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import dataclasses
+
 import numpy as np
 import pytest
 import torch
@@ -310,6 +312,63 @@ def test_kl_backtracking_accepts_a_smaller_adam_step():
     assert stats.policy_kl <= trainer.train.policy_kl_cap
     assert stats.policy_kl_p99 <= trainer.train.policy_kl_p99_cap
     assert trainer.optimizer_steps == 1
+
+
+def test_proven_early_p99_rejection_matches_full_backtracking(monkeypatch):
+    """Skipping the remainder of a provably failed guard pass is transparent."""
+
+    options = dict(
+        policy_objective="sampled_mirror",
+        learning_rate=0.1,
+        lr_warmup_updates=0,
+        policy_kl_cap=1e-4,
+        policy_kl_p99_cap=4e-4,
+        sampled_mirror_target_kl=5e-5,
+        kl_backtrack_attempts=16,
+        kl_backtrack_factor=0.5,
+        suit_coef=0.0,
+        trick_coef=0.0,
+        bid_hit_coef=0.0,
+    )
+    early = make_trainer(**options)
+    complete = make_trainer(**options)
+    trees, _ = early.collect()
+
+    early_calls = 0
+    complete_calls = 0
+    early_forward = early.model.forward_full
+    complete_forward = complete.model.forward_full
+
+    def count_early(*args, **kwargs):
+        nonlocal early_calls
+        early_calls += 1
+        return early_forward(*args, **kwargs)
+
+    def count_complete(*args, **kwargs):
+        nonlocal complete_calls
+        complete_calls += 1
+        return complete_forward(*args, **kwargs)
+
+    monkeypatch.setattr(early.model, "forward_full", count_early)
+    monkeypatch.setattr(complete.model, "forward_full", count_complete)
+    full_guard = complete._evaluate_policy_kl
+
+    def disable_early_return(groups, **_kwargs):
+        return full_guard(groups)
+
+    monkeypatch.setattr(complete, "_evaluate_policy_kl", disable_early_return)
+
+    early_stats = early.update(trees)
+    complete_stats = complete.update(trees)
+    early_payload = dataclasses.asdict(early_stats)
+    complete_payload = dataclasses.asdict(complete_stats)
+    for key in ("update_sec", "build_sec"):
+        early_payload.pop(key)
+        complete_payload.pop(key)
+    assert early_payload == complete_payload
+    for left, right in zip(early.model.parameters(), complete.model.parameters()):
+        assert torch.equal(left, right)
+    assert early_calls < complete_calls
 
 
 def test_lr_warmup_ramps_and_survives_the_kl_cap():

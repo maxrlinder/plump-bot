@@ -23,6 +23,7 @@ must pass before an Adam step is accepted.
 from __future__ import annotations
 
 import copy
+import math
 import os
 import random
 import time
@@ -622,7 +623,19 @@ class SeqTrainer:
                 for group, nominal_lr in zip(self.optimizer.param_groups, nominal_lrs):
                     group["lr"] = nominal_lr * scale
                 self.optimizer.step()
-                policy_kl, kl_p95, kl_p99, kl_max = self._evaluate_policy_kl(groups)
+                policy_kl, kl_p95, kl_p99, kl_max = self._evaluate_policy_kl(
+                    groups,
+                    # A rejected non-final attempt is immediately restored, so
+                    # stop its guard pass as soon as enough above-cap weight
+                    # proves that the final weighted p99 must fail. The last
+                    # attempt always runs in full so a rollback still reports
+                    # its exact diagnostics.
+                    reject_p99_above=(
+                        self.train.policy_kl_p99_cap
+                        if attempt + 1 < attempts
+                        else None
+                    ),
+                )
                 stats.policy_kl = policy_kl
                 stats.policy_kl_p95 = kl_p95
                 stats.policy_kl_p99 = kl_p99
@@ -678,14 +691,27 @@ class SeqTrainer:
 
     def _epoch_backward(self, groups, stats: SeqUpdateStats) -> None:
         totals = defaultdict(float)
+        # Keep reporting scalars on-device until every forward/backward has
+        # been queued. Calling float(tensor) inside _chunk_loss synchronizes
+        # MPS once per microbatch, inserting a CPU barrier between each
+        # forward and backward. Converting here preserves the original Python
+        # summation order (and therefore the exact reported values) while the
+        # first conversion pays the only synchronization.
+        pending_terms: list[tuple[str, list[torch.Tensor]]] = []
         for group in groups:
             by_chunk = _rows_by_chunk(group, self._microbatches(group))
             for (start, stop), policy_rows in zip(self._microbatches(group), by_chunk):
-                loss, terms = self._chunk_loss(group, start, stop, policy_rows)
+                loss, terms = self._chunk_loss(
+                    group, start, stop, policy_rows, defer_terms=True
+                )
                 if loss is not None:
                     loss.backward()
-                for key, value in terms.items():
-                    totals[key] += value
+                pending_terms.extend(terms.items())
+        for key, values in pending_terms:
+            subtotal = 0.0
+            for value in values:
+                subtotal += float(value)
+            totals[key] += subtotal
         stats.loss_policy = totals["policy"]
         stats.loss_value = totals["value"]
         stats.loss_suit = totals["suit"]
@@ -693,7 +719,9 @@ class SeqTrainer:
         stats.loss_bid_hit = totals["bid_hit"]
         stats.entropy = totals["entropy"]
 
-    def _chunk_loss(self, group, start, stop, policy_rows):
+    def _chunk_loss(
+        self, group, start, stop, policy_rows, *, defer_terms: bool = False
+    ):
         device = self.device
         train = self.train
         # Only the heads whose loss is actually weighted -- each one skipped is
@@ -715,7 +743,7 @@ class SeqTrainer:
             * owned.float()
         )
 
-        terms: dict[str, float] = {}
+        term_parts: dict[str, list[torch.Tensor]] = defaultdict(list)
         loss = tokens.new_zeros((), dtype=torch.float32)
 
         # Value.
@@ -725,7 +753,7 @@ class SeqTrainer:
             * position_weight
         ).sum()
         loss = loss + train.value_coef * value_loss
-        terms["value"] = float(value_loss.detach())
+        term_parts["value"].append(value_loss.detach())
 
         # Suit presence.
         suit_labeled = None
@@ -743,7 +771,7 @@ class SeqTrainer:
             )
             suit_loss = (per_position * position_weight).sum()
             loss = loss + train.suit_coef * suit_loss
-            terms["suit"] = float(suit_loss.detach())
+            term_parts["suit"].append(suit_loss.detach())
 
         # Trick counts (feasibility-masked CE, per relative player).
         player_labeled = None
@@ -769,7 +797,7 @@ class SeqTrainer:
             )
             trick_loss = (per_position * position_weight).sum()
             loss = loss + train.trick_coef * trick_loss
-            terms["trick"] = float(trick_loss.detach())
+            term_parts["trick"].append(trick_loss.detach())
 
         # Bid hit (per relative seat, sigmoid). One constant label per seat for
         # the whole round -- it is the outcome -- broadcast over every owned
@@ -792,28 +820,36 @@ class SeqTrainer:
             per_position = (bce * mask).sum(dim=2) / mask.sum(dim=2).clamp_min(1.0)
             bid_hit_loss = (per_position * position_weight).sum()
             loss = loss + train.bid_hit_coef * bid_hit_loss
-            terms["bid_hit"] = float(bid_hit_loss.detach())
+            term_parts["bid_hit"].append(bid_hit_loss.detach())
 
         # Policy: NeuRD over every focal decision, branched or not.
-        policy_total = 0.0
-        entropy_total = 0.0
         for phase_key, rows in policy_rows.items():
             if not rows["weight"]:
                 continue
             losses, _, entropies, weight = self._policy_terms(output, rows, phase_key)
             policy_loss = (weight * losses).sum()
             loss = loss + train.policy_coef * policy_loss
-            policy_total += float(policy_loss.detach())
+            term_parts["policy"].append(policy_loss.detach())
             if train.entropy_coef:
                 entropy_term = (weight * entropies).sum()
                 loss = loss - train.entropy_coef * entropy_term
-                entropy_total += float(entropy_term.detach())
+                term_parts["entropy"].append(entropy_term.detach())
             else:
-                entropy_total += float((weight * entropies).sum().detach())
-        if policy_total:
-            terms["policy"] = policy_total
-            terms["entropy"] = entropy_total
+                term_parts["entropy"].append(
+                    (weight * entropies).sum().detach()
+                )
 
+        if defer_terms:
+            terms = dict(term_parts)
+        else:
+            # Preserve the historical public helper contract used by focused
+            # loss tests. Training itself requests deferred tensors above.
+            terms = {}
+            for key, values in term_parts.items():
+                subtotal = 0.0
+                for value in values:
+                    subtotal += float(value)
+                terms[key] = subtotal
         if loss.requires_grad:
             return loss, terms
         return None, terms
@@ -921,17 +957,92 @@ class SeqTrainer:
             losses = (target * (log_target - safe) * legal.float()).sum(dim=-1)
         return losses, divergences, entropies, weight
 
-    def _evaluate_policy_kl(self, groups) -> tuple[float, float, float, float]:
+    def _policy_divergences(self, output, rows, phase_key):
+        """KL-only policy readout for the post-step trust-region guard.
+
+        The guard does not consume candidate Q values, inclusion
+        probabilities, baselines, sampled advantages, entropies, or mirror
+        targets. Reusing _policy_terms here rebuilt and transferred all of
+        those tensors and recomputed the complete objective after every
+        attempted Adam step even though only KL(old || new) was retained.
+        """
+
+        logits_all = output.bid_logits if phase_key == "bid" else output.card_logits
+        seq_idx = torch.from_numpy(
+            np.asarray(rows["seq_index"], dtype=np.int64)
+        ).to(self.device)
+        pos_idx = torch.from_numpy(
+            np.asarray(rows["position"], dtype=np.int64)
+        ).to(self.device)
+        logits = logits_all[seq_idx, pos_idx].float()
+        old_full = torch.from_numpy(np.stack(rows["old_probs_full"])).to(self.device)
+        legal = old_full > 0
+        full_logprobs = torch.log_softmax(
+            logits.masked_fill(~legal, float("-inf")), dim=-1
+        )
+        safe = torch.where(
+            legal, full_logprobs, torch.zeros_like(full_logprobs)
+        )
+        log_old = torch.log(old_full.clamp_min(1e-12))
+        divergences = (
+            old_full * (log_old - safe) * legal.float()
+        ).sum(dim=-1)
+        weight = torch.from_numpy(
+            np.asarray(rows["weight"], dtype=np.float32)
+        ).to(self.device)
+        return divergences, weight
+
+    def _evaluate_policy_kl(
+        self,
+        groups,
+        *,
+        reject_p99_above: float | None = None,
+    ) -> tuple[float, float, float, float]:
         """Mean, p95, p99, and max KL(old||new) over every policy row.
 
         Under the old split this covered branch rows only, leaving the spine
         half of the decisions outside the rollback guard. With one row type
         there is nothing left uncovered.
+
+        A non-None ``reject_p99_above`` permits a proof-only early return. If
+        the weight already observed above the cap is large enough that even
+        assigning every unvisited row below it cannot save weighted p99, the
+        attempted step is known to fail. The threshold includes a conservative
+        IEEE-float32 summation error bound, so this cannot reject an attempt
+        the complete existing percentile calculation would accept.
         """
 
         self.model.eval()
         all_divergences: list[np.ndarray] = []
         all_weights: list[np.ndarray] = []
+        bad_weights: list[float] = []
+        rejection_weight = None
+        if reject_p99_above is not None:
+            guard_weights = np.asarray(
+                [
+                    weight
+                    for group in groups
+                    for rows in group.policy.values()
+                    for weight in rows.weight
+                ],
+                dtype=np.float32,
+            )
+            positive_weights = [
+                float(weight) for weight in guard_weights[guard_weights > 0]
+            ]
+            count = len(positive_weights)
+            total = math.fsum(positive_weights)
+            # numpy.cumsum retains float32 for these weights. Bound the
+            # order-dependent rounding of both the below-cap prefix and total
+            # using Higham's gamma_n, then require the worst-case prefix still
+            # to fall below 99% of the best-case total.
+            unit_roundoff = 2.0**-24
+            product = max(count - 1, 0) * unit_roundoff
+            if total > 0 and product < 1.0:
+                gamma = product / (1.0 - product)
+                rejection_weight = total * (
+                    1.0 - 0.99 * (1.0 - gamma) / (1.0 + gamma)
+                )
         with torch.inference_mode():
             for group in groups:
                 for (start, stop), policy_rows in zip(
@@ -945,11 +1056,29 @@ class SeqTrainer:
                     for phase_key, rows in policy_rows.items():
                         if not rows["weight"]:
                             continue
-                        _, divergences, _, weight = self._policy_terms(
+                        divergences, weight = self._policy_divergences(
                             output, rows, phase_key
                         )
-                        all_divergences.append(divergences.detach().cpu().numpy())
-                        all_weights.append(weight.detach().cpu().numpy())
+                        divergence_np = divergences.detach().cpu().numpy()
+                        weight_np = weight.detach().cpu().numpy()
+                        all_divergences.append(divergence_np)
+                        all_weights.append(weight_np)
+                        if rejection_weight is not None:
+                            mask = (
+                                (divergence_np > reject_p99_above)
+                                & (weight_np > 0)
+                            )
+                            bad_weights.extend(
+                                float(value) for value in weight_np[mask]
+                            )
+                    if (
+                        rejection_weight is not None
+                        and math.fsum(bad_weights) > rejection_weight
+                    ):
+                        rejected = float(
+                            np.nextafter(reject_p99_above, math.inf)
+                        )
+                        return 0.0, 0.0, rejected, rejected
         if not all_divergences:
             return 0.0, 0.0, 0.0, 0.0
         return _weighted_kl_summary(
