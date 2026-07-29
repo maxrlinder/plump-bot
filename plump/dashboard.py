@@ -15,6 +15,9 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 
+Field = tuple[str, str]
+
+
 def render_dashboard(
     metrics_path: str | Path,
     output_path: str | Path,
@@ -23,6 +26,8 @@ def render_dashboard(
     smooth: int = 20,
     dpi: int = 150,
 ) -> int:
+    """Render comparable quantities together and discrete events without smoothing."""
+
     metrics_path = Path(metrics_path)
     output_path = Path(output_path)
     rows = _read_rows(metrics_path)
@@ -31,97 +36,105 @@ def render_dashboard(
 
     iteration = _series(rows, "iteration")
     fig, axes = plt.subplots(3, 3, figsize=(20, 13), constrained_layout=True)
-    fig.suptitle(title or f"Plump schema-v6 · {metrics_path.parent.name}", fontsize=16)
+    fig.get_layout_engine().set(rect=(0.0, 0.035, 1.0, 0.96))
+    fig.suptitle(
+        title or f"Plump schema-v6 · {metrics_path.parent.name}",
+        fontsize=16,
+    )
 
-    _lines(
+    _dual_lines(
         axes[0, 0],
         iteration,
         rows,
-        (
-            ("eval_reward_vs_heuristic", "relative reward"),
-            ("eval_bid_hit", "bid hit"),
-        ),
+        left=(("eval_reward_vs_heuristic", "relative reward"),),
+        right=(("eval_bid_hit", "bid accuracy"),),
         smooth=1,
         title="Held-out evaluation",
+        left_label="relative reward",
+        right_label="bid accuracy",
     )
-    _lines(
+    _dual_lines(
         axes[0, 1],
         iteration,
         rows,
-        (
-            ("reward_self", "self"),
-            ("reward_historical", "historical"),
-            ("bid_hit_rate", "rollout bid hit"),
+        left=(
+            ("reward_self", "self-play reward"),
+            ("reward_historical", "historical-opponent reward"),
         ),
+        right=(("bid_hit_rate", "observed bid accuracy"),),
         smooth=smooth,
-        title="Rollout outcomes",
+        title="Observed outcomes",
+        left_label="relative reward",
+        right_label="bid accuracy",
+        omit_zero=True,
     )
-    _lines(
+    _dual_lines(
         axes[0, 2],
         iteration,
         rows,
-        (
-            ("loss_policy", "policy"),
-            ("loss_value", "value"),
-            ("loss_suit", "suit"),
-            ("loss_bid_hit", "bid hit"),
-            ("loss_trick", "trick count"),
+        left=(
+            ("loss_policy", "target-fit loss"),
+            ("policy_kl", "realized KL"),
         ),
-        smooth=smooth,
-        title="Objectives",
+        right=(("learning_rate", "learning rate"),),
+        smooth=min(smooth, 5),
+        right_smooth=1,
+        title="Policy update",
+        left_label="KL / loss",
+        right_label="learning rate",
+        omit_zero=True,
     )
     _lines(
         axes[1, 0],
         iteration,
         rows,
         (
-            ("spine_entropy", "spine entropy"),
-            ("entropy", "update entropy"),
-            ("policy_kl", "policy KL"),
-            ("step_scale", "step scale"),
-            ("backtracks", "backtracks"),
-            ("rolled_back", "rollback"),
+            ("loss_value", "value"),
+            ("loss_suit", "suit presence"),
+            ("loss_trick", "trick count"),
+            ("loss_bid_hit", "bid-hit belief"),
         ),
         smooth=smooth,
-        title="Policy health",
+        title="Active auxiliary losses",
+        ylabel="loss",
+        omit_zero=True,
     )
     _lines(
         axes[1, 1],
         iteration,
         rows,
         (
-            ("trees", "trees"),
-            ("leaves", "leaves"),
-            ("positions", "positions"),
-            ("forward_rows", "forward rows"),
+            ("leaves", "terminal leaves"),
+            ("policy_rows", "policy rows"),
+            ("branch_decisions", "branch decisions"),
+            ("skipped_by_placement", "placement skips"),
         ),
         smooth=smooth,
-        title="Training volume",
+        title="Tree and search volume",
+        ylabel="count",
     )
     _lines(
         axes[1, 2],
         iteration,
         rows,
         (
-            ("branched_rows", "branched rows"),
-            ("unbranched_rows", "unbranched rows"),
-            ("branch_decisions", "branch decisions"),
-            ("blocked_by_cache", "cache blocked"),
-            ("skipped_by_placement", "placement skips"),
+            ("spine_entropy", "rollout policy"),
+            ("entropy", "updated policy"),
         ),
         smooth=smooth,
-        title="Branching",
+        title="Policy entropy",
+        ylabel="nats",
     )
-    _lines(
+    _dual_lines(
         axes[2, 0],
         iteration,
         rows,
-        (
-            ("positions_per_sec", "positions/s"),
-            ("forward_rows_per_sec", "forward rows/s"),
-        ),
+        left=(("positions_per_sec", "positions/s"),),
+        right=(("forward_rows_per_sec", "forward rows/s"),),
         smooth=smooth,
         title="Throughput",
+        left_label="positions/s",
+        right_label="forward rows/s",
     )
     _lines(
         axes[2, 1],
@@ -130,42 +143,48 @@ def render_dashboard(
         (
             ("collect_sec", "collect"),
             ("update_sec", "update"),
-            ("forward_sec", "forward"),
-            ("token_build_sec", "token build"),
+            ("forward_sec", "forward within collect"),
         ),
         smooth=smooth,
-        title="Wall time (seconds)",
+        title="Wall time",
+        ylabel="seconds",
     )
-    _lines(
+    _dual_lines(
         axes[2, 2],
         iteration,
         rows,
-        (
-            ("peak_cache_rows", "peak cache rows"),
-            ("cache_rows_allocated", "allocated rows"),
-            ("cache_pressure", "cache pressure"),
-            ("peak_device_gb", "peak device GB"),
-            ("learning_rate", "learning rate"),
+        left=(
+            ("peak_cache_rows", "rows used"),
+            ("cache_rows_allocated", "rows reserved"),
         ),
-        smooth=smooth,
-        title="Memory and optimizer",
+        right=(("peak_device_gb", "device high-water"),),
+        smooth=1,
+        title="Memory (raw, unsmoothed)",
+        left_label="KV-cache rows",
+        right_label="device GB",
     )
+    _mark_cache_cap_hits(axes[2, 2], iteration, rows)
+    _mark_policy_events(axes[0, 2], iteration, rows)
 
     for ax in axes.flat:
         ax.set_xlabel("Iteration")
         ax.grid(alpha=0.18)
-        if ax.lines:
-            ax.legend(fontsize=8, loc="best")
 
     last = rows[-1]
+    backtracks = int(sum(_finite(_series(rows, "backtracks"))))
+    rollbacks = int(sum(_finite(_series(rows, "rolled_back"))))
     fig.text(
         0.5,
-        0.005,
+        0.012,
         " · ".join(
             (
-                f"iteration {int(float(last['iteration']))}",
-                f"elapsed {float(last.get('elapsed_sec') or 0):.1f}s",
-                f"rollback {int(float(last.get('rolled_back') or 0))}",
+                f"iteration {int(_number(last, 'iteration'))}",
+                f"optimizer steps {int(_number(last, 'optimizer_steps'))}",
+                f"LR {_number(last, 'learning_rate'):.2e}",
+                f"step scale {_number(last, 'step_scale'):.3f}",
+                f"backtracks {backtracks}",
+                f"rollbacks {rollbacks}",
+                f"elapsed {_duration(_number(last, 'elapsed_sec'))}",
             )
         ),
         ha="center",
@@ -216,32 +235,207 @@ def _smooth(values: np.ndarray, window: int) -> np.ndarray:
     return out
 
 
+def _has_signal(values: np.ndarray, *, omit_zero: bool) -> bool:
+    finite = _finite(values)
+    if not finite.size:
+        return False
+    return not (omit_zero and np.allclose(finite, 0.0))
+
+
+def _finite(values: np.ndarray) -> np.ndarray:
+    return values[np.isfinite(values)]
+
+
+def _plot_fields(
+    ax,
+    iteration: np.ndarray,
+    rows: list[dict[str, str]],
+    fields: tuple[Field, ...],
+    *,
+    smooth: int,
+    omit_zero: bool,
+    color_offset: int = 0,
+) -> list:
+    handles = []
+    for index, (field, label) in enumerate(fields):
+        values = _series(rows, field)
+        if not _has_signal(values, omit_zero=omit_zero):
+            continue
+        rendered = _smooth(values, smooth)
+        valid = np.isfinite(iteration) & np.isfinite(rendered)
+        if not valid.any():
+            continue
+        (line,) = ax.plot(
+            iteration[valid],
+            rendered[valid],
+            linewidth=1.7,
+            color=f"C{color_offset + index}",
+            label=label,
+        )
+        handles.append(line)
+    return handles
+
+
 def _lines(
     ax,
     iteration: np.ndarray,
     rows: list[dict[str, str]],
-    fields: tuple[tuple[str, str], ...],
+    fields: tuple[Field, ...],
     *,
     smooth: int,
     title: str,
+    ylabel: str | None = None,
+    omit_zero: bool = False,
 ) -> None:
-    plotted = False
-    for field, label in fields:
-        values = _series(rows, field)
-        valid = np.isfinite(iteration) & np.isfinite(values)
-        if not valid.any():
-            continue
-        rendered = _smooth(values, smooth)
-        ax.plot(iteration[valid], rendered[valid], linewidth=1.6, label=label)
-        plotted = True
+    handles = _plot_fields(
+        ax,
+        iteration,
+        rows,
+        fields,
+        smooth=smooth,
+        omit_zero=omit_zero,
+    )
     ax.set_title(title)
-    if not plotted:
-        ax.text(
-            0.5,
-            0.5,
-            "No data yet",
-            transform=ax.transAxes,
-            ha="center",
-            va="center",
-            color="#777777",
-        )
+    if ylabel:
+        ax.set_ylabel(ylabel)
+    if handles:
+        ax.legend(handles=handles, fontsize=8, loc="best")
+    else:
+        _no_data(ax)
+
+
+def _dual_lines(
+    ax,
+    iteration: np.ndarray,
+    rows: list[dict[str, str]],
+    *,
+    left: tuple[Field, ...],
+    right: tuple[Field, ...],
+    smooth: int,
+    title: str,
+    left_label: str,
+    right_label: str,
+    right_smooth: int | None = None,
+    omit_zero: bool = False,
+):
+    right_ax = ax.twinx()
+    left_handles = _plot_fields(
+        ax,
+        iteration,
+        rows,
+        left,
+        smooth=smooth,
+        omit_zero=omit_zero,
+    )
+    right_handles = _plot_fields(
+        right_ax,
+        iteration,
+        rows,
+        right,
+        smooth=smooth if right_smooth is None else right_smooth,
+        omit_zero=omit_zero,
+        color_offset=len(left),
+    )
+    ax.set_title(title)
+    if left_handles:
+        ax.set_ylabel(left_label)
+    if right_handles:
+        right_ax.set_ylabel(right_label)
+        right_ax.grid(False)
+    else:
+        right_ax.set_yticks([])
+        right_ax.spines["right"].set_visible(False)
+    handles = [*left_handles, *right_handles]
+    if handles:
+        ax.legend(handles=handles, fontsize=8, loc="best")
+    else:
+        _no_data(ax)
+    return right_ax
+
+
+def _no_data(ax) -> None:
+    ax.text(
+        0.5,
+        0.5,
+        "No data yet",
+        transform=ax.transAxes,
+        ha="center",
+        va="center",
+        color="#777777",
+    )
+
+
+def _mark_cache_cap_hits(
+    ax,
+    iteration: np.ndarray,
+    rows: list[dict[str, str]],
+) -> None:
+    blocked = _series(rows, "blocked_by_cache")
+    used = _series(rows, "peak_cache_rows")
+    valid = (
+        np.isfinite(iteration)
+        & np.isfinite(blocked)
+        & np.isfinite(used)
+        & (blocked > 0)
+    )
+    if not valid.any():
+        return
+    ax.scatter(
+        iteration[valid],
+        used[valid],
+        marker="x",
+        s=42,
+        linewidths=1.5,
+        color="#d62728",
+        zorder=5,
+    )
+    first = int(np.flatnonzero(valid)[0])
+    ax.annotate(
+        f"cap hit · {int(blocked[first]):,} branches blocked",
+        (iteration[first], used[first]),
+        xytext=(7, -15),
+        textcoords="offset points",
+        fontsize=7,
+        color="#b22222",
+    )
+
+
+def _mark_policy_events(
+    ax,
+    iteration: np.ndarray,
+    rows: list[dict[str, str]],
+) -> None:
+    kl = _series(rows, "policy_kl")
+    backtracks = _series(rows, "backtracks")
+    rollbacks = _series(rows, "rolled_back")
+    finite = np.isfinite(iteration) & np.isfinite(kl)
+    for values, marker, color in (
+        (backtracks, "v", "#ff7f0e"),
+        (rollbacks, "x", "#d62728"),
+    ):
+        active = finite & np.isfinite(values) & (values > 0)
+        if active.any():
+            ax.scatter(
+                iteration[active],
+                kl[active],
+                marker=marker,
+                s=38,
+                color=color,
+                zorder=5,
+            )
+
+
+def _number(row: dict[str, str], key: str) -> float:
+    raw = row.get(key, "")
+    try:
+        return float(raw) if raw not in ("", None) else 0.0
+    except ValueError:
+        return 0.0
+
+
+def _duration(seconds: float) -> str:
+    if seconds < 60:
+        return f"{seconds:.0f}s"
+    if seconds < 3600:
+        return f"{seconds / 60:.1f}m"
+    return f"{seconds / 3600:.1f}h"

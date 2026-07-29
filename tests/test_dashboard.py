@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import csv
 
-from plump.dashboard import render_dashboard
+import numpy as np
+
+from plump.dashboard import _duration, _has_signal, render_dashboard
 
 
 def test_dashboard_renders_sparse_partial_and_resumed_rows(tmp_path):
@@ -44,3 +46,18 @@ def test_dashboard_renders_sparse_partial_and_resumed_rows(tmp_path):
     assert render_dashboard(metrics, output, smooth=2, dpi=40) == 2
     assert output.read_bytes().startswith(b"\x89PNG\r\n\x1a\n")
     assert not list(tmp_path.glob(".*.tmp.png"))
+
+
+def test_dashboard_omits_disabled_zero_only_metrics():
+    disabled = np.asarray([0.0, 0.0, np.nan])
+    active = np.asarray([0.0, 0.1, np.nan])
+
+    assert not _has_signal(disabled, omit_zero=True)
+    assert _has_signal(disabled, omit_zero=False)
+    assert _has_signal(active, omit_zero=True)
+
+
+def test_dashboard_formats_elapsed_time_compactly():
+    assert _duration(42.0) == "42s"
+    assert _duration(90.0) == "1.5m"
+    assert _duration(7200.0) == "2.0h"
