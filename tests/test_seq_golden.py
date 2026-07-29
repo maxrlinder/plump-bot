@@ -214,7 +214,14 @@ def test_schema_v6_collection_and_update_match_pre_refactor_golden_hashes():
                 {
                     key: value
                     for key, value in dataclasses.asdict(stats).items()
-                    if key not in {"update_sec", "build_sec"}
+                    if key not in {
+                        "update_sec",
+                        "build_sec",
+                        # Reporting-only trust-region diagnostics. The hashes
+                        # below still freeze the accepted model update itself.
+                        "backtracks",
+                        "step_scale",
+                    }
                 }
             ),
             "weights": _sha256(trainer.model.state_dict()),

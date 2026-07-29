@@ -59,6 +59,8 @@ METRIC_COLUMNS = (
     "loss_bid_hit",
     "entropy",
     "policy_kl",
+    "backtracks",
+    "step_scale",
     "rolled_back",
     "eval_reward_vs_heuristic",
     "eval_bid_hit",
@@ -311,8 +313,11 @@ def train_command(args: argparse.Namespace) -> int:
                 f"(collect {summary.collect_sec:.1f} update {stats.update_sec:.1f}) "
                 f"| leaves {summary.leaves:5d} positions {stats.positions:6d} "
                 f"| bid_hit {summary.bid_hit_rate:.3f} "
-                f"| kl {stats.policy_kl:.5f}"
+                f"| kl {stats.policy_kl:.5f} "
+                f"| step {stats.step_scale:.3f}"
             )
+            if stats.backtracks:
+                message += f" ({stats.backtracks} backtracks)"
             if stats.rolled_back:
                 message += " ROLLBACK"
             if eval_reward is not None:
@@ -452,6 +457,8 @@ def _metric_row(
         "loss_bid_hit": stats.loss_bid_hit,
         "entropy": stats.entropy,
         "policy_kl": stats.policy_kl,
+        "backtracks": stats.backtracks,
+        "step_scale": stats.step_scale,
         "rolled_back": int(stats.rolled_back),
         "eval_reward_vs_heuristic": (
             "" if eval_reward is None else eval_reward

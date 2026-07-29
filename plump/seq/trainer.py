@@ -1,14 +1,15 @@
 """Trainer for the schema-v6 sequence pipeline.
 
 One update consumes the collected trees as full causal forwards grouped by
-(players, hand size). There is a single policy objective — NeuRD — over every
-focal decision, plus per-position value and belief auxiliary losses.
+(players, hand size). The policy objective is selectable: the original NeuRD
+update or sampled entropic policy mirror descent. Both operate over every focal
+decision and share the per-position value and belief auxiliary losses.
 
-Why one objective. The rollout is an external-sampling tree: the focal's
+Why these objectives. The rollout is an external-sampling tree: the focal's
 actions are enumerated (or drawn by an explicit rule) while chance and the
 opponents are sampled. On that data an importance ratio corrects nothing —
 ratios exist to repair sampling from the policy, and the candidate set was not
-drawn that way. NeuRD's loss has no expectation over actions in it at all:
+drawn that way. NeuRD's loss has no expectation over actions in it:
 
     L = -sum_a w_a * sg[A(a)] * y_a      =>      dL/dy_a = -w_a * A(a)
 
@@ -29,6 +30,13 @@ expanded that action. Without it, a rule that expands by sampling the policy
 gives E[gradient] ~ pi(a)*A(a) — the policy-gradient prefactor NeuRD exists to
 remove, reintroduced through the candidate sampler. Tree weighting keeps
 factorially larger games from dominating.
+
+Mirror descent uses the same correction to construct a sampled full-action
+advantage estimate, takes the exact exponentiated policy-improvement step for
+that estimate, and fits the resulting KL-bounded distribution. Its per-row
+gradient is ``pi_new - pi_target``, so it cannot explode with the raw
+counterfactual reward scale. A post-update KL guard can backtrack the Adam step
+instead of throwing away an otherwise useful rollout.
 """
 
 from __future__ import annotations
@@ -69,7 +77,7 @@ from .tokens import IGNORE_LABEL, build_replay_arrays, build_seat_tokens
 
 @dataclass
 class PolicyRows:
-    """NeuRD rows for one phase within one group.
+    """Counterfactual policy rows for one phase within one group.
 
     One row per focal decision, branched or not. A branched decision carries
     its candidate set; an unbranched one carries the single realized action.
@@ -117,6 +125,8 @@ class SeqUpdateStats:
     entropy: float = 0.0
     policy_kl: float = 0.0
     rolled_back: bool = False
+    backtracks: int = 0
+    step_scale: float = 1.0
     policy_rows: int = 0
     # Split of policy_rows by how the row was produced. Diagnostics: both
     # feed the same loss.
@@ -170,6 +180,69 @@ def summarize_trees(trees: list[SeqTree], collector_stats) -> SeqRolloutSummary:
     )
     summary.spine_entropy = float(np.mean(entropies)) if entropies else 0.0
     return summary
+
+
+def mirror_descent_target(
+    old_probs: torch.Tensor,
+    advantages: torch.Tensor,
+    legal: torch.Tensor,
+    *,
+    step_size: float,
+    uniform_mix: float,
+    target_kl: float,
+    bisection_steps: int = 16,
+) -> torch.Tensor:
+    """Return the exact sampled entropic mirror-descent target.
+
+    ``advantages`` is already the full-support sampled estimate (zero for an
+    unexpanded legal action). The unconstrained update is
+
+        target ∝ anchor * exp(step_size * advantages)
+
+    where ``anchor`` is ``old_probs`` mixed with legal-uniform exploration.
+    Written relative to ``old_probs``, this is one exponentiated direction.
+    Scaling that direction is itself an entropic mirror-descent step, so a
+    vectorized bisection can enforce ``KL(old || target) <= target_kl`` without
+    clipping probabilities after normalization.
+    """
+
+    old_probs = old_probs.detach()
+    advantages = advantages.detach()
+    legal_float = legal.float()
+    legal_count = legal_float.sum(dim=-1, keepdim=True).clamp_min(1.0)
+    uniform = legal_float / legal_count
+    anchor = (1.0 - uniform_mix) * old_probs + uniform_mix * uniform
+
+    log_old = torch.log(old_probs.clamp_min(1e-12))
+    direction = (
+        torch.log(anchor.clamp_min(1e-12)) - log_old + step_size * advantages
+    )
+    direction = torch.where(legal, direction, torch.zeros_like(direction))
+
+    def at(scale: torch.Tensor) -> torch.Tensor:
+        scores = log_old + scale * direction
+        return torch.softmax(scores.masked_fill(~legal, float("-inf")), dim=-1)
+
+    full = at(torch.ones((old_probs.shape[0], 1), device=old_probs.device))
+    if target_kl <= 0:
+        return full
+
+    def old_to(candidate: torch.Tensor) -> torch.Tensor:
+        log_candidate = torch.log(candidate.clamp_min(1e-12))
+        return (
+            old_probs * (log_old - log_candidate) * legal_float
+        ).sum(dim=-1, keepdim=True)
+
+    full_kl = old_to(full)
+    low = torch.zeros_like(full_kl)
+    high = torch.ones_like(full_kl)
+    for _ in range(bisection_steps):
+        middle = (low + high) * 0.5
+        acceptable = old_to(at(middle)) <= target_kl
+        low = torch.where(acceptable, middle, low)
+        high = torch.where(acceptable, high, middle)
+    scale = torch.where(full_kl <= target_kl, torch.ones_like(low), low)
+    return at(scale)
 
 
 # --------------------------------------------------------------------- #
@@ -497,15 +570,40 @@ class SeqTrainer:
                 self.model.parameters(), self.train.max_grad_norm
             )
             self._apply_warmup_lr()
-            self.optimizer.step()
-            policy_kl = self._evaluate_policy_kl(groups)
-            stats.policy_kl = policy_kl
-            if stats.policy_rows > 0 and policy_kl > self.train.policy_kl_cap:
+            nominal_lrs = [
+                float(group["lr"]) for group in self.optimizer.param_groups
+            ]
+            accepted = False
+            attempts = self.train.kl_backtrack_attempts + 1
+            for attempt in range(attempts):
+                if attempt:
+                    self.model.load_state_dict(snapshot[0])
+                    self.optimizer.load_state_dict(snapshot[1])
+                scale = self.train.kl_backtrack_factor**attempt
+                for group, nominal_lr in zip(
+                    self.optimizer.param_groups, nominal_lrs
+                ):
+                    group["lr"] = nominal_lr * scale
+                self.optimizer.step()
+                policy_kl = self._evaluate_policy_kl(groups)
+                stats.policy_kl = policy_kl
+                if (
+                    stats.policy_rows == 0
+                    or policy_kl <= self.train.policy_kl_cap
+                ):
+                    stats.backtracks += attempt
+                    stats.step_scale = min(stats.step_scale, scale)
+                    accepted = True
+                    self.optimizer_steps += 1
+                    break
+            for group, nominal_lr in zip(self.optimizer.param_groups, nominal_lrs):
+                group["lr"] = nominal_lr
+            if not accepted:
                 self.model.load_state_dict(snapshot[0])
                 self.optimizer.load_state_dict(snapshot[1])
                 stats.rolled_back = True
+                stats.step_scale = 0.0
                 break
-            self.optimizer_steps += 1
         self._release_device_memory()
         stats.update_sec = time.perf_counter() - started
         return stats
@@ -691,7 +789,7 @@ class SeqTrainer:
         return None, terms
 
     def _policy_terms(self, output, rows, phase_key):
-        """Per-row NeuRD losses, KL(old||new) divergences, and entropies."""
+        """Per-row selected-objective losses, divergences, and entropies."""
 
         device = self.device
         train = self.train
@@ -735,21 +833,27 @@ class SeqTrainer:
 
         gathered = logits.gather(1, cand)
         advantages = (q_values - baseline) * cand_mask.float()
-        advantages = advantages.clamp(
-            -train.neurd_advantage_clip, train.neurd_advantage_clip
-        )
 
         # 1/q correction for which actions the branch rule expanded. Capped
         # because the deterministic and single-sample rules can put q at the
         # policy mass of a near-zero-probability action; with a uniform or
         # Gumbel arm in play the cap is essentially never reached.
-        exponent = train.neurd_inclusion_exponent
+        if train.policy_objective == "neurd":
+            advantage_clip = train.neurd_advantage_clip
+            exponent = train.neurd_inclusion_exponent
+            inclusion_cap = train.neurd_inclusion_cap
+        else:
+            advantage_clip = train.mirror_advantage_clip
+            exponent = train.mirror_inclusion_exponent
+            inclusion_cap = train.mirror_inclusion_cap
+        if advantage_clip > 0:
+            advantages = advantages.clamp(-advantage_clip, advantage_clip)
         if exponent == 0.0:
             importance = cand_mask.float()
         else:
             importance = (
                 inclusion.clamp_min(1e-6).pow(-exponent).clamp_max(
-                    train.neurd_inclusion_cap
+                    inclusion_cap
                 )
                 * cand_mask.float()
             )
@@ -765,26 +869,46 @@ class SeqTrainer:
         probs_new = safe.exp() * legal.float()
         entropies = -(probs_new * safe).sum(dim=-1)
 
-        # L = -sum_a w_a A(a) y_a, so dL/dy_a = -w_a A(a): each candidate logit
-        # moves by its own regret, with no pi(a) prefactor and no dependence on
-        # which siblings were expanded.
-        #
-        # Deliberately *not* centered over the candidate set. Centering is only
-        # a null direction when the set is every legal action; for a capped set
-        # it would cancel the one real signal about the set as a whole -- if
-        # every expanded action beat the baseline, mass should move to them
-        # from the unexpanded ones. Nor is the loss divided by the candidate
-        # count: a k=1 row would then have exactly zero gradient, and scaling
-        # each action's regret by how many siblings it happened to get is the
-        # arbitrary weighting this objective exists to remove. What keeps the
-        # per-action gradients honest across different set sizes is the 1/q
-        # correction above, not a per-row rescale.
         scaled_adv = advantages * importance * cand_mask.float()
-        finite = torch.where(cand_mask, gathered, torch.zeros_like(gathered))
-        regret = -(scaled_adv.detach() * finite).sum(dim=-1)
-        losses = (
-            train.neurd_regret_coef * regret + train.neurd_kl_coef * divergences
-        )
+        if train.policy_objective == "neurd":
+            # L = -sum_a w_a A(a) y_a, so dL/dy_a = -w_a A(a): each
+            # candidate logit moves by its own regret, with no pi(a) prefactor
+            # and no dependence on which siblings were expanded.
+            #
+            # Deliberately *not* centered over the candidate set. Centering is
+            # only a null direction when the set is every legal action; for a
+            # capped set it would cancel the signal that mass should move from
+            # unexpanded actions when every expanded one beat the baseline.
+            finite = torch.where(cand_mask, gathered, torch.zeros_like(gathered))
+            regret = -(scaled_adv.detach() * finite).sum(dim=-1)
+            losses = (
+                train.neurd_regret_coef * regret
+                + train.neurd_kl_coef * divergences
+            )
+        else:
+            # Horvitz-Thompson sampled full-action advantage: unexpanded legal
+            # actions are zero, expanded actions carry A/q. Candidate indices
+            # are unique under every branch rule, but scatter_add also makes
+            # this correct if a future sampler represents multiplicity.
+            full_adv = torch.zeros_like(logits).scatter_add(
+                1, cand, scaled_adv
+            )
+            target = mirror_descent_target(
+                old_full,
+                full_adv,
+                legal,
+                step_size=train.mirror_step_size,
+                uniform_mix=train.mirror_uniform_mix,
+                target_kl=train.mirror_target_kl,
+            )
+            log_target = torch.log(target.clamp_min(1e-12))
+            # KL(target || current). The target is stopped by construction;
+            # the gradient on each logit is pi_current - target.
+            losses = (
+                target
+                * (log_target - safe)
+                * legal.float()
+            ).sum(dim=-1)
         return losses, divergences, entropies, weight
 
     def _evaluate_policy_kl(self, groups) -> float:

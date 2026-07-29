@@ -2,7 +2,8 @@
 
 An autoregressive self-play agent for the Swedish trick-taking game Plump.
 The current and only model pipeline is schema v6: a causal transformer,
-KV-cached counterfactual rollout collector, and NeuRD trainer.
+KV-cached counterfactual rollout collector, and selectable NeuRD or sampled
+policy-mirror-descent trainer.
 
 ## Quick start
 

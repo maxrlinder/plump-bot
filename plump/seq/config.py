@@ -52,6 +52,8 @@ SLOT_NEXT_PHASE = 11
 #           costs P tokens instead of P + N*P)
 #   all  -> before every bid and every card play
 TurnTokenMode = Literal["off", "bid", "all"]
+PolicyObjective = Literal["neurd", "mirror_descent"]
+POLICY_OBJECTIVES: frozenset[str] = frozenset(get_args(PolicyObjective))
 
 
 def seq_len(
@@ -772,8 +774,16 @@ class SeqTrainingConfig:
     microbatch_positions: int = 16384
     max_grad_norm: float = 1.0
 
-    # Policy objective. One loss over every focal decision: NeuRD, whose
-    # gradient on the logit of action a is -A(a), independent of pi(a).
+    # Policy objective. Both choices consume the same counterfactual rows and
+    # leave collection unchanged:
+    #
+    #   neurd          direct per-logit regret updates (the legacy objective)
+    #   mirror_descent fit an exponentiated, KL-bounded policy-improvement
+    #                  target constructed from the sampled action values
+    policy_objective: PolicyObjective = "neurd"
+
+    # NeuRD. One loss over every focal decision, with gradient on the logit of
+    # action a equal to -A(a), independent of pi(a).
     #
     # Why not a policy gradient: the softmax PG gradient is pi(a)*A(a), so an
     # action the policy has drifted away from moves quadratically slowly in
@@ -803,6 +813,36 @@ class SeqTrainingConfig:
     # |legal| <= 11 here, so the cap below is rarely reached.
     neurd_inclusion_exponent: float = 1.0
     neurd_inclusion_cap: float = 12.0
+
+    # Sampled entropic policy mirror descent. Candidate advantages form a
+    # Horvitz-Thompson estimate of the full legal advantage vector:
+    #
+    #   A_hat(a) = 1[a expanded] * (Q(a) - V) / q(a)^exponent
+    #
+    # The non-parametric improvement target is the exact exponentiated update
+    # for that estimate:
+    #
+    #   pi_target(a) proportional to pi_old(a) * exp(step_size * A_hat(a))
+    #
+    # ``mirror_uniform_mix`` replaces pi_old in the proximal anchor by a small
+    # mixture with the legal uniform distribution. It gives a deliberately
+    # suppressed action finite recovery velocity; zero is plain mirror descent.
+    # The whole exponentiated direction is scaled per row until
+    # KL(pi_old || pi_target) <= mirror_target_kl, then fitted by forward
+    # cross-entropy. A zero target KL disables this inner bound.
+    mirror_step_size: float = 1.0
+    mirror_target_kl: float = 0.003
+    mirror_uniform_mix: float = 0.0
+    mirror_advantage_clip: float = 10.0
+    mirror_inclusion_exponent: float = 1.0
+    mirror_inclusion_cap: float = 12.0
+
+    # If the shared neural update still exceeds ``policy_kl_cap``, retry the
+    # same Adam step from the exact pre-step model/optimizer state at
+    # ``factor ** attempt`` of its nominal learning rate. Zero attempts keeps
+    # the legacy all-or-nothing rollback behavior.
+    kl_backtrack_attempts: int = 0
+    kl_backtrack_factor: float = 0.5
 
     # Loss weighting across games/trees.
     tree_weighting: Literal["per_tree", "per_row"] = "per_tree"
@@ -887,6 +927,32 @@ class SeqTrainingConfig:
 
     def validate(self) -> None:
         self.rollout.validate()
+        if self.policy_objective not in POLICY_OBJECTIVES:
+            raise ValueError(
+                f"Unknown policy_objective {self.policy_objective!r}; expected "
+                f"one of {sorted(POLICY_OBJECTIVES)}."
+            )
+        if self.policy_kl_cap <= 0:
+            raise ValueError("policy_kl_cap must be > 0.")
+        if self.neurd_advantage_clip < 0 or self.mirror_advantage_clip < 0:
+            raise ValueError("Advantage clips must be >= 0.")
+        if (
+            self.neurd_inclusion_exponent < 0
+            or self.mirror_inclusion_exponent < 0
+        ):
+            raise ValueError("Inclusion exponents must be >= 0.")
+        if self.neurd_inclusion_cap <= 0 or self.mirror_inclusion_cap <= 0:
+            raise ValueError("Inclusion caps must be > 0.")
+        if self.mirror_step_size <= 0:
+            raise ValueError("mirror_step_size must be > 0.")
+        if self.mirror_target_kl < 0:
+            raise ValueError("mirror_target_kl must be >= 0.")
+        if not 0.0 <= self.mirror_uniform_mix < 1.0:
+            raise ValueError("mirror_uniform_mix must be in [0, 1).")
+        if self.kl_backtrack_attempts < 0:
+            raise ValueError("kl_backtrack_attempts must be >= 0.")
+        if not 0.0 < self.kl_backtrack_factor < 1.0:
+            raise ValueError("kl_backtrack_factor must be in (0, 1).")
         if len(self.player_counts) != len(self.player_count_weights):
             raise ValueError("player_count_weights must match player_counts.")
         if any(weight < 0 for weight in self.player_count_weights):

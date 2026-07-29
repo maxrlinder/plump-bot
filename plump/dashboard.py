@@ -78,6 +78,8 @@ def render_dashboard(
             ("spine_entropy", "spine entropy"),
             ("entropy", "update entropy"),
             ("policy_kl", "policy KL"),
+            ("step_scale", "step scale"),
+            ("backtracks", "backtracks"),
             ("rolled_back", "rollback"),
         ),
         smooth=smooth,

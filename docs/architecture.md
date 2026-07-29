@@ -64,10 +64,10 @@ three policy arms are what the value backup averages over, weighted Hájek
 was reached by exploring, not by the policy, so admitting it to the average
 would pull the parent's value toward actions the policy does not play. Its
 inclusion probability is real, though, and that is its purpose: it puts a floor
-under q for every legal action, which keeps NeuRD's 1/q correction bounded on
-actions the policy has driven toward zero. Drawing it from the complement
-rather than from all legal actions is what makes it always a new subtree
-instead of sometimes a duplicate of one already expanded.
+under q for every legal action, which keeps the policy objective's 1/q
+correction bounded on actions the policy has driven toward zero. Drawing it
+from the complement rather than from all legal actions is what makes it always
+a new subtree instead of sometimes a duplicate of one already expanded.
 
 ## Heads
 

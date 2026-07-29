@@ -22,6 +22,7 @@ from plump.seq.trainer import (
     SeqTrainer,
     _rows_by_chunk,
     build_training_groups,
+    mirror_descent_target,
     summarize_trees,
 )
 
@@ -193,6 +194,102 @@ def test_entropy_bonus_and_advantage_clip_run():
     stats = trainer.update(trees)
     assert np.isfinite(stats.loss_policy) or stats.policy_rows == 0
     assert np.isfinite(stats.entropy)
+
+
+def test_mirror_descent_target_matches_closed_form_exponentiated_update():
+    old = torch.tensor([[0.25, 0.75, 0.0]])
+    advantages = torch.tensor([[2.0, -1.0, 99.0]])
+    legal = old > 0
+    observed = mirror_descent_target(
+        old,
+        advantages,
+        legal,
+        step_size=0.5,
+        uniform_mix=0.0,
+        target_kl=0.0,
+    )
+    expected = torch.softmax(
+        torch.tensor(
+            [[np.log(0.25) + 1.0, np.log(0.75) - 0.5]],
+            dtype=old.dtype,
+        ),
+        dim=-1,
+    )
+    torch.testing.assert_close(observed[:, :2], expected)
+    assert observed[0, 2] == 0
+
+
+def test_mirror_descent_target_respects_kl_bound_and_legal_support():
+    old = torch.tensor([[0.97, 0.02, 0.01, 0.0]])
+    advantages = torch.tensor([[0.0, 4.0, 10.0, 100.0]])
+    legal = old > 0
+    cap = 0.003
+    target = mirror_descent_target(
+        old,
+        advantages,
+        legal,
+        step_size=2.0,
+        uniform_mix=0.02,
+        target_kl=cap,
+        bisection_steps=24,
+    )
+    kl = (
+        old
+        * (
+            torch.log(old.clamp_min(1e-12))
+            - torch.log(target.clamp_min(1e-12))
+        )
+        * legal.float()
+    ).sum()
+    assert kl <= cap + 1e-6
+    assert target.sum() == pytest.approx(1.0)
+    assert target[0, 2] > old[0, 2]
+    assert target[0, 3] == 0
+
+
+def test_mirror_descent_update_is_finite_and_changes_weights():
+    trainer = make_trainer(
+        policy_objective="mirror_descent",
+        mirror_uniform_mix=0.02,
+        mirror_target_kl=0.003,
+    )
+    trees, _ = trainer.collect()
+    before = [parameter.detach().clone() for parameter in trainer.model.parameters()]
+    stats = trainer.update(trees)
+    assert np.isfinite(stats.loss_policy)
+    assert np.isfinite(stats.policy_kl)
+    assert not stats.rolled_back
+    assert any(
+        not torch.equal(left, right)
+        for left, right in zip(before, trainer.model.parameters())
+    )
+
+
+def test_unknown_policy_objective_is_rejected():
+    with pytest.raises(ValueError, match="policy_objective"):
+        make_trainer(policy_objective="ppo")
+
+
+def test_kl_backtracking_accepts_a_smaller_adam_step():
+    trainer = make_trainer(
+        policy_objective="mirror_descent",
+        learning_rate=0.1,
+        lr_warmup_updates=0,
+        policy_kl_cap=1e-4,
+        mirror_target_kl=5e-5,
+        kl_backtrack_attempts=16,
+        kl_backtrack_factor=0.5,
+        suit_coef=0.0,
+        trick_coef=0.0,
+        bid_hit_coef=0.0,
+    )
+    trees, _ = trainer.collect()
+    stats = trainer.update(trees)
+    assert not stats.rolled_back
+    assert stats.backtracks > 0
+    assert 0.0 < stats.step_scale < 1.0
+    assert stats.policy_kl <= trainer.train.policy_kl_cap
+    assert trainer.optimizer_steps == 1
 
 
 def test_lr_warmup_ramps_and_survives_the_kl_cap():

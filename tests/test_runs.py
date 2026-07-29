@@ -50,6 +50,13 @@ def _trainer() -> SeqTrainer:
 def test_run_creation_records_config_and_rejects_field_changes(tmp_path):
     assert CHECKOUT_CONFIG_PATH.read_bytes() == PACKAGED_CONFIG_PATH.read_bytes()
     resolved = load_training_config()
+    assert resolved.training.policy_objective == "mirror_descent"
+    assert resolved.training.branch_depth_exponent == -1.0
+    assert resolved.training.kl_backtrack_attempts == 8
+    assert resolved.training.branch_rule.bid_rule() == (
+        "gumbel_top_k_plus_random",
+        4,
+    )
     run = RunDirectory("unit-run", root=tmp_path)
 
     with run.acquire_lock():

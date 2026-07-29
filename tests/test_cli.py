@@ -25,10 +25,8 @@ TINY_OVERRIDES = (
     "training.games_per_cell=1",
     "training.reference_rate=0.01",
     "training.exhaustive_until=2",
-    # The tiny run wants no branching at all, which the preset's
-    # bid_mode="same_as_play" refuses to inherit from play_mode="none" -- the
-    # bid is never rate-gated, so an unexpanded root is an error there rather
-    # than a setting. Say it explicitly, which is what the guard asks for.
+    # The tiny run wants no branching at all, including the preset's explicit
+    # multi-arm bid exploration.
     'training.bid_mode="top_k"',
     "training.bid_top_k=1",
     'training.play_mode="none"',
