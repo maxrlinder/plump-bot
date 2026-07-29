@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import csv
+import json
 import math
+import re
 import uuid
 from pathlib import Path
 
@@ -25,6 +27,7 @@ def render_dashboard(
     smooth: int = 20,
     dpi: int = 150,
     include_learning_rate: bool = False,
+    evaluations_path: str | Path | None = None,
 ) -> int:
     """Render comparable quantities together and discrete events without smoothing."""
 
@@ -35,6 +38,12 @@ def render_dashboard(
         raise ValueError(f"No metric rows in {metrics_path}")
 
     iteration = _series(rows, "iteration")
+    evaluation_points = _evaluation_points(
+        rows,
+        Path(evaluations_path)
+        if evaluations_path is not None
+        else metrics_path.parent / "evaluations",
+    )
     fig, axes = plt.subplots(3, 3, figsize=(20, 13), constrained_layout=True)
     fig.get_layout_engine().set(rect=(0.0, 0.035, 1.0, 0.96))
     fig.suptitle(
@@ -42,16 +51,9 @@ def render_dashboard(
         fontsize=16,
     )
 
-    _dual_lines(
+    _checkpoint_evaluation(
         axes[0, 0],
-        iteration,
-        rows,
-        left=(("eval_reward_vs_heuristic", "relative reward"),),
-        right=(("eval_bid_hit", "bid accuracy"),),
-        smooth=1,
-        title="Held-out evaluation",
-        left_label="relative reward",
-        right_label="bid accuracy",
+        evaluation_points,
     )
     _dual_lines(
         axes[0, 1],
@@ -190,20 +192,24 @@ def render_dashboard(
     last = rows[-1]
     backtracks = int(sum(_finite(_series(rows, "backtracks"))))
     rollbacks = int(sum(_finite(_series(rows, "rolled_back"))))
+    footer = [
+        f"iteration {int(_number(last, 'iteration'))}",
+        f"optimizer steps {int(_number(last, 'optimizer_steps'))}",
+    ]
+    if include_learning_rate:
+        footer.append(f"LR {_number(last, 'learning_rate'):.2e}")
+    footer.extend(
+        (
+            f"step scale {_number(last, 'step_scale'):.3f}",
+            f"backtracks {backtracks}",
+            f"rollbacks {rollbacks}",
+            f"elapsed {_duration(_number(last, 'elapsed_sec'))}",
+        )
+    )
     fig.text(
         0.5,
         0.012,
-        " · ".join(
-            (
-                f"iteration {int(_number(last, 'iteration'))}",
-                f"optimizer steps {int(_number(last, 'optimizer_steps'))}",
-                f"LR {_number(last, 'learning_rate'):.2e}",
-                f"step scale {_number(last, 'step_scale'):.3f}",
-                f"backtracks {backtracks}",
-                f"rollbacks {rollbacks}",
-                f"elapsed {_duration(_number(last, 'elapsed_sec'))}",
-            )
-        ),
+        " · ".join(footer),
         ha="center",
         fontsize=9,
     )
@@ -227,6 +233,119 @@ def _read_rows(path: Path) -> list[dict[str, str]]:
         raise FileNotFoundError(path)
     with path.open(newline="") as handle:
         return list(csv.DictReader(handle))
+
+
+def _evaluation_points(
+    rows: list[dict[str, str]],
+    evaluations_path: Path,
+) -> list[dict[str, float]]:
+    """Merge inline legacy scores with checkpoint-scoped sidecar reports."""
+
+    points: dict[int, dict[str, float]] = {}
+    iterations = _series(rows, "iteration")
+    rewards = _series(rows, "eval_reward_vs_heuristic")
+    bids = _series(rows, "eval_bid_hit")
+    for iteration, reward, bid in zip(iterations, rewards, bids):
+        if np.isfinite(iteration) and (np.isfinite(reward) or np.isfinite(bid)):
+            points[int(iteration)] = {
+                "iteration": float(iteration),
+                "reward": float(reward),
+                "bid_hit": float(bid),
+                "ci_low": math.nan,
+                "ci_high": math.nan,
+            }
+
+    if evaluations_path.is_dir():
+        for path in sorted(evaluations_path.glob("iter_*/heuristic.json")):
+            try:
+                payload = json.loads(path.read_text())
+                report = payload.get("report", payload)
+                raw_iteration = payload.get("iteration")
+                if raw_iteration is None:
+                    match = re.fullmatch(r"iter_(\d+)", path.parent.name)
+                    if match is None:
+                        continue
+                    raw_iteration = match.group(1)
+                iteration = int(raw_iteration)
+                points[iteration] = {
+                    "iteration": float(iteration),
+                    "reward": float(report["macro_relative_reward"]),
+                    "bid_hit": float(report["macro_bid_hit_rate"]),
+                    "ci_low": float(report.get("relative_reward_ci_low", math.nan)),
+                    "ci_high": float(
+                        report.get("relative_reward_ci_high", math.nan)
+                    ),
+                }
+            except (KeyError, TypeError, ValueError, json.JSONDecodeError, OSError):
+                continue
+    return [points[key] for key in sorted(points)]
+
+
+def _checkpoint_evaluation(ax, points: list[dict[str, float]]) -> None:
+    right_ax = ax.twinx()
+    ax.set_title("Checkpoint evaluation vs heuristic")
+    if not points:
+        right_ax.set_yticks([])
+        right_ax.spines["right"].set_visible(False)
+        _no_data(ax)
+        return
+
+    iteration = np.asarray(
+        [point["iteration"] for point in points],
+        dtype=np.float64,
+    )
+    reward = np.asarray([point["reward"] for point in points], dtype=np.float64)
+    bid_hit = np.asarray([point["bid_hit"] for point in points], dtype=np.float64)
+    ci_low = np.asarray([point["ci_low"] for point in points], dtype=np.float64)
+    ci_high = np.asarray([point["ci_high"] for point in points], dtype=np.float64)
+
+    handles = []
+    reward_valid = np.isfinite(iteration) & np.isfinite(reward)
+    if reward_valid.any():
+        (reward_line,) = ax.plot(
+            iteration[reward_valid],
+            reward[reward_valid],
+            color="C0",
+            linewidth=1.8,
+            marker="o",
+            label="relative reward",
+        )
+        handles.append(reward_line)
+        ci_valid = (
+            reward_valid
+            & np.isfinite(ci_low)
+            & np.isfinite(ci_high)
+        )
+        if ci_valid.any():
+            ax.fill_between(
+                iteration[ci_valid],
+                ci_low[ci_valid],
+                ci_high[ci_valid],
+                color="C0",
+                alpha=0.12,
+                linewidth=0,
+            )
+        ax.axhline(0.0, color="#777777", linewidth=0.8, alpha=0.45)
+        ax.set_ylabel("relative reward")
+
+    bid_valid = np.isfinite(iteration) & np.isfinite(bid_hit)
+    if bid_valid.any():
+        (bid_line,) = right_ax.plot(
+            iteration[bid_valid],
+            bid_hit[bid_valid],
+            color="C1",
+            linewidth=1.8,
+            marker="s",
+            label="bid accuracy",
+        )
+        handles.append(bid_line)
+        right_ax.set_ylabel("bid accuracy")
+        right_ax.grid(False)
+    else:
+        right_ax.set_yticks([])
+        right_ax.spines["right"].set_visible(False)
+    if handles:
+        ax.legend(handles=handles, fontsize=8, loc="best")
 
 
 def _series(rows: list[dict[str, str]], name: str) -> np.ndarray:

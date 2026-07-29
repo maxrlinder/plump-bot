@@ -7,7 +7,12 @@ import json
 
 import torch
 
-from plump.cli import METRIC_COLUMNS, _ensure_metrics_header, main
+from plump.cli import (
+    METRIC_COLUMNS,
+    _ensure_metrics_header,
+    _truncate_metrics_after,
+    main,
+)
 
 TINY_OVERRIDES = (
     "run.iterations=1",
@@ -71,6 +76,26 @@ def test_legacy_metrics_header_is_upgraded_for_outcome_split(tmp_path):
     assert tuple(reader.fieldnames) == METRIC_COLUMNS
     assert rows[0]["bid_hit_rate"] == "0.25"
     assert all(rows[0][field] == "" for field in new_fields)
+
+
+def test_resume_discards_only_post_checkpoint_metric_rows(tmp_path):
+    metrics = tmp_path / "metrics.csv"
+    with metrics.open("w", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=("iteration", "loss_policy"))
+        writer.writeheader()
+        writer.writerows(
+            (
+                {"iteration": 49, "loss_policy": 1.0},
+                {"iteration": 50, "loss_policy": 0.9},
+                {"iteration": 51, "loss_policy": 0.8},
+            )
+        )
+
+    assert _truncate_metrics_after(metrics, 50) == 1
+    with metrics.open(newline="") as handle:
+        rows = list(csv.DictReader(handle))
+    assert [row["iteration"] for row in rows] == ["49", "50"]
+    assert _truncate_metrics_after(metrics, 50) == 0
 
 
 def test_cli_tiny_run_resume_and_mismatch(tmp_path, monkeypatch, capsys):

@@ -3,10 +3,16 @@
 from __future__ import annotations
 
 import csv
+import json
 
 import numpy as np
 
-from plump.dashboard import _duration, _has_signal, render_dashboard
+from plump.dashboard import (
+    _duration,
+    _evaluation_points,
+    _has_signal,
+    render_dashboard,
+)
 
 
 def test_dashboard_renders_sparse_partial_and_resumed_rows(tmp_path):
@@ -85,3 +91,42 @@ def test_dashboard_formats_elapsed_time_compactly():
     assert _duration(42.0) == "42s"
     assert _duration(90.0) == "1.5m"
     assert _duration(7200.0) == "2.0h"
+
+
+def test_sidecar_evaluation_overrides_inline_checkpoint_score(tmp_path):
+    evaluations = tmp_path / "evaluations"
+    output = evaluations / "iter_000005" / "heuristic.json"
+    output.parent.mkdir(parents=True)
+    output.write_text(
+        json.dumps(
+            {
+                "format_version": 1,
+                "iteration": 5,
+                "report": {
+                    "macro_relative_reward": 0.35,
+                    "macro_bid_hit_rate": 0.42,
+                    "relative_reward_ci_low": 0.1,
+                    "relative_reward_ci_high": 0.6,
+                },
+            }
+        )
+    )
+    rows = [
+        {
+            "iteration": "5",
+            "eval_reward_vs_heuristic": "-0.5",
+            "eval_bid_hit": "0.2",
+        }
+    ]
+
+    points = _evaluation_points(rows, evaluations)
+
+    assert points == [
+        {
+            "iteration": 5.0,
+            "reward": 0.35,
+            "bid_hit": 0.42,
+            "ci_low": 0.1,
+            "ci_high": 0.6,
+        }
+    ]

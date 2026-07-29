@@ -43,6 +43,7 @@ class RunDirectory:
         self.analysis = self.path / "analysis"
         self.metrics = self.path / "metrics.csv"
         self.dashboard = self.path / "dashboard.png"
+        self.evaluation_dashboard = self.path / "dashboard-eval.png"
         self.config = self.path / "config.toml"
         self.metadata = self.path / "metadata.json"
         self.train_log = self.path / "train.log"
@@ -128,7 +129,7 @@ class RunDirectory:
         path = self.checkpoints / data["path"]
         if path.stat().st_size != int(data["size"]):
             raise RuntimeError(f"Checkpoint size mismatch: {path}")
-        if _sha256(path) != data["sha256"]:
+        if file_sha256(path) != data["sha256"]:
             raise RuntimeError(f"Checkpoint checksum mismatch: {path}")
         return path
 
@@ -166,7 +167,7 @@ def checkpoint_manifest(checkpoint: Path, iteration: int) -> dict[str, Any]:
         "iteration": iteration,
         "path": checkpoint.name,
         "size": checkpoint.stat().st_size,
-        "sha256": _sha256(checkpoint),
+        "sha256": file_sha256(checkpoint),
         "written_at": _timestamp(),
     }
 
@@ -189,7 +190,7 @@ def atomic_write_text(path: Path, value: str) -> None:
             temporary.unlink()
 
 
-def _sha256(path: Path) -> str:
+def file_sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:
         for block in iter(lambda: handle.read(1024 * 1024), b""):

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import argparse
 import csv
-import dataclasses
 import json
 import random
 import sys
@@ -19,13 +18,18 @@ from plump.dashboard import render_dashboard
 from plump.evaluation import DealBank, evaluate_policy
 from plump.gui.app import run as run_gui
 from plump.policies import HeuristicPolicy
+from plump.run_evaluation import (
+    EvaluationProtocol,
+    discover_interval_checkpoints,
+    evaluate_checkpoint,
+)
 from plump.run_config import (
     DEFAULT_CONFIG_PATH,
     config_diff,
     load_training_config,
     resolve_training_config,
 )
-from plump.runs import RunDirectory, atomic_write_json
+from plump.runs import RunDirectory
 from plump.seq.model import SeqPlumpModel
 from plump.seq.policy import SeqModelPolicy, best_seq_device
 from plump.seq.trainer import SeqTrainer
@@ -131,8 +135,29 @@ def build_parser() -> argparse.ArgumentParser:
         help="evaluate a schema-v6 checkpoint against the heuristic",
     )
     evaluate.add_argument("run")
-    evaluate.add_argument("--checkpoint", default="latest")
+    evaluate.add_argument(
+        "--checkpoint",
+        default="latest",
+        help="latest, best, an iteration/path, or all interval checkpoints",
+    )
+    evaluate.add_argument("--opponent", choices=("heuristic",), default="heuristic")
     evaluate.add_argument("--device")
+    evaluate.add_argument("--deals", type=int)
+    evaluate.add_argument("--seed", type=int)
+    evaluate.add_argument("--action-seed", type=int, default=17)
+    evaluate.add_argument("--bootstrap-samples", type=int, default=2000)
+    evaluate.add_argument(
+        "--batch-size",
+        type=int,
+        help="inference batch size (default: min(configured value, 64))",
+    )
+    evaluate.add_argument("--force", action="store_true")
+    evaluate.add_argument(
+        "--watch",
+        action="store_true",
+        help="evaluate each new interval checkpoint until interrupted",
+    )
+    evaluate.add_argument("--poll-seconds", type=float, default=10.0)
     evaluate.set_defaults(handler=evaluate_command)
 
     analyze = subparsers.add_parser(
@@ -209,11 +234,18 @@ def train_command(args: argparse.Namespace) -> int:
         if existed:
             checkpoint = run.resolve_checkpoint("latest")
             trainer.load_checkpoint(checkpoint)
+            discarded = _truncate_metrics_after(run.metrics, trainer.iteration)
             _emit(
                 run,
                 f"Resumed {run.name} from {checkpoint.name} "
                 f"at iteration {trainer.iteration}.",
             )
+            if discarded:
+                _emit(
+                    run,
+                    f"Discarded {discarded} metric rows newer than the "
+                    "resumed checkpoint.",
+                )
         elif args.from_checkpoint is not None:
             source = args.from_checkpoint.expanduser().resolve()
             trainer.load_checkpoint(
@@ -235,6 +267,10 @@ def train_command(args: argparse.Namespace) -> int:
             )
         else:
             _emit(run, f"Created run {run.name} on {device}.")
+            initial = run.interval_checkpoint(0)
+            trainer.save_checkpoint(initial)
+            run.record_latest(initial, 0)
+            _emit(run, f"Saved reproducible initial checkpoint {initial.name}.")
 
         _ensure_metrics_header(run.metrics)
         elapsed_before = _recorded_elapsed(run.metrics)
@@ -376,38 +412,111 @@ def dashboard_command(args: argparse.Namespace) -> int:
 
 def evaluate_command(args: argparse.Namespace) -> int:
     run = RunDirectory(args.run)
-    checkpoint = run.resolve_checkpoint(args.checkpoint)
     resolved = resolve_training_config(run.recorded_config())
     evaluation = resolved.evaluation
     device = args.device or str(best_seq_device())
-    policy = SeqModelPolicy.from_checkpoint(
-        checkpoint,
-        device=device,
-        greedy=True,
-        name=checkpoint.stem,
+    deals = int(
+        evaluation["deals"] if args.deals is None else args.deals
+    )
+    deal_seed = int(
+        evaluation["seed"] if args.seed is None else args.seed
+    )
+    batch_size = int(
+        min(int(evaluation["batch_size"]), 64)
+        if args.batch_size is None
+        else args.batch_size
+    )
+    if deals < 1:
+        raise ValueError("--deals must be positive.")
+    if batch_size < 1:
+        raise ValueError("--batch-size must be positive.")
+    if args.bootstrap_samples < 1:
+        raise ValueError("--bootstrap-samples must be positive.")
+    if args.poll_seconds <= 0:
+        raise ValueError("--poll-seconds must be positive.")
+    if args.watch and args.checkpoint != "all":
+        raise ValueError("--watch requires --checkpoint all.")
+
+    hand_sizes = tuple(
+        sorted({cell.hand_size for cell in resolved.training.schedule_cells})
+    )
+    protocol = EvaluationProtocol(
+        opponent=args.opponent,
+        player_counts=resolved.training.player_counts,
+        hand_sizes=hand_sizes,
+        deals_per_configuration=deals,
+        deal_seed=deal_seed,
+        action_seed=int(args.action_seed),
+        bootstrap_samples=int(args.bootstrap_samples),
+        batch_size=batch_size,
     )
     bank = DealBank.generate(
-        player_counts=resolved.training.player_counts,
-        hand_sizes=tuple(
-            sorted({cell.hand_size for cell in resolved.training.schedule_cells})
-        ),
-        deals_per_configuration=int(evaluation["deals"]),
-        seed=int(evaluation["seed"]),
+        player_counts=protocol.player_counts,
+        hand_sizes=protocol.hand_sizes,
+        deals_per_configuration=protocol.deals_per_configuration,
+        seed=protocol.deal_seed,
     )
-    report = evaluate_policy(
-        policy,
-        HeuristicPolicy(),
-        bank,
-        batch_size=int(evaluation["batch_size"]),
-    )
-    output = run.evaluations / _checkpoint_output_name(checkpoint) / "heuristic.json"
-    atomic_write_json(output, dataclasses.asdict(report))
-    print(
-        f"{checkpoint.name}: reward={report.macro_relative_reward:.4f} "
-        f"bid_hit={report.macro_bid_hit_rate:.4f} rounds={report.rounds}"
-    )
-    print(f"Wrote {output}.")
-    return 0
+    processed: set[Path] = set()
+    metrics_signature: tuple[int, int] | None = None
+    while True:
+        if args.checkpoint == "all":
+            checkpoints = discover_interval_checkpoints(run)
+        else:
+            checkpoints = [run.resolve_checkpoint(args.checkpoint)]
+        pending = [path for path in checkpoints if path not in processed]
+        if not checkpoints and not args.watch:
+            raise FileNotFoundError(
+                f"No interval checkpoints in {run.checkpoints}"
+            )
+
+        refreshed = False
+        for checkpoint in pending:
+            payload, created = evaluate_checkpoint(
+                run,
+                checkpoint,
+                protocol=protocol,
+                deal_bank=bank,
+                device=device,
+                force=args.force,
+            )
+            report = payload["report"]
+            status = "evaluated" if created else "cached"
+            print(
+                f"{checkpoint.name}: {status} on {device} in "
+                f"{float(payload['elapsed_sec']):.1f}s | "
+                f"reward={float(report['macro_relative_reward']):.4f} "
+                f"[{float(report['relative_reward_ci_low']):.4f}, "
+                f"{float(report['relative_reward_ci_high']):.4f}] | "
+                f"bid_hit={float(report['macro_bid_hit_rate']):.4f} "
+                f"rounds={int(report['rounds'])}",
+                flush=True,
+            )
+            processed.add(checkpoint)
+            refreshed = True
+
+        current_signature = _file_signature(run.metrics)
+        dashboard_changed = (
+            refreshed
+            or (args.watch and current_signature != metrics_signature)
+        )
+        if dashboard_changed:
+            try:
+                rows = render_dashboard(
+                    run.metrics,
+                    run.evaluation_dashboard,
+                    title=f"Plump schema-v6 · {run.name}",
+                )
+                print(
+                    f"Wrote {run.evaluation_dashboard} from {rows} training rows.",
+                    flush=True,
+                )
+            except (FileNotFoundError, ValueError) as error:
+                print(f"Dashboard refresh deferred: {error}", flush=True)
+            metrics_signature = current_signature
+
+        if not args.watch:
+            return 0
+        time.sleep(args.poll_seconds)
 
 
 def analyze_command(args: argparse.Namespace) -> int:
@@ -559,6 +668,48 @@ def _recorded_elapsed(path: Path) -> float:
     if not rows:
         return 0.0
     return float(rows[-1].get("elapsed_sec") or 0.0)
+
+
+def _truncate_metrics_after(path: Path, iteration: int) -> int:
+    """Atomically discard reporting rows newer than a resumed checkpoint."""
+
+    if not path.is_file():
+        return 0
+    with path.open(newline="") as handle:
+        reader = csv.DictReader(handle)
+        fieldnames = reader.fieldnames
+        rows = list(reader)
+    if not fieldnames:
+        return 0
+    kept = [
+        row
+        for row in rows
+        if int(float(row.get("iteration") or 0)) <= iteration
+    ]
+    discarded = len(rows) - len(kept)
+    if not discarded:
+        return 0
+
+    temporary = path.with_name(f".{path.name}.resume.tmp")
+    try:
+        with temporary.open("w", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(kept)
+            handle.flush()
+        temporary.replace(path)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+    return discarded
+
+
+def _file_signature(path: Path) -> tuple[int, int] | None:
+    try:
+        stat = path.stat()
+    except FileNotFoundError:
+        return None
+    return stat.st_mtime_ns, stat.st_size
 
 
 def _checkpoint_output_name(checkpoint: Path) -> str:

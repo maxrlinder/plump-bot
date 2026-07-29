@@ -30,8 +30,17 @@ is rejected with a field-level diff.
 ```bash
 uv run plump dashboard first-run
 uv run plump evaluate first-run --checkpoint latest
+uv run plump evaluate first-run --checkpoint all
 uv run plump analyze first-run --checkpoint best
 uv run plump play first-run --checkpoint latest
+```
+
+Evaluation is safe to run beside training: it reads atomically completed
+checkpoints, loads one model at a time, and never edits the trainer's metrics
+file. To evaluate each existing and future checkpoint until interrupted:
+
+```bash
+uv run plump evaluate first-run --checkpoint all --watch
 ```
 
 Generated checkpoints, metrics, dashboards, evaluations, and analyses stay

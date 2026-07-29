@@ -9,10 +9,17 @@ It can also be regenerated without touching training:
 uv run plump dashboard RUN
 ```
 
-The dashboard shows held-out strength and bid hit, rollout outcomes, objective
-losses, entropy and KL, branch/data volume, throughput, wall-time breakdown,
-cache pressure, device memory, learning rate, and rollback state. Sparse
-evaluation columns and resumed CSV files are supported.
+The top-left graph combines run-scoped checkpoint evaluations against the
+heuristic with any older inline evaluation rows. Sidecar reports take
+precedence and show relative reward with its confidence band plus bid
+accuracy. The remaining panels show rollout outcomes, objective losses,
+entropy and KL, branch/data volume, throughput, wall-time breakdown, cache
+pressure, device memory, and rollback state. Learning rate is hidden unless
+`--include-learning-rate` is passed. Sparse evaluation results and resumed CSV
+files are supported.
+
+While an older trainer process is still refreshing `dashboard.png`, a sidecar
+evaluator writes the new layout to `dashboard-eval.png`.
 
 ## Card representation analysis
 
