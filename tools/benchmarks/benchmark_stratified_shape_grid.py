@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
 import random
 import statistics
@@ -32,6 +33,7 @@ from plump.seq.config import GameScheduleCell
 from plump.seq.model import SeqPlumpModel
 from plump.seq.policy import best_seq_device
 from plump.seq.rollout import SeqRolloutCollector
+from plump.seq.tokens import card_id
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -47,9 +49,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--device", default=None)
     parser.add_argument("--timeout", type=float, default=900.0)
     parser.add_argument("--output", type=Path, default=None)
+    parser.add_argument(
+        "--matched-two-deal",
+        action="store_true",
+        help=(
+            "compare the same two deals as two serial one-deal waves and one "
+            "paired two-deal wave"
+        ),
+    )
     # Internal child-process arguments.
     parser.add_argument("--one-case", default=None)
     parser.add_argument("--deals", type=int, choices=(1, 2), default=1)
+    parser.add_argument("--games", type=int, default=None)
     parser.add_argument("--repeat", type=int, default=0)
     return parser
 
@@ -67,6 +78,136 @@ def _load_model(checkpoint: Path, device: torch.device) -> SeqPlumpModel:
     return model.to(device).eval()
 
 
+def _sha256(payload: Any) -> str:
+    encoded = json.dumps(
+        payload, sort_keys=True, separators=(",", ":"), allow_nan=False
+    ).encode()
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _tree_fingerprints(trees) -> dict[str, str]:
+    """Identify matched deals and their realized discrete rollout workload.
+
+    Policy probabilities are rounded only for the numerical fingerprint so
+    harmless backend noise below 1e-6 does not obscure an otherwise identical
+    batch-vs-serial rollout. The discrete fingerprint remains exact.
+    """
+
+    deal_payload = []
+    discrete_payload = []
+    canonical_discrete_payload = []
+    policy_payload = []
+    for tree in trees:
+        deal = {
+            "players": tree.num_players,
+            "hand_size": tree.hand_size,
+            "focal": tree.focal,
+            "start": tree.bidding_start_player,
+            "hands": {
+                str(player): sorted(card_id(card) for card in hand)
+                for player, hand in sorted(tree.initial_hands.items())
+            },
+        }
+        deal_payload.append(deal)
+        leaves = []
+        canonical_leaves = []
+        policies = []
+        for leaf in tree.leaves:
+            decisions = []
+            probability_rows = []
+            for record in leaf.decisions:
+                branch = record.branch
+                decisions.append(
+                    {
+                        "position": record.position,
+                        "phase": record.phase,
+                        "sampled": record.action_index,
+                        "candidates": (
+                            None if branch is None else branch.candidate_indices
+                        ),
+                        "children": (
+                            None
+                            if branch is None
+                            else sorted(branch.child_values.items())
+                        ),
+                    }
+                )
+                probability_rows.append(
+                    {
+                        "old": [round(float(value), 6) for value in record.old_probs],
+                        "prior": (
+                            None
+                            if branch is None
+                            else [
+                                round(float(value), 6) for value in branch.prior_probs
+                            ]
+                        ),
+                        "q": (
+                            None
+                            if branch is None
+                            else [
+                                round(float(value), 6)
+                                for value in branch.inclusion_probs
+                            ]
+                        ),
+                    }
+                )
+            round_state = leaf.env.state.current_round
+            leaf_payload = {
+                "owned_from": leaf.owned_from,
+                "spine": leaf.on_policy_spine,
+                "terminal": leaf.terminal_value,
+                "scores": round_state.round_scores,
+                "decisions": decisions,
+            }
+            leaves.append(leaf_payload)
+            canonical_leaves.append(
+                {
+                    **leaf_payload,
+                    "decisions": [
+                        {
+                            **decision,
+                            "candidates": (
+                                None
+                                if decision["candidates"] is None
+                                else sorted(decision["candidates"])
+                            ),
+                        }
+                        for decision in decisions
+                    ],
+                }
+            )
+            policies.append(probability_rows)
+        discrete_payload.append(
+            {
+                "deal": deal,
+                "leaf_total": tree.leaf_total,
+                "decision_total": tree.decision_total,
+                "leaves": leaves,
+            }
+        )
+        canonical_discrete_payload.append(
+            {
+                "deal": deal,
+                "leaf_total": tree.leaf_total,
+                "decision_total": tree.decision_total,
+                "leaves": sorted(
+                    canonical_leaves,
+                    key=lambda value: json.dumps(
+                        value, sort_keys=True, separators=(",", ":")
+                    ),
+                ),
+            }
+        )
+        policy_payload.append(policies)
+    return {
+        "deal_fingerprint": _sha256(deal_payload),
+        "ordered_discrete_fingerprint": _sha256(discrete_payload),
+        "canonical_discrete_fingerprint": _sha256(canonical_discrete_payload),
+        "policy_fingerprint_6dp": _sha256(policy_payload),
+    }
+
+
 def run_one_case(args: argparse.Namespace) -> dict[str, Any]:
     players, hand_size = (int(part) for part in args.one_case.split(","))
     run = RunDirectory(args.run)
@@ -82,6 +223,9 @@ def run_one_case(args: argparse.Namespace) -> dict[str, Any]:
     np.random.seed(seed)
     torch.manual_seed(seed)
     model = _load_model(checkpoint, device)
+    games = args.games if args.games is not None else args.deals
+    if games < args.deals or games % args.deals:
+        raise ValueError("--games must be a positive multiple of --deals.")
 
     rollout = replace(
         resolved.training.rollout,
@@ -96,7 +240,7 @@ def run_one_case(args: argparse.Namespace) -> dict[str, Any]:
             GameScheduleCell(
                 hand_size=hand_size,
                 num_players=players,
-                games=args.deals,
+                games=games,
             ),
         ),
         branch_budget=replace(
@@ -120,18 +264,30 @@ def run_one_case(args: argparse.Namespace) -> dict[str, Any]:
     raw_positions = sum(
         length - leaf.owned_from for tree in trees for leaf in tree.leaves
     )
+    shape_cost = stats.by_shape[(players, hand_size)]
+    mode = (
+        "serial"
+        if games == 2 and args.deals == 1
+        else "paired"
+        if games == 2 and args.deals == 2
+        else "solo"
+        if games == 1
+        else f"batch_{args.deals}"
+    )
     result = {
         "players": players,
         "hand_size": hand_size,
-        "mode": "solo" if args.deals == 1 else "paired",
-        "deals": args.deals,
+        "mode": mode,
+        "games": games,
+        "batch_size": args.deals,
+        "batches": shape_cost.batches,
         "repeat": args.repeat,
         "seed": seed,
         "branch_rate": rate,
         "device": str(device),
         "completed": True,
         "wall_sec": wall_sec,
-        "sec_per_deal": wall_sec / args.deals,
+        "sec_per_deal": wall_sec / games,
         "trees": len(trees),
         "leaves": stats.leaves,
         "decisions": stats.decisions,
@@ -149,6 +305,7 @@ def run_one_case(args: argparse.Namespace) -> dict[str, Any]:
         "compact_sec": stats.compact_sec,
         "token_build_sec": stats.token_build_sec,
         "forward_sec": stats.forward_sec,
+        **_tree_fingerprints(trees),
     }
     collector.release_caches()
     return result
@@ -207,6 +364,82 @@ def _summaries(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return summaries
 
 
+def _matched_comparisons(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    groups: dict[tuple[int, int, int], dict[str, dict[str, Any]]] = {}
+    for row in rows:
+        if not row.get("completed") or row.get("mode") not in ("serial", "paired"):
+            continue
+        key = (int(row["players"]), int(row["hand_size"]), int(row["repeat"]))
+        groups.setdefault(key, {})[str(row["mode"])] = row
+
+    comparisons = []
+    for (players, hand_size, repeat), group in sorted(groups.items()):
+        if set(group) != {"serial", "paired"}:
+            continue
+        serial, paired = group["serial"], group["paired"]
+        game_speedup = float(serial["wall_sec"]) / float(paired["wall_sec"])
+        row_speedup = (
+            float(paired["forward_rows"])
+            / float(paired["wall_sec"])
+            / (float(serial["forward_rows"]) / float(serial["wall_sec"]))
+        )
+        if row_speedup < 1.9:
+            scaling = "sublinear"
+        elif row_speedup <= 2.1:
+            scaling = "linear"
+        else:
+            scaling = "superlinear"
+        comparisons.append(
+            {
+                "players": players,
+                "hand_size": hand_size,
+                "repeat": repeat,
+                "branch_rate": float(serial["branch_rate"]),
+                "serial_sec": float(serial["wall_sec"]),
+                "paired_sec": float(paired["wall_sec"]),
+                "game_throughput_speedup": game_speedup,
+                "row_throughput_speedup": row_speedup,
+                "batch_efficiency": row_speedup / 2.0,
+                "scaling": scaling,
+                "paired_is_faster": game_speedup > 1.0,
+                "identical_deals": (
+                    serial["deal_fingerprint"] == paired["deal_fingerprint"]
+                ),
+                "identical_tree_realization": (
+                    serial["canonical_discrete_fingerprint"]
+                    == paired["canonical_discrete_fingerprint"]
+                ),
+                "identical_leaf_order": (
+                    serial["ordered_discrete_fingerprint"]
+                    == paired["ordered_discrete_fingerprint"]
+                ),
+                "identical_policy_6dp": (
+                    serial["policy_fingerprint_6dp"] == paired["policy_fingerprint_6dp"]
+                ),
+                "identical_aggregate_work": all(
+                    serial[name] == paired[name]
+                    for name in (
+                        "trees",
+                        "leaves",
+                        "decisions",
+                        "raw_positions",
+                        "forward_rows",
+                        "branch_decisions",
+                        "blocked_by_cache",
+                        "skipped_by_placement",
+                    )
+                ),
+                "serial_peak_device_gb": float(serial["peak_device_gb"]),
+                "paired_peak_device_gb": float(paired["peak_device_gb"]),
+                "serial_peak_cache_rows": int(serial["peak_cache_rows"]),
+                "paired_peak_cache_rows": int(paired["peak_cache_rows"]),
+                "serial_forward_rows": int(serial["forward_rows"]),
+                "paired_forward_rows": int(paired["forward_rows"]),
+            }
+        )
+    return comparisons
+
+
 def _write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
     if not rows:
         return
@@ -226,10 +459,15 @@ def run_grid(args: argparse.Namespace) -> None:
     checkpoint = run.resolve_checkpoint(args.checkpoint)
     output = args.output
     if output is None:
+        report_name = (
+            "stratified_matched_batch_grid"
+            if args.matched_two_deal
+            else "stratified_shape_grid"
+        )
         output = (
             run.path
             / "benchmarks"
-            / f"stratified_shape_grid_iter_{int(args.checkpoint):06d}.json"
+            / f"{report_name}_iter_{int(args.checkpoint):06d}.json"
         )
     output = output.expanduser().resolve()
     players = _parse_ints(args.players)
@@ -242,13 +480,19 @@ def run_grid(args: argparse.Namespace) -> None:
         "repeats": args.repeats,
         "players": list(players),
         "hand_sizes": list(hand_sizes),
+        "matched_two_deal": args.matched_two_deal,
         "started_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }
 
     for repeat in range(args.repeats):
         for hand_size in hand_sizes:
             for player_count in players:
-                for deals in (1, 2):
+                cases = (
+                    ((1, 2, "serial"), (2, 2, "paired"))
+                    if args.matched_two_deal
+                    else ((1, 1, "solo"), (2, 2, "paired"))
+                )
+                for deals, games, expected_mode in cases:
                     command = [
                         sys.executable,
                         str(Path(__file__).resolve()),
@@ -260,6 +504,8 @@ def run_grid(args: argparse.Namespace) -> None:
                         str(args.config),
                         "--deals",
                         str(deals),
+                        "--games",
+                        str(games),
                         "--repeat",
                         str(repeat),
                         "--one-case",
@@ -279,8 +525,9 @@ def run_grid(args: argparse.Namespace) -> None:
                             row = {
                                 "players": player_count,
                                 "hand_size": hand_size,
-                                "mode": "solo" if deals == 1 else "paired",
-                                "deals": deals,
+                                "mode": expected_mode,
+                                "games": games,
+                                "batch_size": deals,
                                 "repeat": repeat,
                                 "completed": False,
                                 "wall_sec": time.perf_counter() - started,
@@ -296,8 +543,9 @@ def run_grid(args: argparse.Namespace) -> None:
                         row = {
                             "players": player_count,
                             "hand_size": hand_size,
-                            "mode": "solo" if deals == 1 else "paired",
-                            "deals": deals,
+                            "mode": expected_mode,
+                            "games": games,
+                            "batch_size": deals,
                             "repeat": repeat,
                             "completed": False,
                             "wall_sec": time.perf_counter() - started,
@@ -314,26 +562,39 @@ def run_grid(args: argparse.Namespace) -> None:
                     print(
                         f"repeat {repeat + 1}/{args.repeats} "
                         f"{player_count}p/{hand_size}c "
-                        f"{'solo' if deals == 1 else 'paired'}: {status}",
+                        f"{expected_mode}: {status}",
                         flush=True,
                     )
+                    comparisons = _matched_comparisons(rows)
                     atomic_write_json(
                         output,
                         {
                             "metadata": metadata,
                             "runs": rows,
                             "summary": _summaries(rows),
+                            "comparisons": comparisons,
                         },
                     )
 
     summaries = _summaries(rows)
+    comparisons = _matched_comparisons(rows)
     metadata["completed_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     atomic_write_json(
         output,
-        {"metadata": metadata, "runs": rows, "summary": summaries},
+        {
+            "metadata": metadata,
+            "runs": rows,
+            "summary": summaries,
+            "comparisons": comparisons,
+        },
     )
     _write_csv(output.with_suffix(".csv"), summaries)
-    print(f"Wrote {output} and {output.with_suffix('.csv')}.")
+    if comparisons:
+        _write_csv(
+            output.with_name(f"{output.stem}_comparisons.csv"),
+            comparisons,
+        )
+    print(f"Wrote matched benchmark results under {output.parent}.")
 
 
 def main() -> None:
