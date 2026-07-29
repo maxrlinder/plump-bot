@@ -6,19 +6,21 @@ import math
 import random
 from collections import Counter
 from dataclasses import replace
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
 import torch
 
+from plump.rewards import compute_relative_rewards
 from plump.seq.config import (
     NEXT_BID,
-    BranchBudgetConfig,
-    BranchRuleConfig,
-    GameScheduleCell,
     SLOT_REL_PLAYER,
     SLOT_TYPE,
     TOKEN_BID,
+    BranchBudgetConfig,
+    BranchRuleConfig,
+    GameScheduleCell,
     RolloutOptions,
     SeqModelConfig,
     SeqTrainingConfig,
@@ -32,7 +34,6 @@ from plump.seq.model import SeqPlumpModel
 from plump.seq.policy import masked_probabilities
 from plump.seq.rollout import SeqRolloutCollector
 from plump.seq.tokens import build_seat_tokens
-from plump.rewards import compute_relative_rewards
 
 MODEL_CONFIG = SeqModelConfig(d_model=64, n_layers=2, n_heads=4, d_ff=128)
 
@@ -42,6 +43,7 @@ def make_collector(
     cells,
     branch_rate: float = 1.0,
     seed=0,
+    bid_mode="sample_k_plus_uniform",
     bid_top_k=4,
     play_mode="all_legal",
     play_top_k=4,
@@ -52,7 +54,10 @@ def make_collector(
     train = SeqTrainingConfig(
         schedule_cells=tuple(cells),
         branch_rule=BranchRuleConfig(
-            bid_top_k=bid_top_k, play_mode=play_mode, play_top_k=play_top_k
+            bid_mode=bid_mode,
+            bid_top_k=bid_top_k,
+            play_mode=play_mode,
+            play_top_k=play_top_k,
         ),
         branch_budget=BranchBudgetConfig(branch_rate=branch_rate),
     )
@@ -65,7 +70,12 @@ def collect_trees(collector, seed=0):
 
 def test_unbranched_single_leaf_tree():
     cells = [GameScheduleCell(hand_size=4, num_players=3)]
-    collector = make_collector(cells=cells, branch_rate=0.0, bid_top_k=1)
+    collector = make_collector(
+        cells=cells,
+        branch_rate=0.0,
+        bid_mode="sample_k",
+        bid_top_k=1,
+    )
     trees = collect_trees(collector)
     assert len(trees) == 1
     tree = trees[0]
@@ -114,9 +124,7 @@ def test_branching_partitions_positions_across_leaves():
         if record.branch is not None
     )
     assert owned_total == total_len + sum(
-        total_len - leaf.owned_from
-        for leaf in tree.leaves
-        if not leaf.on_policy_spine
+        total_len - leaf.owned_from for leaf in tree.leaves if not leaf.on_policy_spine
     )
     assert branch_children == tree.leaf_total - 1
 
@@ -137,9 +145,7 @@ def test_backed_values_match_backup_formulas():
                 if math.isclose(branch.candidate_mass, 1.0, abs_tol=1e-6):
                     expected = sum(
                         p * branch.child_values[i]
-                        for p, i in zip(
-                            branch.prior_probs, branch.candidate_indices
-                        )
+                        for p, i in zip(branch.prior_probs, branch.candidate_indices)
                     )
                     checked_exact += 1
                 else:
@@ -213,9 +219,7 @@ def test_sample_k_uses_monte_carlo_weights():
     """Sampled candidates weight by empirical frequency, summing to one."""
 
     cells = [GameScheduleCell(hand_size=6, num_players=3)]
-    collector = make_collector(
-        cells=cells, play_mode="sample_k", play_top_k=3
-    )
+    collector = make_collector(cells=cells, play_mode="sample_k", play_top_k=3)
     trees = collect_trees(collector, seed=21)
     checked = 0
     for tree in trees:
@@ -254,8 +258,18 @@ def test_uniform_arm_is_explored_but_carries_no_backup_weight():
     )
     trees = collect_trees(collector, seed=11)
     zero_weight_arms = 0
+    zero_reach_leaves = 0
     for tree in trees:
+        represented_positions = sum(
+            sum(leaf.position_reach_weights().values()) for leaf in tree.leaves
+        )
+        assert represented_positions == pytest.approx(
+            seq_len(tree.num_players, tree.hand_size)
+        )
         for leaf in tree.leaves:
+            if leaf.reach_weight == 0.0:
+                zero_reach_leaves += 1
+                assert not any(leaf.position_reach_weights().values())
             for record in leaf.decisions:
                 branch = record.branch
                 if branch is None or record.phase == NEXT_BID:
@@ -280,15 +294,14 @@ def test_uniform_arm_is_explored_but_carries_no_backup_weight():
                 )
                 assert branch.backed_value == pytest.approx(expected)
     assert zero_weight_arms > 0
+    assert zero_reach_leaves > 0
 
 
 def test_uniform_arm_matches_sample_k_backups_on_shared_actions():
     """Adding the arm must not perturb the on-policy draws or their values."""
 
     cells = [GameScheduleCell(hand_size=5, num_players=3)]
-    plain = make_collector(
-        cells=cells, play_mode="sample_k", play_top_k=3
-    )
+    plain = make_collector(cells=cells, play_mode="sample_k", play_top_k=3)
     explored = make_collector(
         cells=cells,
         play_mode="sample_k_plus_uniform",
@@ -325,9 +338,7 @@ def test_sample_k_can_pick_outside_the_top_actions():
     """Sampling must be able to reach actions top-k would never evaluate."""
 
     cells = [GameScheduleCell(hand_size=8, num_players=4)]
-    collector = make_collector(
-        cells=cells, play_mode="sample_k", play_top_k=3
-    )
+    collector = make_collector(cells=cells, play_mode="sample_k", play_top_k=3)
     trees = collect_trees(collector, seed=5)
     reached_outside_top3 = False
     for tree in trees:
@@ -417,9 +428,7 @@ def test_deal_batching_matches_sequential_collection():
     sequential = options_collector(
         cells=cells, options=RolloutOptions(deals_per_batch=1)
     )
-    batched = options_collector(
-        cells=cells, options=RolloutOptions(deals_per_batch=3)
-    )
+    batched = options_collector(cells=cells, options=RolloutOptions(deals_per_batch=3))
     batched.model.load_state_dict(sequential.model.state_dict())
 
     left = collect_trees(sequential, seed=4)
@@ -445,6 +454,29 @@ def test_deal_batching_matches_sequential_collection():
                     assert got == pytest.approx(want, abs=1e-6)
 
 
+def test_hand_threshold_batches_short_deals_and_isolates_long_deals():
+    options = RolloutOptions(
+        deals_per_batch=2,
+        parallel_deals_max_hand_size=5,
+    )
+    collector = options_collector(
+        cells=[GameScheduleCell(hand_size=5, num_players=3, games=2)],
+        options=options,
+    )
+    assert (
+        collector._deals_for(
+            GameScheduleCell(hand_size=5, num_players=3, games=2), 3, 2
+        )
+        == 2
+    )
+    assert (
+        collector._deals_for(
+            GameScheduleCell(hand_size=6, num_players=3, games=2), 3, 2
+        )
+        == 1
+    )
+
+
 def test_historical_arm_off_produces_only_self_trees():
     cells = [GameScheduleCell(hand_size=4, num_players=3, games=2)]
     collector = options_collector(
@@ -459,12 +491,8 @@ def test_bid_split_matches_unsplit_tree():
     """Splitting the root bid must reproduce the unsplit tree exactly."""
 
     cells = [GameScheduleCell(hand_size=5, num_players=3)]
-    whole = options_collector(
-        cells=cells, options=RolloutOptions(bid_split_groups=1)
-    )
-    split = options_collector(
-        cells=cells, options=RolloutOptions(bid_split_groups=2)
-    )
+    whole = options_collector(cells=cells, options=RolloutOptions(bid_split_groups=1))
+    split = options_collector(cells=cells, options=RolloutOptions(bid_split_groups=2))
     split.model.load_state_dict(whole.model.state_dict())
 
     a = collect_trees(whole, seed=8)[0]
@@ -473,12 +501,13 @@ def test_bid_split_matches_unsplit_tree():
     assert a.leaf_total == b.leaf_total
     assert len(a.leaves) == len(b.leaves)
     # Exactly one on-policy spine survives the split.
-    assert sum(l.on_policy_spine for l in a.leaves) == 1
-    assert sum(l.on_policy_spine for l in b.leaves) == 1
+    assert sum(leaf.on_policy_spine for leaf in a.leaves) == 1
+    assert sum(leaf.on_policy_spine for leaf in b.leaves) == 1
     # The same terminal values are reached by the same set of leaves.
-    assert sorted(l.terminal_value for l in a.leaves) == pytest.approx(
-        sorted(l.terminal_value for l in b.leaves)
+    assert sorted(leaf.terminal_value for leaf in a.leaves) == pytest.approx(
+        sorted(leaf.terminal_value for leaf in b.leaves)
     )
+
     # The root bid backup is identical, so training targets are unchanged.
     def root_target(tree):
         owners = [leaf for leaf in tree.leaves if leaf.owned_from == 0]
@@ -625,12 +654,8 @@ def test_bid_split_lowers_peak_cache_rows():
     """The point of splitting: fewer rows live at once for the same tree."""
 
     cells = [GameScheduleCell(hand_size=6, num_players=4)]
-    whole = options_collector(
-        cells=cells, options=RolloutOptions(bid_split_groups=1)
-    )
-    split = options_collector(
-        cells=cells, options=RolloutOptions(bid_split_groups=4)
-    )
+    whole = options_collector(cells=cells, options=RolloutOptions(bid_split_groups=1))
+    split = options_collector(cells=cells, options=RolloutOptions(bid_split_groups=4))
     split.model.load_state_dict(whole.model.state_dict())
 
     unsplit_tree = collect_trees(whole, seed=8)[0]
@@ -717,10 +742,13 @@ def test_deals_per_shape_makes_the_update_size_independent_of_table_size():
     # Widest shape first, so the cache pool is sized once at the top.
     assert (flat[0].num_players, flat[0].hand_size) == (5, 10)
 
-    assert sum(
-        cell.games
-        for cell in build_position_balanced_schedule(deals_per_shape=2, repeats=3)
-    ) == 24 * 6
+    assert (
+        sum(
+            cell.games
+            for cell in build_position_balanced_schedule(deals_per_shape=2, repeats=3)
+        )
+        == 24 * 6
+    )
     with pytest.raises(ValueError):
         build_position_balanced_schedule(deals_per_shape=0)
 
@@ -805,16 +833,15 @@ def test_cycle_balances_bidding_position_not_absolute_seat():
     )
     trees = collect_trees(collector, seed=2)
     positions = Counter(
-        (tree.focal - tree.bidding_start_player) % tree.num_players
-        for tree in trees
+        (tree.focal - tree.bidding_start_player) % tree.num_players for tree in trees
     )
     assert positions == {0: 2, 1: 2, 2: 2, 3: 2, 4: 2}
     # The cursor is per player count and must not restart on a new cell, or a
     # five-player game would never reach its late bidding positions.
     first_cell = trees[:5]
-    assert len({
-        (tree.focal - tree.bidding_start_player) % 5 for tree in first_cell
-    }) == 5
+    assert (
+        len({(tree.focal - tree.bidding_start_player) % 5 for tree in first_cell}) == 5
+    )
 
 
 def test_branch_points_reach_the_endgame():
@@ -843,8 +870,8 @@ def test_branch_points_reach_the_endgame():
         for stage, n in tree.branch_decisions_by_stage.items():
             counts[stage] += n
 
-    assert counts[-1] > 0                      # the bid is always expanded
-    assert max(counts) >= 6                    # and the endgame is reached
+    assert counts[-1] > 0  # the bid is always expanded
+    assert max(counts) >= 6  # and the endgame is reached
     late = sum(counts[stage] for stage in range(6, 9))
     assert late > 0
 
@@ -856,15 +883,11 @@ def test_branch_rate_controls_tree_size_and_decay_moves_it_early():
         torch.manual_seed(0)
         model = SeqPlumpModel(MODEL_CONFIG).eval()
         train = SeqTrainingConfig(
-            schedule_cells=(
-                GameScheduleCell(hand_size=9, num_players=4, games=4),
-            ),
+            schedule_cells=(GameScheduleCell(hand_size=9, num_players=4, games=4),),
             branch_rule=BranchRuleConfig(
                 bid_top_k=4, play_mode="sample_k_plus_uniform", play_top_k=3
             ),
-            branch_budget=BranchBudgetConfig(
-                **budget_kwargs
-            ),
+            branch_budget=BranchBudgetConfig(**budget_kwargs),
             rollout=RolloutOptions(deals_per_batch=4),
         )
         collector = SeqRolloutCollector(model, train, device="cpu")
@@ -884,9 +907,13 @@ def test_branch_rate_controls_tree_size_and_decay_moves_it_early():
     # Decay pushes branch points away from the late tricks.
     flat, _ = collect(branch_rate=0.6)
     decayed, _ = collect(branch_rate=0.6, branch_rate_decay=2.0)
-    deepest = lambda trees: max(
-        (max(t.branched_tricks) for t in trees if t.branched_tricks), default=-1
-    )
+
+    def deepest(trees):
+        return max(
+            (max(t.branched_tricks) for t in trees if t.branched_tricks),
+            default=-1,
+        )
+
     assert deepest(decayed) <= deepest(flat)
     assert sum(t.leaf_total for t in decayed) < sum(t.leaf_total for t in flat)
 
@@ -919,7 +946,7 @@ def test_shape_rate_table_overrides_the_global_rate():
                 bid_top_k=4, play_mode="sample_k_plus_uniform", play_top_k=3
             ),
             branch_budget=BranchBudgetConfig(
-                    branch_rate=0.2,
+                branch_rate=0.2,
                 branch_rate_by_shape=table,
             ),
             rollout=RolloutOptions(deals_per_batch=3),
@@ -937,9 +964,7 @@ def test_derived_rate_table_is_exhaustive_then_tapers():
     """Rate 1.0 while branching is cheap, then geometric down to the anchor."""
 
     table = build_branch_rate_table(0.5, exhaustive_until=7)
-    rates = {
-        (rule.num_players, rule.hand_size): rule.rate for rule in table
-    }
+    rates = {(rule.num_players, rule.hand_size): rule.rate for rule in table}
     # One rule per scheduled shape, so no shape falls back to a global rate.
     assert len(rates) == 3 * 8
     # Short games branch every eligible decision; long games taper to the
@@ -977,7 +1002,7 @@ def test_validate_requires_a_rate_for_every_scheduled_shape():
                 GameScheduleCell(hand_size=9, num_players=4, games=1),
             ),
             branch_budget=BranchBudgetConfig(
-                    branch_rate=None,
+                branch_rate=None,
                 branch_rate_by_shape=table,
             ),
         )
@@ -1008,101 +1033,48 @@ def test_rate_skips_are_not_cache_blocks():
     assert collector.stats.blocked_by_cache == 0
 
 
-def test_gumbel_top_k_never_repeats_a_candidate():
-    """Duplicates cost a whole subtree and buy no counterfactual."""
+def test_sample_k_reports_true_inclusion_and_unbiased_value_backup():
+    """Statistically pin q(a), E[I/q], and the backed V_pi."""
 
-    from plump.seq.config import BranchRuleConfig, BranchBudgetConfig
-    from plump.seq.trainer import SeqTrainer
-    from plump.seq.model import SeqPlumpModel
-    from plump.seq.config import GameScheduleCell, SeqModelConfig, SeqTrainingConfig
+    collector = make_collector(cells=[GameScheduleCell(hand_size=3, num_players=3)])
+    probs = np.asarray([0.5, 0.2, 0.15, 0.1, 0.05], dtype=np.float64)
+    values = np.asarray([-2.0, 0.5, 1.0, 3.0, 8.0], dtype=np.float64)
+    legal = list(range(len(probs)))
+    draws = 50_000
+    k = 3
+    rng = random.Random(9182)
+    leaf = SimpleNamespace(rng=rng)
+    included = np.zeros(len(probs))
+    inverse = np.zeros(len(probs))
+    backups = 0.0
+    zero_weight_explorers = 0
 
-    torch.manual_seed(0)
-    train = SeqTrainingConfig(
-        schedule_cells=(
-            GameScheduleCell(hand_size=6, num_players=4),
-            GameScheduleCell(hand_size=8, num_players=5),
-        ),
-        branch_rule=BranchRuleConfig(play_mode="gumbel_top_k", play_top_k=3),
-        branch_budget=BranchBudgetConfig(branch_rate=1.0),
-    )
-    model = SeqPlumpModel(SeqModelConfig(d_model=64, n_layers=2, n_heads=4, d_ff=128))
-    trees, _ = SeqTrainer(model, train, device="cpu").collect()
+    expected_q = 1.0 - (1.0 - probs) ** k * (1.0 - 1.0 / len(legal))
+    for _ in range(draws):
+        sampled = collector._draw(probs, rng)
+        candidates, weights, _, reported = collector._candidates_for_mode(
+            leaf,
+            legal,
+            probs,
+            sampled,
+            "sample_k_plus_uniform",
+            k,
+        )
+        assert weights is not None
+        backups += sum(
+            weight * values[action] for action, weight in zip(candidates, weights)
+        )
+        for action, weight, q in zip(candidates, weights, reported):
+            assert q == pytest.approx(expected_q[action])
+            included[action] += 1
+            inverse[action] += 1.0 / q
+            if weight == 0.0:
+                zero_weight_explorers += 1
 
-    seen = 0
-    for tree in trees:
-        for leaf in tree.leaves:
-            for record in leaf.decisions:
-                branch = record.branch
-                if branch is None or record.phase == NEXT_BID:
-                    continue
-                seen += 1
-                indices = branch.candidate_indices
-                assert len(set(indices)) == len(indices)
-                assert len(indices) <= 3
-                assert len(branch.inclusion_probs) == len(indices)
-                assert all(0.0 < q <= 1.0 for q in branch.inclusion_probs)
-                # Backup weights are a probability vector over the candidates,
-                # so the parent's value stays inside the children's range.
-                assert sum(branch.prior_probs) == pytest.approx(1.0)
-    assert seen > 0
-
-
-def test_gumbel_top_k_plus_random_adds_one_zero_weight_explorer():
-    """The uniform arm widens the policy loss without moving the backup.
-
-    It is drawn from what the Gumbel pass left, so it is always a new subtree,
-    never a duplicate. It carries backup weight zero: it was reached by
-    exploring rather than by the policy, so letting it into the weighted average
-    would pull the parent's value toward actions the policy does not play. Its
-    inclusion probability is still real, and that is the point -- it is what
-    puts a floor under q for actions the policy has driven toward zero.
-    """
-
-    from plump.seq.config import BranchRuleConfig, BranchBudgetConfig
-    from plump.seq.trainer import SeqTrainer
-    from plump.seq.model import SeqPlumpModel
-    from plump.seq.config import GameScheduleCell, SeqModelConfig, SeqTrainingConfig
-
-    torch.manual_seed(0)
-    train = SeqTrainingConfig(
-        schedule_cells=(
-            GameScheduleCell(hand_size=6, num_players=4),
-            GameScheduleCell(hand_size=8, num_players=5),
-        ),
-        branch_rule=BranchRuleConfig(
-            play_mode="gumbel_top_k_plus_random", play_top_k=3
-        ),
-        branch_budget=BranchBudgetConfig(branch_rate=1.0),
-    )
-    model = SeqPlumpModel(SeqModelConfig(d_model=64, n_layers=2, n_heads=4, d_ff=128))
-    trees, _ = SeqTrainer(model, train, device="cpu").collect()
-
-    seen = widened = 0
-    for tree in trees:
-        for leaf in tree.leaves:
-            for record in leaf.decisions:
-                branch = record.branch
-                if branch is None or record.phase == NEXT_BID:
-                    continue
-                seen += 1
-                indices = branch.candidate_indices
-                assert len(set(indices)) == len(indices)
-                # One more arm than gumbel_top_k, and never more than that.
-                assert len(indices) <= 4
-                assert len(branch.inclusion_probs) == len(indices)
-                assert all(0.0 < q <= 1.0 for q in branch.inclusion_probs)
-                assert sum(branch.prior_probs) == pytest.approx(1.0)
-                zero_weight = [
-                    weight for weight in branch.prior_probs if weight == 0.0
-                ]
-                # A set that reached 4 can only have done so via the extra arm,
-                # and that arm is the one carrying no backup weight.
-                if len(indices) == 4:
-                    widened += 1
-                    assert len(zero_weight) == 1
-                assert len(zero_weight) <= 1
-    assert seen > 0
-    assert widened > 0, "the uniform arm never fired"
+    np.testing.assert_allclose(included / draws, expected_q, atol=0.006)
+    np.testing.assert_allclose(inverse / draws, np.ones(len(probs)), atol=0.02)
+    assert backups / draws == pytest.approx(float(probs @ values), abs=0.025)
+    assert zero_weight_explorers > 0
 
 
 def test_same_as_play_gives_bids_the_identical_rule_not_a_similar_one():
@@ -1111,8 +1083,8 @@ def test_same_as_play_gives_bids_the_identical_rule_not_a_similar_one():
     Asserting on the bid's *shape* would pass for a parallel implementation
     that happens to agree today, so this asserts on the resolution instead --
     and that the bid branch really carries the sampling rule's fingerprints
-    (distinct arms, a zero-weight explorer, non-degenerate inclusion probs)
-    rather than deterministic top-k's all-ones.
+    (empirical policy weights, a zero-weight explorer, and exact non-degenerate
+    inclusion probabilities).
     """
 
     from plump.seq.config import (
@@ -1127,11 +1099,16 @@ def test_same_as_play_gives_bids_the_identical_rule_not_a_similar_one():
     from plump.seq.trainer import SeqTrainer
 
     rule = BranchRuleConfig(
-        bid_mode="same_as_play", play_mode="gumbel_top_k_plus_random", play_top_k=3
+        bid_mode="same_as_play",
+        play_mode="sample_k_plus_uniform",
+        play_top_k=3,
     )
-    assert rule.bid_rule() == ("gumbel_top_k_plus_random", 3)
+    assert rule.bid_rule() == ("sample_k_plus_uniform", 3)
     # bid_top_k is inert under same_as_play -- k comes from the play rule.
-    assert replace(rule, bid_top_k=9).bid_rule() == ("gumbel_top_k_plus_random", 3)
+    assert replace(rule, bid_top_k=9).bid_rule() == (
+        "sample_k_plus_uniform",
+        3,
+    )
     # Bidding precedes every trick, so a stage rule from trick 0 owns it too.
     staged = replace(
         rule,
@@ -1141,7 +1118,10 @@ def test_same_as_play_gives_bids_the_identical_rule_not_a_similar_one():
     )
     assert staged.bid_rule() == ("sample_k", 2)
     # And an explicit mode still overrides.
-    assert replace(rule, bid_mode="top_k", bid_top_k=4).bid_rule() == ("top_k", 4)
+    assert replace(rule, bid_mode="all_legal", bid_top_k=4).bid_rule() == (
+        "all_legal",
+        4,
+    )
 
     torch.manual_seed(0)
     train = SeqTrainingConfig(
@@ -1152,7 +1132,7 @@ def test_same_as_play_gives_bids_the_identical_rule_not_a_similar_one():
     model = SeqPlumpModel(SeqModelConfig(d_model=64, n_layers=2, n_heads=4, d_ff=128))
     trees, _ = SeqTrainer(model, train, device="cpu").collect()
 
-    bids = widened = 0
+    bids = 0
     for tree in trees:
         for leaf in tree.leaves:
             for record in leaf.decisions:
@@ -1168,15 +1148,11 @@ def test_same_as_play_gives_bids_the_identical_rule_not_a_similar_one():
                 assert all(0.0 < q <= 1.0 for q in branch.inclusion_probs)
                 zero_weight = [w for w in branch.prior_probs if w == 0.0]
                 assert len(zero_weight) <= 1
-                if len(indices) == 4:
-                    widened += 1
-                    assert len(zero_weight) == 1
     assert bids > 0
-    assert widened > 0, "the bid's uniform arm never fired"
 
 
 def test_a_bid_rule_that_would_leave_the_root_unexpanded_is_rejected():
-    """"none" is fine for plays and fatal for the bid, which never rate-gates."""
+    """ "none" is fine for plays and fatal for the bid, which never rate-gates."""
 
     from plump.seq.config import BranchRuleConfig, GameScheduleCell, SeqTrainingConfig
 
@@ -1189,20 +1165,20 @@ def test_a_bid_rule_that_would_leave_the_root_unexpanded_is_rejected():
 
     bad = SeqTrainingConfig(
         schedule_cells=(GameScheduleCell(hand_size=3, num_players=3),),
-        branch_rule=BranchRuleConfig(bid_mode="gumbel_topk"),
+        branch_rule=BranchRuleConfig(bid_mode="sample_topk"),
     )
     with pytest.raises(ValueError, match="Unknown bid_mode"):
         bad.validate()
 
 
 def test_unknown_play_mode_is_rejected_rather_than_silently_downgraded():
-    """PlayBranchMode is erased at runtime; a typo must not become top_k."""
+    """PlayBranchMode is erased at runtime; a typo must not change training."""
 
     from plump.seq.config import BranchRuleConfig, GameScheduleCell, SeqTrainingConfig
 
     train = SeqTrainingConfig(
         schedule_cells=(GameScheduleCell(hand_size=3, num_players=3),),
-        branch_rule=BranchRuleConfig(play_mode="gumbel_topk"),
+        branch_rule=BranchRuleConfig(play_mode="sample_topk"),
     )
     with pytest.raises(ValueError, match="Unknown play_mode"):
         train.validate()

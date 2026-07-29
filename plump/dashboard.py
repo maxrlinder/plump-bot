@@ -14,7 +14,6 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 
-
 Field = tuple[str, str]
 
 
@@ -73,14 +72,15 @@ def render_dashboard(
         iteration,
         rows,
         left=(
-            ("loss_policy", "target-fit loss"),
-            ("policy_kl", "realized KL"),
+            ("policy_kl", "mean KL"),
+            ("policy_kl_p99", "p99 KL"),
+            ("policy_kl_max", "max KL"),
         ),
         right=(("learning_rate", "learning rate"),),
         smooth=min(smooth, 5),
         right_smooth=1,
-        title="Policy update",
-        left_label="KL / loss",
+        title="Policy trust region",
+        left_label="old → new KL",
         right_label="learning rate",
         omit_zero=True,
     )

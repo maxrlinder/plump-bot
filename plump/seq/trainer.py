@@ -1,48 +1,28 @@
 """Trainer for the schema-v6 sequence pipeline.
 
-One update consumes the collected trees as full causal forwards grouped by
-(players, hand size). The policy objective is selectable: the original NeuRD
-update or sampled entropic policy mirror descent. Both operate over every focal
-decision and share the per-position value and belief auxiliary losses.
+One update consumes collected counterfactual trees as full causal forwards
+grouped by (players, hand size). The default policy objective is sampled NeuRD.
+For a frozen value control variate ``b`` and exact candidate inclusion ``q``:
 
-Why these objectives. The rollout is an external-sampling tree: the focal's
-actions are enumerated (or drawn by an explicit rule) while chance and the
-opponents are sampled. On that data an importance ratio corrects nothing —
-ratios exist to repair sampling from the policy, and the candidate set was not
-drawn that way. NeuRD's loss has no expectation over actions in it:
+    Q_hat(a) = b + I(a) / q(a) * (Q(a) - b)
+    A_hat(a) = Q_hat(a) - sum_x pi_old(x) Q_hat(x)
+    L = -sum_a sg[A_hat(a)] * y(a)
 
-    L = -sum_a w_a * sg[A(a)] * y_a      =>      dL/dy_a = -w_a * A(a)
+With exponent one and clipping/capping disabled, this gives the full legal
+action regret vector in expectation. The selectable ``sampled_mirror`` option
+exponentiates the same realized vector; it is a deliberate stochastic
+bias/variance alternative, not claimed to be unbiased full-information mirror
+descent.
 
-which is a per-action statement, true for each ``a`` independently of which
-other actions were expanded. So an arbitrary candidate set is valid, provided
-(1) Q(a) is unbiased for that action's continuation value, (2) the baseline V
-is the full-policy value rather than a mean over the candidates, and (3) set
-membership does not depend on the noise in Q(a).
-
-A branched decision supplies Q(a) per candidate and V from the backup (exact
-for full candidate mass, control-variate for a capped set). An unbranched one
-is the k=1 case: Q is the realized return and V is the value head's estimate,
-which is the same statement with a bootstrapped baseline. Both are rows of the
-same loss, so there is no branch/spine mix to balance.
-
-``w_a`` is 1/q(a)**exponent, where q is the chance the branch rule would have
-expanded that action. Without it, a rule that expands by sampling the policy
-gives E[gradient] ~ pi(a)*A(a) — the policy-gradient prefactor NeuRD exists to
-remove, reintroduced through the candidate sampler. Tree weighting keeps
-factorially larger games from dominating.
-
-Mirror descent uses the same correction to construct a sampled full-action
-advantage estimate, takes the exact exponentiated policy-improvement step for
-that estimate, and fits the resulting KL-bounded distribution. Its per-row
-gradient is ``pi_new - pi_target``, so it cannot explode with the raw
-counterfactual reward scale. A post-update KL guard can backtrack the Adam step
-instead of throwing away an otherwise useful rollout.
+Expanded paths carry empirical old-policy reach. Uniform-only explorer
+descendants therefore supply their parent's Q value but receive zero
+descendant policy/value/belief weight. Both mean and p99 post-update KL caps
+must pass before an Adam step is accepted.
 """
 
 from __future__ import annotations
 
 import copy
-import math
 import os
 import random
 import time
@@ -69,7 +49,6 @@ from .policy import SeqLeague, best_seq_device
 from .rollout import SeqRolloutCollector, SeqTree
 from .tokens import IGNORE_LABEL, build_replay_arrays, build_seat_tokens
 
-
 # --------------------------------------------------------------------- #
 # Batch containers                                                       #
 # --------------------------------------------------------------------- #
@@ -88,10 +67,8 @@ class PolicyRows:
     old_probs_full: list[np.ndarray] = field(default_factory=list)
     candidates: list[np.ndarray] = field(default_factory=list)
     q_values: list[np.ndarray] = field(default_factory=list)
-    # Full-policy value at this state, *not* a mean over the candidates: the
-    # backup for a branched decision, the value head for an unbranched one.
-    # NeuRD needs A(a) = Q(a) - V with V over all legal actions, because the
-    # loss makes a claim about each candidate logit on its own.
+    # Frozen value-head prediction made before candidate sampling. It is an
+    # independent control variate in Q_hat(a) = b + I(a)/q(a) * (Q(a) - b).
     baseline: list[float] = field(default_factory=list)
     # P(this action was expanded here), per candidate. See the module docstring.
     inclusion: list[np.ndarray] = field(default_factory=list)
@@ -104,11 +81,11 @@ class PolicyRows:
 class SeqTrainingGroup:
     num_players: int
     hand_size: int
-    tokens: np.ndarray          # [B, L, WIDTH]
-    owned: np.ndarray           # [B, L] bool
-    value_targets: np.ndarray   # [B, L] float32
-    seq_weight: np.ndarray      # [B] float32 (aux/value weight per sequence)
-    trick_targets: np.ndarray   # [B, max_players]
+    tokens: np.ndarray  # [B, L, WIDTH]
+    owned: np.ndarray  # [B, L] bool
+    value_targets: np.ndarray  # [B, L] float32
+    position_weight: np.ndarray  # [B, L] on-policy aux/value weight
+    trick_targets: np.ndarray  # [B, max_players]
     trick_masks: np.ndarray
     suit_targets: np.ndarray
     bid_hit_targets: np.ndarray  # [B, max_players]
@@ -124,6 +101,9 @@ class SeqUpdateStats:
     loss_bid_hit: float = 0.0
     entropy: float = 0.0
     policy_kl: float = 0.0
+    policy_kl_p95: float = 0.0
+    policy_kl_p99: float = 0.0
+    policy_kl_max: float = 0.0
     rolled_back: bool = False
     backtracks: int = 0
     step_scale: float = 1.0
@@ -182,7 +162,7 @@ def summarize_trees(trees: list[SeqTree], collector_stats) -> SeqRolloutSummary:
     return summary
 
 
-def mirror_descent_target(
+def sampled_mirror_target(
     old_probs: torch.Tensor,
     advantages: torch.Tensor,
     legal: torch.Tensor,
@@ -192,10 +172,10 @@ def mirror_descent_target(
     target_kl: float,
     bisection_steps: int = 16,
 ) -> torch.Tensor:
-    """Return the exact sampled entropic mirror-descent target.
+    """Return an entropic mirror target for one sampled advantage vector.
 
-    ``advantages`` is already the full-support sampled estimate (zero for an
-    unexpanded legal action). The unconstrained update is
+    ``advantages`` is already a full-support stochastic estimate. The exact
+    update for that realized estimate is
 
         target ∝ anchor * exp(step_size * advantages)
 
@@ -214,9 +194,7 @@ def mirror_descent_target(
     anchor = (1.0 - uniform_mix) * old_probs + uniform_mix * uniform
 
     log_old = torch.log(old_probs.clamp_min(1e-12))
-    direction = (
-        torch.log(anchor.clamp_min(1e-12)) - log_old + step_size * advantages
-    )
+    direction = torch.log(anchor.clamp_min(1e-12)) - log_old + step_size * advantages
     direction = torch.where(legal, direction, torch.zeros_like(direction))
 
     def at(scale: torch.Tensor) -> torch.Tensor:
@@ -229,9 +207,9 @@ def mirror_descent_target(
 
     def old_to(candidate: torch.Tensor) -> torch.Tensor:
         log_candidate = torch.log(candidate.clamp_min(1e-12))
-        return (
-            old_probs * (log_old - log_candidate) * legal_float
-        ).sum(dim=-1, keepdim=True)
+        return (old_probs * (log_old - log_candidate) * legal_float).sum(
+            dim=-1, keepdim=True
+        )
 
     full_kl = old_to(full)
     low = torch.zeros_like(full_kl)
@@ -243,6 +221,73 @@ def mirror_descent_target(
         high = torch.where(acceptable, high, middle)
     scale = torch.where(full_kl <= target_kl, torch.ones_like(low), low)
     return at(scale)
+
+
+def control_variate_action_advantages(
+    old_probs: torch.Tensor,
+    candidates: torch.Tensor,
+    q_values: torch.Tensor,
+    inclusion: torch.Tensor,
+    candidate_mask: torch.Tensor,
+    baseline: torch.Tensor,
+    *,
+    inclusion_exponent: float = 1.0,
+    inclusion_cap: float = 0.0,
+    advantage_clip: float = 0.0,
+) -> torch.Tensor:
+    """Estimate the full legal-action advantage vector.
+
+    For legal action ``a`` and a frozen, pre-sampling baseline ``b``:
+
+    ``Q_hat(a) = b + I(a) / q(a) * (Q(a) - b)``.
+
+    Centering that complete vector under ``old_probs`` gives a sampled NeuRD
+    regret vector whose expectation is ``Q_pi(a) - V_pi`` when exponent is one,
+    the cap and clip are disabled, and the supplied inclusion probabilities are
+    exact. Unobserved actions receive the control variate, not a fabricated
+    zero advantage.
+    """
+
+    residual = (q_values - baseline) * candidate_mask.float()
+    if advantage_clip > 0:
+        residual = residual.clamp(-advantage_clip, advantage_clip)
+    correction = inclusion.clamp_min(1e-12).pow(-inclusion_exponent)
+    if inclusion_cap > 0:
+        correction = correction.clamp_max(inclusion_cap)
+    corrected = residual * correction * candidate_mask.float()
+    observed_residual = torch.zeros_like(old_probs).scatter_add(
+        1, candidates, corrected
+    )
+    legal = old_probs > 0
+    q_hat = torch.where(
+        legal,
+        baseline.expand_as(old_probs) + observed_residual,
+        torch.zeros_like(old_probs),
+    )
+    value_hat = (old_probs * q_hat).sum(dim=-1, keepdim=True)
+    return (q_hat - value_hat) * legal.float()
+
+
+def _weighted_kl_summary(
+    values: np.ndarray, weights: np.ndarray
+) -> tuple[float, float, float, float]:
+    positive = weights > 0
+    values = values[positive]
+    weights = weights[positive]
+    if values.size == 0 or float(weights.sum()) <= 0:
+        return 0.0, 0.0, 0.0, 0.0
+    order = np.argsort(values)
+    ordered_values = values[order]
+    ordered_weights = weights[order]
+    cumulative = np.cumsum(ordered_weights)
+    total = float(cumulative[-1])
+
+    def percentile(q: float) -> float:
+        index = int(np.searchsorted(cumulative, q * total, side="left"))
+        return float(ordered_values[min(index, len(ordered_values) - 1)])
+
+    mean = float(np.dot(values, weights) / total)
+    return mean, percentile(0.95), percentile(0.99), float(values.max())
 
 
 # --------------------------------------------------------------------- #
@@ -265,13 +310,12 @@ def _branch_depth_scale(trees, exponent: float) -> dict[int, float]:
         records = [record for leaf in tree.leaves for record in leaf.decisions]
         if not records:
             continue
-        raw = {
-            id(record): (1.0 + record.depth) ** exponent for record in records
-        }
-        total = sum(raw.values())
-        if total <= 0:
+        raw = {id(record): (1.0 + record.depth) ** exponent for record in records}
+        reach_total = sum(record.reach_weight for record in records)
+        scaled_total = sum(record.reach_weight * raw[id(record)] for record in records)
+        if reach_total <= 0 or scaled_total <= 0:
             continue
-        normalizer = len(records) / total
+        normalizer = reach_total / scaled_total
         for key, value in raw.items():
             scale[key] = value * normalizer
     return scale
@@ -290,14 +334,14 @@ def build_training_groups(
     per_tree = train_config.tree_weighting == "per_tree"
     owned_per_tree = {
         id(tree): sum(
-            model_config.seq_len(tree.num_players, tree.hand_size)
-            - leaf.owned_from
-            for leaf in tree.leaves
+            sum(leaf.position_reach_weights().values()) for leaf in tree.leaves
         )
         for tree in trees
     }
     rows_per_tree_policy = {
-        id(tree): sum(len(leaf.decisions) for leaf in tree.leaves)
+        id(tree): sum(
+            record.reach_weight for leaf in tree.leaves for record in leaf.decisions
+        )
         for tree in trees
     }
     exponent = float(train_config.tree_weight_exponent) if per_tree else 1.0
@@ -310,7 +354,7 @@ def build_training_groups(
         for tree in trees
     }
 
-    def row_weights(rows_per_tree: dict[int, int]):
+    def row_weights(rows_per_tree: dict[int, float]):
         """Per-row weight for each tree, from its share of the total.
 
         A tree's share is proportional to ``importance * rows ** exponent``: at
@@ -327,7 +371,7 @@ def build_training_groups(
         if total <= 0:
             return {key: 0.0 for key in rows_per_tree}
         return {
-            key: shares[key] / total / max(rows_per_tree[key], 1)
+            key: shares[key] / total / max(rows_per_tree[key], 1e-12)
             for key in rows_per_tree
         }
 
@@ -349,7 +393,7 @@ def build_training_groups(
         tokens = np.zeros((batch, length, 12), dtype=np.int64)
         owned = np.zeros((batch, length), dtype=bool)
         value_targets = np.zeros((batch, length), dtype=np.float32)
-        seq_weight = np.zeros(batch, dtype=np.float32)
+        position_weight = np.zeros((batch, length), dtype=np.float32)
         trick_targets = np.full(
             (batch, model_config.max_players), IGNORE_LABEL, np.int64
         )
@@ -363,7 +407,7 @@ def build_training_groups(
         bid_hit_targets = np.full(
             (batch, model_config.max_players), IGNORE_LABEL, np.int64
         )
-        policy ={"bid": PolicyRows(), "play": PolicyRows()}
+        policy = {"bid": PolicyRows(), "play": PolicyRows()}
 
         # Tokens first, in a pass of their own, so a branch child can copy the
         # prefix its parent already wrote instead of replaying the same events.
@@ -415,7 +459,8 @@ def build_training_groups(
             owned[row, leaf.owned_from :] = True
             for position, value in leaf.value_targets().items():
                 value_targets[row, position] = value
-            seq_weight[row] = seq_weight_for(tree)
+            for position, reach in leaf.position_reach_weights().items():
+                position_weight[row, position] = seq_weight_for(tree) * reach
             trick_targets[row] = arrays.trick_targets
             trick_masks[row] = arrays.trick_masks
             suit_targets[row] = arrays.suit_targets
@@ -443,9 +488,7 @@ def build_training_groups(
                     )
                     rows.baseline.append(float(record.old_value))
                     rows.inclusion.append(
-                        np.asarray(
-                            [record.old_probs[action]], dtype=np.float32
-                        )
+                        np.asarray([record.old_probs[action]], dtype=np.float32)
                     )
                     rows.branched.append(False)
                 else:
@@ -458,17 +501,15 @@ def build_training_groups(
                             dtype=np.float32,
                         )
                     )
-                    # The backup: exact sum_a pi(a) Q(a) at full candidate
-                    # mass, control-variate estimate of the same quantity for
-                    # a capped set. Either way it is the full-policy value,
-                    # which is what A(a) must be measured against.
-                    rows.baseline.append(float(b.backed_value))
+                    rows.baseline.append(float(record.old_value))
                     rows.inclusion.append(
                         np.asarray(b.inclusion_probs, dtype=np.float32)
                     )
                     rows.branched.append(True)
                 rows.weight.append(
-                    policy_weight_for(tree) * depth_scale.get(id(record), 1.0)
+                    policy_weight_for(tree)
+                    * record.reach_weight
+                    * depth_scale.get(id(record), 1.0)
                 )
 
         groups.append(
@@ -478,7 +519,7 @@ def build_training_groups(
                 tokens=tokens,
                 owned=owned,
                 value_targets=value_targets,
-                seq_weight=seq_weight,
+                position_weight=position_weight,
                 trick_targets=trick_targets,
                 trick_masks=trick_masks,
                 suit_targets=suit_targets,
@@ -532,7 +573,7 @@ class SeqTrainer:
 
     def collect(self) -> tuple[list[SeqTree], SeqRolloutSummary]:
         self.model.eval()
-        trees = self.collector.collect(self.league, self.rng)
+        trees = self.collector.collect(self.league, self.rng, iteration=self.iteration)
         return trees, summarize_trees(trees, self.collector.stats)
 
     # -------------------------------------------------------------- #
@@ -570,9 +611,7 @@ class SeqTrainer:
                 self.model.parameters(), self.train.max_grad_norm
             )
             self._apply_warmup_lr()
-            nominal_lrs = [
-                float(group["lr"]) for group in self.optimizer.param_groups
-            ]
+            nominal_lrs = [float(group["lr"]) for group in self.optimizer.param_groups]
             accepted = False
             attempts = self.train.kl_backtrack_attempts + 1
             for attempt in range(attempts):
@@ -580,16 +619,17 @@ class SeqTrainer:
                     self.model.load_state_dict(snapshot[0])
                     self.optimizer.load_state_dict(snapshot[1])
                 scale = self.train.kl_backtrack_factor**attempt
-                for group, nominal_lr in zip(
-                    self.optimizer.param_groups, nominal_lrs
-                ):
+                for group, nominal_lr in zip(self.optimizer.param_groups, nominal_lrs):
                     group["lr"] = nominal_lr * scale
                 self.optimizer.step()
-                policy_kl = self._evaluate_policy_kl(groups)
+                policy_kl, kl_p95, kl_p99, kl_max = self._evaluate_policy_kl(groups)
                 stats.policy_kl = policy_kl
-                if (
-                    stats.policy_rows == 0
-                    or policy_kl <= self.train.policy_kl_cap
+                stats.policy_kl_p95 = kl_p95
+                stats.policy_kl_p99 = kl_p99
+                stats.policy_kl_max = kl_max
+                if stats.policy_rows == 0 or (
+                    policy_kl <= self.train.policy_kl_cap
+                    and kl_p99 <= self.train.policy_kl_p99_cap
                 ):
                     stats.backtracks += attempt
                     stats.step_scale = min(stats.step_scale, scale)
@@ -620,9 +660,7 @@ class SeqTrainer:
         """
 
         warmup = self.train.lr_warmup_updates
-        scale = 1.0 if warmup <= 0 else min(
-            1.0, (self.optimizer_steps + 1) / warmup
-        )
+        scale = 1.0 if warmup <= 0 else min(1.0, (self.optimizer_steps + 1) / warmup)
         for group in self.optimizer.param_groups:
             group["lr"] = self.train.learning_rate * scale
 
@@ -642,9 +680,7 @@ class SeqTrainer:
         totals = defaultdict(float)
         for group in groups:
             by_chunk = _rows_by_chunk(group, self._microbatches(group))
-            for (start, stop), policy_rows in zip(
-                self._microbatches(group), by_chunk
-            ):
+            for (start, stop), policy_rows in zip(self._microbatches(group), by_chunk):
                 loss, terms = self._chunk_loss(group, start, stop, policy_rows)
                 if loss is not None:
                     loss.backward()
@@ -674,8 +710,10 @@ class SeqTrainer:
         tokens = torch.from_numpy(group.tokens[start:stop]).to(device)
         output = self.model.forward_full(tokens, aux_heads=aux)
         owned = torch.from_numpy(group.owned[start:stop]).to(device)
-        seq_weight = torch.from_numpy(group.seq_weight[start:stop]).to(device)
-        position_weight = seq_weight[:, None] * owned.float()
+        position_weight = (
+            torch.from_numpy(group.position_weight[start:stop]).to(device)
+            * owned.float()
+        )
 
         terms: dict[str, float] = {}
         loss = tokens.new_zeros((), dtype=torch.float32)
@@ -692,9 +730,7 @@ class SeqTrainer:
         # Suit presence.
         suit_labeled = None
         if train.suit_coef > 0:
-            suit_targets = torch.from_numpy(
-                group.suit_targets[start:stop]
-            ).to(device)
+            suit_targets = torch.from_numpy(group.suit_targets[start:stop]).to(device)
             suit_labeled = (suit_targets != IGNORE_LABEL) & owned[:, :, None, None]
         if suit_labeled is not None and suit_labeled.any():
             bce = F.binary_cross_entropy_with_logits(
@@ -712,9 +748,7 @@ class SeqTrainer:
         # Trick counts (feasibility-masked CE, per relative player).
         player_labeled = None
         if train.trick_coef > 0:
-            trick_targets = torch.from_numpy(
-                group.trick_targets[start:stop]
-            ).to(device)
+            trick_targets = torch.from_numpy(group.trick_targets[start:stop]).to(device)
             trick_masks = torch.from_numpy(group.trick_masks[start:stop]).to(device)
             player_labeled = trick_targets != IGNORE_LABEL  # [B, P]
         if player_labeled is not None and player_labeled.any():
@@ -728,9 +762,7 @@ class SeqTrainer:
             )
             gathered = log_probs.gather(3, safe_targets).squeeze(-1)  # [B,L,P]
             mask = (
-                player_labeled[:, None, :]
-                & owned[:, :, None]
-                & trick_masks.any(dim=-1)
+                player_labeled[:, None, :] & owned[:, :, None] & trick_masks.any(dim=-1)
             )
             per_position = (-gathered * mask.float()).sum(dim=2) / (
                 mask.float().sum(dim=2).clamp_min(1.0)
@@ -745,9 +777,9 @@ class SeqTrainer:
         # progressively more informed prefix.
         bid_hit_labeled = None
         if train.bid_hit_coef > 0:
-            bid_hit_targets = torch.from_numpy(
-                group.bid_hit_targets[start:stop]
-            ).to(device)
+            bid_hit_targets = torch.from_numpy(group.bid_hit_targets[start:stop]).to(
+                device
+            )
             bid_hit_labeled = bid_hit_targets != IGNORE_LABEL  # [B, P]
         if bid_hit_labeled is not None and bid_hit_labeled.any():
             logits = output.bid_hit_logits  # [B, L, P]
@@ -768,9 +800,7 @@ class SeqTrainer:
         for phase_key, rows in policy_rows.items():
             if not rows["weight"]:
                 continue
-            losses, _, entropies, weight = self._policy_terms(
-                output, rows, phase_key
-            )
+            losses, _, entropies, weight = self._policy_terms(output, rows, phase_key)
             policy_loss = (weight * losses).sum()
             loss = loss + train.policy_coef * policy_loss
             policy_total += float(policy_loss.detach())
@@ -827,36 +857,33 @@ class SeqTrainer:
         q_values = to_device(q_np)
         old_full = to_device(np.stack(rows["old_probs_full"]))
         weight = to_device(np.asarray(rows["weight"], dtype=np.float32))
-        baseline = to_device(
-            np.asarray(rows["baseline"], dtype=np.float32)
-        ).unsqueeze(-1)
+        baseline = to_device(np.asarray(rows["baseline"], dtype=np.float32)).unsqueeze(
+            -1
+        )
 
-        gathered = logits.gather(1, cand)
-        advantages = (q_values - baseline) * cand_mask.float()
-
-        # 1/q correction for which actions the branch rule expanded. Capped
-        # because the deterministic and single-sample rules can put q at the
-        # policy mass of a near-zero-probability action; with a uniform or
-        # Gumbel arm in play the cap is essentially never reached.
+        # Select the explicitly configured estimator. Exact NeuRD uses
+        # exponent=1 with no cap or clip. The sampled-mirror knobs remain
+        # independent because it is an explicitly biased variance tradeoff.
         if train.policy_objective == "neurd":
             advantage_clip = train.neurd_advantage_clip
             exponent = train.neurd_inclusion_exponent
             inclusion_cap = train.neurd_inclusion_cap
         else:
-            advantage_clip = train.mirror_advantage_clip
-            exponent = train.mirror_inclusion_exponent
-            inclusion_cap = train.mirror_inclusion_cap
-        if advantage_clip > 0:
-            advantages = advantages.clamp(-advantage_clip, advantage_clip)
-        if exponent == 0.0:
-            importance = cand_mask.float()
-        else:
-            importance = (
-                inclusion.clamp_min(1e-6).pow(-exponent).clamp_max(
-                    inclusion_cap
-                )
-                * cand_mask.float()
-            )
+            advantage_clip = train.sampled_mirror_advantage_clip
+            exponent = train.sampled_mirror_inclusion_exponent
+            inclusion_cap = train.sampled_mirror_inclusion_cap
+
+        full_adv = control_variate_action_advantages(
+            old_full,
+            cand,
+            q_values,
+            inclusion,
+            cand_mask,
+            baseline,
+            inclusion_exponent=exponent,
+            inclusion_cap=inclusion_cap,
+            advantage_clip=advantage_clip,
+        )
 
         # Full-support KL(old || new) anchor and guard metric.
         legal = old_full > 0
@@ -869,50 +896,33 @@ class SeqTrainer:
         probs_new = safe.exp() * legal.float()
         entropies = -(probs_new * safe).sum(dim=-1)
 
-        scaled_adv = advantages * importance * cand_mask.float()
         if train.policy_objective == "neurd":
-            # L = -sum_a w_a A(a) y_a, so dL/dy_a = -w_a A(a): each
-            # candidate logit moves by its own regret, with no pi(a) prefactor
-            # and no dependence on which siblings were expanded.
-            #
-            # Deliberately *not* centered over the candidate set. Centering is
-            # only a null direction when the set is every legal action; for a
-            # capped set it would cancel the signal that mass should move from
-            # unexpanded actions when every expanded one beat the baseline.
-            finite = torch.where(cand_mask, gathered, torch.zeros_like(gathered))
-            regret = -(scaled_adv.detach() * finite).sum(dim=-1)
+            # Full-support sampled NeuRD. The control-variate estimator is
+            # centered over the old policy before this direct logit update, so
+            # it has the paper's sampled-regret semantics even when only a
+            # subset of action values was evaluated.
+            finite_logits = torch.where(legal, logits, torch.zeros_like(logits))
+            regret = -(full_adv.detach() * finite_logits).sum(dim=-1)
             losses = (
-                train.neurd_regret_coef * regret
-                + train.neurd_kl_coef * divergences
+                train.neurd_regret_coef * regret + train.neurd_kl_coef * divergences
             )
         else:
-            # Horvitz-Thompson sampled full-action advantage: unexpanded legal
-            # actions are zero, expanded actions carry A/q. Candidate indices
-            # are unique under every branch rule, but scatter_add also makes
-            # this correct if a future sampler represents multiplicity.
-            full_adv = torch.zeros_like(logits).scatter_add(
-                1, cand, scaled_adv
-            )
-            target = mirror_descent_target(
+            target = sampled_mirror_target(
                 old_full,
                 full_adv,
                 legal,
-                step_size=train.mirror_step_size,
-                uniform_mix=train.mirror_uniform_mix,
-                target_kl=train.mirror_target_kl,
+                step_size=train.sampled_mirror_step_size,
+                uniform_mix=train.sampled_mirror_uniform_mix,
+                target_kl=train.sampled_mirror_target_kl,
             )
             log_target = torch.log(target.clamp_min(1e-12))
             # KL(target || current). The target is stopped by construction;
             # the gradient on each logit is pi_current - target.
-            losses = (
-                target
-                * (log_target - safe)
-                * legal.float()
-            ).sum(dim=-1)
+            losses = (target * (log_target - safe) * legal.float()).sum(dim=-1)
         return losses, divergences, entropies, weight
 
-    def _evaluate_policy_kl(self, groups) -> float:
-        """Weighted KL(old||new) over *every* policy row.
+    def _evaluate_policy_kl(self, groups) -> tuple[float, float, float, float]:
+        """Mean, p95, p99, and max KL(old||new) over every policy row.
 
         Under the old split this covered branch rows only, leaving the spine
         half of the decisions outside the rollback guard. With one row type
@@ -920,8 +930,8 @@ class SeqTrainer:
         """
 
         self.model.eval()
-        total = 0.0
-        weight_sum = 0.0
+        all_divergences: list[np.ndarray] = []
+        all_weights: list[np.ndarray] = []
         with torch.inference_mode():
             for group in groups:
                 for (start, stop), policy_rows in zip(
@@ -930,9 +940,7 @@ class SeqTrainer:
                 ):
                     if not any(rows["weight"] for rows in policy_rows.values()):
                         continue
-                    tokens = torch.from_numpy(group.tokens[start:stop]).to(
-                        self.device
-                    )
+                    tokens = torch.from_numpy(group.tokens[start:stop]).to(self.device)
                     output = self.model.forward_full(tokens, aux_heads=False)
                     for phase_key, rows in policy_rows.items():
                         if not rows["weight"]:
@@ -940,9 +948,14 @@ class SeqTrainer:
                         _, divergences, _, weight = self._policy_terms(
                             output, rows, phase_key
                         )
-                        total += float((weight * divergences).sum())
-                        weight_sum += float(weight.sum())
-        return total / weight_sum if weight_sum > 0 else 0.0
+                        all_divergences.append(divergences.detach().cpu().numpy())
+                        all_weights.append(weight.detach().cpu().numpy())
+        if not all_divergences:
+            return 0.0, 0.0, 0.0, 0.0
+        return _weighted_kl_summary(
+            np.concatenate(all_divergences),
+            np.concatenate(all_weights),
+        )
 
     # -------------------------------------------------------------- #
     # Checkpoints & league                                            #
@@ -1016,8 +1029,14 @@ class SeqTrainer:
             if temporary.exists():
                 temporary.unlink()
 
-    def load_checkpoint(self, path: str | Path) -> None:
+    def load_checkpoint(
+        self,
+        path: str | Path,
+        *,
+        allow_training_config_mismatch: bool = False,
+    ) -> None:
         path = Path(path)
+        requested_resolved_config = self.resolved_config
         payload = torch.load(path, map_location="cpu", weights_only=False)
         if payload.get("checkpoint_format_version") != 1:
             raise ValueError("Checkpoint format mismatch.")
@@ -1027,15 +1046,22 @@ class SeqTrainer:
             raise ValueError("Checkpoint rules fingerprint mismatch.")
         if payload.get("model_config") != asdict(self.model.config):
             raise ValueError("Checkpoint model configuration mismatch.")
-        if payload.get("training_config") != asdict(self.train):
+        if not allow_training_config_mismatch and payload.get(
+            "training_config"
+        ) != asdict(self.train):
             raise ValueError("Checkpoint training configuration mismatch.")
         checkpoint_config = payload.get("resolved_config")
         if (
-            self.resolved_config is not None
+            not allow_training_config_mismatch
+            and self.resolved_config is not None
             and checkpoint_config != self.resolved_config
         ):
             raise ValueError("Checkpoint resolved configuration mismatch.")
-        self.resolved_config = checkpoint_config
+        self.resolved_config = (
+            requested_resolved_config
+            if allow_training_config_mismatch
+            else checkpoint_config
+        )
         self.model.load_state_dict(payload["model_state_dict"])
         self.optimizer.load_state_dict(payload["optimizer_state_dict"])
         self.iteration = int(payload.get("iteration", 0))
@@ -1071,12 +1097,8 @@ class SeqTrainer:
 
         collector_state = payload.get("collector_state", {})
         self.collector._peak_rows = dict(collector_state.get("peak_rows", {}))
-        self.collector._rows_per_deal = dict(
-            collector_state.get("rows_per_deal", {})
-        )
-        self.collector._seat_cursor = dict(
-            collector_state.get("seat_cursor", {})
-        )
+        self.collector._rows_per_deal = dict(collector_state.get("rows_per_deal", {}))
+        self.collector._seat_cursor = dict(collector_state.get("seat_cursor", {}))
 
     def maybe_snapshot(self, checkpoint_dir: str | Path) -> Optional[str]:
         if self.iteration % self.train.snapshot_every != 0:

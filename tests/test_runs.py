@@ -26,7 +26,6 @@ from plump.seq.config import (
 from plump.seq.model import SeqPlumpModel
 from plump.seq.trainer import SeqTrainer
 
-
 MODEL = SeqModelConfig(
     d_model=16,
     n_layers=1,
@@ -50,13 +49,17 @@ def _trainer() -> SeqTrainer:
 def test_run_creation_records_config_and_rejects_field_changes(tmp_path):
     assert CHECKOUT_CONFIG_PATH.read_bytes() == PACKAGED_CONFIG_PATH.read_bytes()
     resolved = load_training_config()
-    assert resolved.training.policy_objective == "mirror_descent"
+    assert resolved.training.policy_objective == "neurd"
     assert resolved.training.branch_depth_exponent == -1.0
     assert resolved.training.kl_backtrack_attempts == 8
     assert resolved.training.branch_rule.bid_rule() == (
-        "gumbel_top_k_plus_random",
+        "sample_k_plus_uniform",
         4,
     )
+    assert resolved.training.checkpoint_every == 50
+    assert resolved.training.suit_coef == 0.05
+    assert resolved.training.trick_coef == 0.05
+    assert resolved.training.rollout.historical_arm == "off"
     run = RunDirectory("unit-run", root=tmp_path)
 
     with run.acquire_lock():
@@ -69,9 +72,7 @@ def test_run_creation_records_config_and_rejects_field_changes(tmp_path):
     assert metadata["python"]
     assert metadata["torch"]
 
-    changed = load_training_config(
-        overrides=["training.learning_rate=0.125"]
-    )
+    changed = load_training_config(overrides=["training.learning_rate=0.125"])
     assert config_diff(run.recorded_config(), changed.raw) == [
         "training.learning_rate: recorded=0.0002 requested=0.125"
     ]

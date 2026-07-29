@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import random
-
 import numpy as np
 import pytest
 import torch
@@ -12,18 +10,19 @@ from plump.seq.config import (
     BranchBudgetConfig,
     BranchRuleConfig,
     GameScheduleCell,
+    RolloutOptions,
     SeqModelConfig,
     SeqTrainingConfig,
 )
 from plump.seq.model import SeqPlumpModel
-from plump.seq.policy import SeqModelPolicy
+from plump.seq.policy import SeqLeague, SeqModelPolicy
 from plump.seq.tokens import IGNORE_LABEL
 from plump.seq.trainer import (
     SeqTrainer,
     _rows_by_chunk,
     build_training_groups,
-    mirror_descent_target,
-    summarize_trees,
+    control_variate_action_advantages,
+    sampled_mirror_target,
 )
 
 MODEL_CONFIG = SeqModelConfig(d_model=64, n_layers=2, n_heads=4, d_ff=128)
@@ -53,17 +52,16 @@ def test_group_weights_normalize_to_one():
     groups = build_training_groups(trees, MODEL_CONFIG, trainer.train)
     assert groups
 
-    seq_weight_total = 0.0
+    position_weight_total = 0.0
     policy_weight_total = 0.0
     for group in groups:
-        owned_counts = group.owned.sum(axis=1)
-        seq_weight_total += float((group.seq_weight * owned_counts).sum())
+        position_weight_total += float(group.position_weight.sum())
         for rows in group.policy.values():
             policy_weight_total += float(np.sum(rows.weight))
     # Each loss family's weights sum to exactly 1, whatever the exponent and
     # however many trees happen to have rows of that kind, so the effective
     # learning rate cannot drift with how the deals happened to come out.
-    assert seq_weight_total == pytest.approx(1.0)
+    assert position_weight_total == pytest.approx(1.0)
     assert policy_weight_total == pytest.approx(1.0)
 
 
@@ -88,8 +86,7 @@ def test_update_produces_finite_losses_and_changes_weights():
     assert stats.positions > 0
     if not stats.rolled_back:
         changed = any(
-            not torch.equal(a, b)
-            for a, b in zip(before, trainer.model.parameters())
+            not torch.equal(a, b) for a, b in zip(before, trainer.model.parameters())
         )
         assert changed
 
@@ -111,9 +108,7 @@ def test_kl_cap_rolls_back_the_epoch():
 def test_update_with_belief_losses_disabled_is_policy_value_only():
     """NeuRD plus value only: disabled auxiliary heads never run."""
 
-    trainer = make_trainer(
-        suit_coef=0.0, trick_coef=0.0, bid_hit_coef=0.0
-    )
+    trainer = make_trainer(suit_coef=0.0, trick_coef=0.0, bid_hit_coef=0.0)
     trees, _ = trainer.collect()
     before = [p.detach().clone() for p in trainer.model.parameters()]
     stats = trainer.update(trees)
@@ -124,8 +119,7 @@ def test_update_with_belief_losses_disabled_is_policy_value_only():
     assert np.isfinite(stats.loss_policy)
     if not stats.rolled_back:
         assert any(
-            not torch.equal(a, b)
-            for a, b in zip(before, trainer.model.parameters())
+            not torch.equal(a, b) for a, b in zip(before, trainer.model.parameters())
         )
 
 
@@ -196,11 +190,11 @@ def test_entropy_bonus_and_advantage_clip_run():
     assert np.isfinite(stats.entropy)
 
 
-def test_mirror_descent_target_matches_closed_form_exponentiated_update():
+def test_sampled_mirror_target_matches_closed_form_exponentiated_update():
     old = torch.tensor([[0.25, 0.75, 0.0]])
     advantages = torch.tensor([[2.0, -1.0, 99.0]])
     legal = old > 0
-    observed = mirror_descent_target(
+    observed = sampled_mirror_target(
         old,
         advantages,
         legal,
@@ -219,12 +213,12 @@ def test_mirror_descent_target_matches_closed_form_exponentiated_update():
     assert observed[0, 2] == 0
 
 
-def test_mirror_descent_target_respects_kl_bound_and_legal_support():
+def test_sampled_mirror_target_respects_kl_bound_and_legal_support():
     old = torch.tensor([[0.97, 0.02, 0.01, 0.0]])
     advantages = torch.tensor([[0.0, 4.0, 10.0, 100.0]])
     legal = old > 0
     cap = 0.003
-    target = mirror_descent_target(
+    target = sampled_mirror_target(
         old,
         advantages,
         legal,
@@ -235,10 +229,7 @@ def test_mirror_descent_target_respects_kl_bound_and_legal_support():
     )
     kl = (
         old
-        * (
-            torch.log(old.clamp_min(1e-12))
-            - torch.log(target.clamp_min(1e-12))
-        )
+        * (torch.log(old.clamp_min(1e-12)) - torch.log(target.clamp_min(1e-12)))
         * legal.float()
     ).sum()
     assert kl <= cap + 1e-6
@@ -247,11 +238,38 @@ def test_mirror_descent_target_respects_kl_bound_and_legal_support():
     assert target[0, 3] == 0
 
 
-def test_mirror_descent_update_is_finite_and_changes_weights():
+def test_sampled_neurd_advantage_has_the_full_information_expectation():
+    """A tabular bandit pins the expected update direction action by action."""
+
+    torch.manual_seed(91)
+    draws = 500_000
+    old = torch.tensor([[0.5, 0.3, 0.15, 0.05]], dtype=torch.float32)
+    q = torch.tensor([-2.0, 0.5, 3.0, 8.0], dtype=torch.float32)
+    candidates = torch.multinomial(old[0], draws, replacement=True).unsqueeze(1)
+    old_batch = old.expand(draws, -1)
+    observed = control_variate_action_advantages(
+        old_batch,
+        candidates,
+        q[candidates],
+        old[0, candidates],
+        torch.ones_like(candidates, dtype=torch.bool),
+        torch.full((draws, 1), 0.7),
+    )
+    expected = q - (old[0] * q).sum()
+    torch.testing.assert_close(observed.mean(dim=0), expected, atol=0.08, rtol=0.0)
+    torch.testing.assert_close(
+        (old_batch * observed).sum(dim=1),
+        torch.zeros(draws),
+        atol=2e-6,
+        rtol=0.0,
+    )
+
+
+def test_sampled_mirror_update_is_finite_and_changes_weights():
     trainer = make_trainer(
-        policy_objective="mirror_descent",
-        mirror_uniform_mix=0.02,
-        mirror_target_kl=0.003,
+        policy_objective="sampled_mirror",
+        sampled_mirror_uniform_mix=0.02,
+        sampled_mirror_target_kl=0.003,
     )
     trees, _ = trainer.collect()
     before = [parameter.detach().clone() for parameter in trainer.model.parameters()]
@@ -272,11 +290,12 @@ def test_unknown_policy_objective_is_rejected():
 
 def test_kl_backtracking_accepts_a_smaller_adam_step():
     trainer = make_trainer(
-        policy_objective="mirror_descent",
+        policy_objective="sampled_mirror",
         learning_rate=0.1,
         lr_warmup_updates=0,
         policy_kl_cap=1e-4,
-        mirror_target_kl=5e-5,
+        policy_kl_p99_cap=4e-4,
+        sampled_mirror_target_kl=5e-5,
         kl_backtrack_attempts=16,
         kl_backtrack_factor=0.5,
         suit_coef=0.0,
@@ -289,6 +308,7 @@ def test_kl_backtracking_accepts_a_smaller_adam_step():
     assert stats.backtracks > 0
     assert 0.0 < stats.step_scale < 1.0
     assert stats.policy_kl <= trainer.train.policy_kl_cap
+    assert stats.policy_kl_p99 <= trainer.train.policy_kl_p99_cap
     assert trainer.optimizer_steps == 1
 
 
@@ -358,8 +378,27 @@ def test_checkpoint_roundtrip_and_league(tmp_path):
         torch.testing.assert_close(a.detach(), b.detach())
 
 
+def test_league_uses_only_the_newest_half_of_training_history():
+    league = SeqLeague(max_snapshots=20)
+    for iteration in (10, 25, 49, 50, 75, 100, 101):
+        league.add(f"iter_{iteration}", f"/tmp/{iteration}.pt", iteration)
+    assert [snapshot.iteration for snapshot in league.eligible_snapshots(100)] == [
+        50,
+        75,
+        100,
+    ]
+    assert [snapshot.iteration for snapshot in league.eligible_snapshots(101)] == [
+        75,
+        100,
+        101,
+    ]
+
+
 def test_league_opponents_join_collection(tmp_path):
-    trainer = make_trainer(tmp_path)
+    trainer = make_trainer(
+        tmp_path,
+        rollout=RolloutOptions(historical_arm="concurrent"),
+    )
     trees, _ = trainer.collect()
     trainer.update(trees)
     trainer.iteration = 1
@@ -367,15 +406,16 @@ def test_league_opponents_join_collection(tmp_path):
     trees, summary = trainer.collect()
     arms = {tree.arm for tree in trees}
     assert arms == {"self", "historical"}
+    self_tree = next(tree for tree in trees if tree.arm == "self")
+    historical_tree = next(tree for tree in trees if tree.arm == "historical")
+    assert self_tree.initial_hands != historical_tree.initial_hands
     assert summary.reward_historical != 0.0 or summary.reward_self != 0.0
 
 
 @pytest.mark.parametrize(
     "exponent, expect_ratio", [(0.0, 1.0), (0.5, None), (1.0, None)]
 )
-def test_tree_weight_exponent_shifts_weight_toward_larger_trees(
-    exponent, expect_ratio
-):
+def test_tree_weight_exponent_shifts_weight_toward_larger_trees(exponent, expect_ratio):
     """The exponent decides how much of the gradient follows compute."""
 
     trainer = make_trainer(
@@ -391,13 +431,16 @@ def test_tree_weight_exponent_shifts_weight_toward_larger_trees(
 
     # Total weight each tree receives on the aux/value losses.
     totals = {}
-    rows = {}
+    rows = {
+        (tree.num_players, tree.hand_size): sum(
+            sum(leaf.position_reach_weights().values()) for leaf in tree.leaves
+        )
+        for tree in trees
+    }
     for group in groups:
-        owned_counts = group.owned.sum(axis=1)
-        for row, weight in enumerate(group.seq_weight):
+        for row in range(group.position_weight.shape[0]):
             key = (group.num_players, group.hand_size)
-            totals[key] = totals.get(key, 0.0) + float(weight * owned_counts[row])
-            rows[key] = rows.get(key, 0) + int(owned_counts[row])
+            totals[key] = totals.get(key, 0.0) + float(group.position_weight[row].sum())
     assert sum(totals.values()) == pytest.approx(1.0)
 
     small, big = (3, 3), (5, 8)
@@ -415,11 +458,8 @@ def _shape_weight_totals(trainer, trees):
     groups = build_training_groups(trees, MODEL_CONFIG, trainer.train)
     totals = {}
     for group in groups:
-        owned_counts = group.owned.sum(axis=1)
         key = (group.num_players, group.hand_size)
-        totals[key] = totals.get(key, 0.0) + float(
-            (group.seq_weight * owned_counts).sum()
-        )
+        totals[key] = totals.get(key, 0.0) + float(group.position_weight.sum())
     return totals
 
 
@@ -502,18 +542,14 @@ def test_unbranched_rows_produce_a_nonzero_policy_gradient():
     # the tree -- so only the play rows are unbranched here.
     play = [group.policy["play"] for group in groups if group.policy["play"].weight]
     assert play, "expected play decisions with branching switched off"
-    assert all(
-        len(candidates) == 1 for r in play for candidates in r.candidates
-    )
+    assert all(len(candidates) == 1 for r in play for candidates in r.candidates)
     assert all(not any(r.branched) for r in play)
 
     trainer.model.zero_grad(set_to_none=True)
     total = 0.0
     for group in groups:
         by_chunk = _rows_by_chunk(group, trainer._microbatches(group))
-        for (start, stop), policy_rows in zip(
-            trainer._microbatches(group), by_chunk
-        ):
+        for (start, stop), policy_rows in zip(trainer._microbatches(group), by_chunk):
             loss, terms = trainer._chunk_loss(group, start, stop, policy_rows)
             if loss is not None:
                 loss.backward()

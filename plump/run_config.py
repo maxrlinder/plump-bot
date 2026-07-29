@@ -20,14 +20,11 @@ from plump.seq.config import (
     build_position_balanced_schedule,
 )
 
-
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 CHECKOUT_CONFIG_PATH = PROJECT_ROOT / "configs" / "train.toml"
 PACKAGED_CONFIG_PATH = Path(__file__).with_name("train.toml")
 DEFAULT_CONFIG_PATH = (
-    CHECKOUT_CONFIG_PATH
-    if CHECKOUT_CONFIG_PATH.is_file()
-    else PACKAGED_CONFIG_PATH
+    CHECKOUT_CONFIG_PATH if CHECKOUT_CONFIG_PATH.is_file() else PACKAGED_CONFIG_PATH
 )
 
 
@@ -106,9 +103,7 @@ def resolve_training_config(raw: dict[str, Any]) -> ResolvedTraining:
         exhaustive_until=int(training_raw["exhaustive_until"]),
         hand_sizes=hand_sizes,
         player_counts=player_counts,
-        player_exponent=float(
-            training_raw["branch_rate_player_exponent"]
-        ),
+        player_exponent=float(training_raw["branch_rate_player_exponent"]),
     )
     rollout_raw = raw["rollout"]
     run_raw = raw["run"]
@@ -118,23 +113,24 @@ def resolve_training_config(raw: dict[str, Any]) -> ResolvedTraining:
         player_counts=player_counts,
         player_count_weights=player_weights,
         branch_rule=BranchRuleConfig(
-            bid_mode=str(training_raw.get("bid_mode", "top_k")),
+            bid_mode=str(training_raw.get("bid_mode", "sample_k_plus_uniform")),
             bid_top_k=int(training_raw["bid_top_k"]),
             play_mode=str(training_raw["play_mode"]),
             play_top_k=int(training_raw["play_top_k"]),
         ),
         branch_budget=BranchBudgetConfig(branch_rate_by_shape=rate_table),
         rollout=RolloutOptions(
-            auto_deals_per_batch=bool(
-                rollout_raw["auto_deals_per_batch"]
-            ),
+            auto_deals_per_batch=bool(rollout_raw["auto_deals_per_batch"]),
             deals_per_batch=int(rollout_raw.get("deals_per_batch", 1)),
+            parallel_deals_max_hand_size=(
+                None
+                if rollout_raw.get("parallel_deals_max_hand_size") is None
+                else int(rollout_raw["parallel_deals_max_hand_size"])
+            ),
             cache_budget_gb=float(rollout_raw["cache_budget_gb"]),
             max_cache_rows=int(rollout_raw["max_cache_rows"]),
             historical_arm=str(rollout_raw["historical_arm"]),
-            bid_position_mode=str(
-                rollout_raw.get("bid_position_mode", "cycle")
-            ),
+            bid_position_mode=str(rollout_raw.get("bid_position_mode", "cycle")),
         ),
         learning_rate=float(training_raw["learning_rate"]),
         lr_warmup_updates=int(training_raw["lr_warmup_updates"]),
@@ -143,28 +139,27 @@ def resolve_training_config(raw: dict[str, Any]) -> ResolvedTraining:
         policy_objective=str(training_raw["policy_objective"]),
         policy_coef=float(training_raw["policy_coef"]),
         policy_kl_cap=float(training_raw["policy_kl_cap"]),
+        policy_kl_p99_cap=float(training_raw["policy_kl_p99_cap"]),
         neurd_regret_coef=float(training_raw["neurd_regret_coef"]),
         neurd_kl_coef=float(training_raw["neurd_kl_coef"]),
-        neurd_advantage_clip=float(
-            training_raw["neurd_advantage_clip"]
-        ),
-        neurd_inclusion_exponent=float(
-            training_raw["neurd_inclusion_exponent"]
-        ),
+        neurd_advantage_clip=float(training_raw["neurd_advantage_clip"]),
+        neurd_inclusion_exponent=float(training_raw["neurd_inclusion_exponent"]),
         neurd_inclusion_cap=float(training_raw["neurd_inclusion_cap"]),
-        mirror_step_size=float(training_raw["mirror_step_size"]),
-        mirror_target_kl=float(training_raw["mirror_target_kl"]),
-        mirror_uniform_mix=float(training_raw["mirror_uniform_mix"]),
-        mirror_advantage_clip=float(training_raw["mirror_advantage_clip"]),
-        mirror_inclusion_exponent=float(
-            training_raw["mirror_inclusion_exponent"]
+        sampled_mirror_step_size=float(training_raw["sampled_mirror_step_size"]),
+        sampled_mirror_target_kl=float(training_raw["sampled_mirror_target_kl"]),
+        sampled_mirror_uniform_mix=float(training_raw["sampled_mirror_uniform_mix"]),
+        sampled_mirror_advantage_clip=float(
+            training_raw["sampled_mirror_advantage_clip"]
         ),
-        mirror_inclusion_cap=float(training_raw["mirror_inclusion_cap"]),
+        sampled_mirror_inclusion_exponent=float(
+            training_raw["sampled_mirror_inclusion_exponent"]
+        ),
+        sampled_mirror_inclusion_cap=float(
+            training_raw["sampled_mirror_inclusion_cap"]
+        ),
         kl_backtrack_attempts=int(training_raw["kl_backtrack_attempts"]),
         kl_backtrack_factor=float(training_raw["kl_backtrack_factor"]),
-        branch_depth_exponent=float(
-            training_raw["branch_depth_exponent"]
-        ),
+        branch_depth_exponent=float(training_raw["branch_depth_exponent"]),
         value_coef=float(training_raw["value_coef"]),
         suit_coef=float(training_raw["suit_coef"]),
         bid_hit_coef=float(training_raw["bid_hit_coef"]),

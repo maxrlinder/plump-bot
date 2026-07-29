@@ -1,21 +1,18 @@
 """Wave-synchronized branching rollout engine over KV caches (schema v6).
 
-Per scheduled game one deal is played as a matched pair of trees (self-play
-opponents and historical opponents) sharing the deal and focal seat. Every
-leaf of a tree advances one public event per wave, so all cache slots share a
-single position counter. Branching a leaf clones its env and copies every
-seat's KV prefix. Which focal decisions branch is decided per decision by
-``branch_rate``; the KV row cap is the only hard limit, and hitting it means
-the rate was set too high for the budget.
+Scheduled deals of the same shape may share a wave loop. Historical games, when
+enabled, always use independent deals. Every leaf advances one public event per
+wave, so all cache slots share a single position counter. Branching a leaf
+clones its env and copies every seat's KV prefix.
 
-Terminal rewards are backed up through the counterfactual tree:
-exact ``V = sum pi_old(a) Q(a)`` where the candidate set covers all legal
-actions, and the control-variate estimator for capped bid sets.
+Terminal rewards are backed up through the counterfactual tree with empirical
+weights from iid old-policy action samples. The resulting Monte Carlo backup is
+an unbiased estimate of ``V_pi_old``; independent uniform explorer arms have
+zero backup and downstream training reach.
 """
 
 from __future__ import annotations
 
-import bisect
 import math
 import random
 import time
@@ -26,13 +23,12 @@ import numpy as np
 import torch
 
 from plump.env import PlumpEnv
+from plump.rewards import compute_relative_rewards
 from plump.rounds import RoundSpec, round_game_config
 from plump.state import BidAction, EventType, GameEvent, Phase, PlayCardAction
-from plump.rewards import compute_relative_rewards
 
 from .config import (
     NEXT_BID,
-    NEXT_NONE,
     NEXT_PLAY,
     NUM_CARDS,
     SLOT_NEXT_ACTOR,
@@ -90,8 +86,8 @@ class SeqBranchRecord:
     """Counterfactual expansion at one focal decision."""
 
     candidate_indices: tuple[int, ...]
-    prior_probs: tuple[float, ...]         # renormalized over candidates
-    raw_probs: dict[int, float]            # unrenormalized old-policy masses
+    prior_probs: tuple[float, ...]  # renormalized over candidates
+    raw_probs: dict[int, float]  # unrenormalized old-policy masses
     # P(a is in the candidate set) under whatever rule selected it, per
     # candidate. NeuRD's logit gradient is per-action, so an action expanded
     # with probability q contributes q * A(a) in expectation over updates --
@@ -134,10 +130,13 @@ class SeqDecisionRecord:
     """One focal decision owned by one leaf."""
 
     position: int
-    phase: int                # NEXT_BID or NEXT_PLAY
+    phase: int  # NEXT_BID or NEXT_PLAY
     action_index: int
-    old_probs: np.ndarray     # masked policy over 11 bids or 52 cards
+    old_probs: np.ndarray  # masked policy over 11 bids or 52 cards
     old_value: float
+    # Empirical old-policy reach represented by this row inside its expanded
+    # tree. Uniform-only explorer descendants have zero reach.
+    reach_weight: float = 1.0
     # Branch decisions above this one on its path. Recorded here rather than
     # walked at update time because an unbranched decision has no record of
     # its own to walk up from.
@@ -160,17 +159,19 @@ class SeqLeaf:
     env: PlumpEnv
     tree: "SeqTree"
     rng: random.Random
-    slots: dict[int, tuple[str, int]]     # seat -> (policy_id, cache slot)
+    slots: dict[int, tuple[str, int]]  # seat -> (policy_id, cache slot)
     owned_from: int
     on_policy_spine: bool
     upstream: Optional[tuple[SeqBranchRecord, int]]
+    # Product of empirical old-policy branch weights along this path.
+    reach_weight: float = 1.0
     # Index of the root-bid candidate this leaf descends from. Kept as a
     # census of how the tree divides across the focal's bid options, and as the
     # structural invariant a bid-split pass is checked against.
     bid_group: int = 0
     decisions: list[SeqDecisionRecord] = field(default_factory=list)
     open_positions: list[int] = field(default_factory=list)
-    segments: list[tuple[list[int], Optional[SeqBranchRecord]]] = field(
+    segments: list[tuple[list[int], Optional[SeqBranchRecord], float]] = field(
         default_factory=list
     )
     pending: Optional[_Pending] = None
@@ -186,7 +187,7 @@ class SeqLeaf:
     parent: Optional["SeqLeaf"] = None
 
     def value_target_at(self, position: int) -> float:
-        for positions, resolver in self.segments:
+        for positions, resolver, _ in self.segments:
             if position in positions:
                 if resolver is None:
                     return self.terminal_value
@@ -195,16 +196,23 @@ class SeqLeaf:
 
     def value_targets(self) -> dict[int, float]:
         targets: dict[int, float] = {}
-        for positions, resolver in self.segments:
+        for positions, resolver, _ in self.segments:
             value = self.terminal_value if resolver is None else resolver.backed_value
             for position in positions:
                 targets[position] = value
         return targets
 
+    def position_reach_weights(self) -> dict[int, float]:
+        return {
+            position: reach
+            for positions, _, reach in self.segments
+            for position in positions
+        }
+
 
 @dataclass
 class SeqTree:
-    arm: str                  # "self" | "historical"
+    arm: str  # "self" | "historical"
     focal: int
     num_players: int
     hand_size: int
@@ -231,6 +239,10 @@ class SeqTree:
     # and each pass resolves a disjoint subset of its children.
     split_bid_record: Optional[SeqBranchRecord] = None
     split_bid_candidates: tuple[int, ...] = ()
+    # Candidate selection consumes the leaf RNG before children start. Later
+    # split passes restore this post-selection state so every root child gets
+    # the same continuation tape it would have received in an unsplit tree.
+    split_post_sample_rng_state: Optional[tuple] = None
 
 
 @dataclass
@@ -292,9 +304,7 @@ class SeqRolloutCollector:
     ) -> None:
         self.model_config: SeqModelConfig = model.config
         self.train = train_config
-        self.device = (
-            torch.device(device) if device is not None else model.device
-        )
+        self.device = torch.device(device) if device is not None else model.device
         self.model = model.to(self.device)
         self._caches: dict[str, KVCache] = {}
         self._kv_dtype = (
@@ -347,13 +357,16 @@ class SeqRolloutCollector:
     # ------------------------------------------------------------------ #
 
     def collect(
-        self, league: Optional[SeqLeague], rng: random.Random
+        self,
+        league: Optional[SeqLeague],
+        rng: random.Random,
+        *,
+        iteration: int = 0,
     ) -> list[SeqTree]:
         started = time.perf_counter()
         self.stats = SeqCollectionStats()
         trees: list[SeqTree] = []
         self._total_leaves = 0
-        options = self.train.rollout
         for cell in self.train.schedule_cells:
             remaining = cell.games
             # Resolve the shape once per cell rather than once per batch: with
@@ -368,7 +381,7 @@ class SeqRolloutCollector:
                 deals = min(remaining, self._deals_for(cell, num_players, remaining))
                 batch_started = time.perf_counter()
                 batch = self._collect_deal_batch(
-                    cell, league, rng, deals, num_players
+                    cell, league, rng, deals, num_players, iteration
                 )
                 cost.sec += time.perf_counter() - batch_started
                 cost.deals += deals
@@ -400,6 +413,11 @@ class SeqRolloutCollector:
 
         options = self.train.rollout
         if not options.auto_deals_per_batch:
+            if (
+                options.parallel_deals_max_hand_size is not None
+                and cell.hand_size > options.parallel_deals_max_hand_size
+            ):
+                return 1
             return options.deals_per_batch
         target = options.auto_target_rows
         if target is None:
@@ -466,6 +484,7 @@ class SeqRolloutCollector:
         rng: random.Random,
         deals: int,
         num_players: int,
+        iteration: int,
     ) -> list[SeqTree]:
         """Build the trees for ``deals`` deals and run their wave loops.
 
@@ -479,15 +498,21 @@ class SeqRolloutCollector:
         models: dict[str, SeqPlumpModel] = {CURRENT: self.model}
         opponent_id: Optional[str] = None
         historical = options.historical_arm
-        if historical != "off" and league is not None and league.has_snapshots():
-            opponent_id, opponent_policy = league.draw(rng, device=self.device)
+        if (
+            historical != "off"
+            and league is not None
+            and league.has_snapshots(iteration)
+        ):
+            opponent_id, opponent_policy = league.draw(
+                rng, iteration=iteration, device=self.device
+            )
             models[OPPONENT] = opponent_policy.model
         else:
             historical = "off"
 
         # A unit is one wave loop: a list of (tree, env, crn_state).
-        paired_unit: list[tuple[SeqTree, PlumpEnv, tuple]] = []
-        separate_unit: list[tuple[SeqTree, PlumpEnv, tuple]] = []
+        concurrent_unit: list[tuple[SeqTree, PlumpEnv, tuple]] = []
+        sequential_units: list[list[tuple[SeqTree, PlumpEnv, tuple]]] = []
         trees: list[SeqTree] = []
 
         def make_tree(arm: str, env: PlumpEnv, start: int, focal: int) -> SeqTree:
@@ -510,34 +535,30 @@ class SeqRolloutCollector:
             env, start, seed = self._new_deal(num_players, hand_size, rng)
             focal = self._focal_seat(cell, num_players, rng, start)
             crn = random.Random(seed ^ 0x5EED).getstate()
-            paired_unit.append((make_tree("self", env, start, focal), env, crn))
-            if historical == "paired":
-                # Matched pair: same deal, same wave loop, same random tape.
-                paired_unit.append(
-                    (make_tree("historical", env, start, focal), env, crn)
+            concurrent_unit.append((make_tree("self", env, start, focal), env, crn))
+            if historical != "off":
+                h_env, h_start, h_seed = self._new_deal(num_players, hand_size, rng)
+                h_crn = random.Random(h_seed ^ 0x5EED).getstate()
+                h_focal = self._focal_seat(cell, num_players, rng, h_start)
+                historical_entry = (
+                    make_tree("historical", h_env, h_start, h_focal),
+                    h_env,
+                    h_crn,
                 )
-            elif historical == "separate":
-                if options.historical_same_deal:
-                    h_env, h_start, h_crn = env, start, crn
+                if historical == "concurrent":
+                    concurrent_unit.append(historical_entry)
                 else:
-                    h_env, h_start, h_seed = self._new_deal(
-                        num_players, hand_size, rng
-                    )
-                    h_crn = random.Random(h_seed ^ 0x5EED).getstate()
-                    focal = self._focal_seat(cell, num_players, rng, h_start)
-                separate_unit.append(
-                    (make_tree("historical", h_env, h_start, focal), h_env, h_crn)
-                )
+                    sequential_units.append([historical_entry])
 
         splits = options.splits_for(hand_size)
-        for unit in (paired_unit, separate_unit):
+        for unit in (concurrent_unit, *sequential_units):
             if not unit:
                 continue
             for group in range(splits):
                 self._run_wave_loop(unit, models, group, splits)
         for tree in trees:
             for leaf in tree.leaves:
-                for _, resolver in leaf.segments:
+                for _, resolver, _ in leaf.segments:
                     if resolver is not None and resolver.backed_value is None:
                         raise AssertionError("Unresolved branch record after game.")
         self.stats.games += deals
@@ -647,12 +668,12 @@ class SeqRolloutCollector:
             for policy_id, (parents, children) in branch_copies.items():
                 self._caches[policy_id].ensure_capacity(row_counters[policy_id])
                 self._caches[policy_id].branch_copy(
-                    torch.from_numpy(
-                        np.asarray(parents, dtype=np.int64)
-                    ).to(self.device),
-                    torch.from_numpy(
-                        np.asarray(children, dtype=np.int64)
-                    ).to(self.device),
+                    torch.from_numpy(np.asarray(parents, dtype=np.int64)).to(
+                        self.device
+                    ),
+                    torch.from_numpy(np.asarray(children, dtype=np.int64)).to(
+                        self.device
+                    ),
                     length=position,
                 )
             if branch_copies:
@@ -670,9 +691,7 @@ class SeqRolloutCollector:
             self.stats.step_sec += t2 - t1
             self.stats.compact_sec += t3 - t2
             if appends:
-                position += self._append_wave(
-                    appends, models, position, row_counters
-                )
+                position += self._append_wave(appends, models, position, row_counters)
             alive = alive_next
 
         # Freeing between passes is what makes splitting a memory win.
@@ -755,9 +774,7 @@ class SeqRolloutCollector:
         options = self.train.rollout
         if options.max_cache_rows is not None:
             return options.max_cache_rows
-        return max(
-            int(options.cache_budget_gb * 1e9 / self._bytes_per_row()), 64
-        )
+        return max(int(options.cache_budget_gb * 1e9 / self._bytes_per_row()), 64)
 
     def _policy_row_cap(self, arms: int) -> int:
         return self._row_cap() if arms < 2 else self._row_cap() // 2
@@ -869,7 +886,9 @@ class SeqRolloutCollector:
         actor = env.current_player()
 
         if actor != leaf.tree.focal:
-            self._advance_leaf(leaf, self._action_for(actor, phase, sampled), appends, alive_next)
+            self._advance_leaf(
+                leaf, self._action_for(actor, phase, sampled), appends, alive_next
+            )
             return
 
         if (
@@ -897,6 +916,7 @@ class SeqRolloutCollector:
             action_index=sampled,
             old_probs=probs,
             old_value=leaf.pending.value,
+            reach_weight=leaf.reach_weight,
             depth=_upstream_depth(leaf.upstream),
         )
         leaf.decisions.append(record)
@@ -917,11 +937,7 @@ class SeqRolloutCollector:
                 leaf,
                 len(candidates),
                 len(
-                    [
-                        t
-                        for t in env.state.current_round.tricks
-                        if t.winner is not None
-                    ]
+                    [t for t in env.state.current_round.tricks if t.winner is not None]
                 ),
             )
         ):
@@ -936,15 +952,15 @@ class SeqRolloutCollector:
             if len(candidates) > 1:
                 self.stats.blocked_by_cache += 1
         if not (len(candidates) > 1 and allow_branch):
-            self._advance_leaf(leaf, self._action_for(actor, phase, sampled), appends, alive_next)
+            self._advance_leaf(
+                leaf, self._action_for(actor, phase, sampled), appends, alive_next
+            )
             return
 
         raw = {index: float(probs[index]) for index in candidates}
         if mc_weights is not None:
-            # Already-normalized backup weights -- empirical frequencies for
-            # sample_k's i.i.d. draws, Hajek pi(a)/q(a) for the Gumbel modes'
-            # draws without replacement. Either way they sum to 1, so the
-            # backup takes the full-mass (exact-form) path.
+            # Empirical frequencies of iid old-policy draws. They sum to one,
+            # so the backup is an ordinary unbiased Monte Carlo mean.
             priors = tuple(mc_weights)
             mass = 1.0
         else:
@@ -961,7 +977,9 @@ class SeqRolloutCollector:
             upstream=leaf.upstream,
         )
         record.branch = branch
-        leaf.segments.append((leaf.open_positions, branch))
+        parent_reach = leaf.reach_weight
+        reach_by_candidate = dict(zip(candidates, priors))
+        leaf.segments.append((leaf.open_positions, branch, parent_reach))
         leaf.open_positions = []
         leaf.upstream = (branch, sampled)
         self.stats.branch_decisions += 1
@@ -1028,6 +1046,7 @@ class SeqRolloutCollector:
                 owned_from=position,
                 on_policy_spine=False,
                 upstream=(branch, candidate),
+                reach_weight=parent_reach * reach_by_candidate[candidate],
                 bid_group=group,
                 covered_until=position,
                 parent=leaf,
@@ -1037,7 +1056,10 @@ class SeqRolloutCollector:
             self._advance_leaf(
                 child, self._action_for(actor, phase, candidate), appends, alive_next
             )
-        self._advance_leaf(leaf, self._action_for(actor, phase, sampled), appends, alive_next)
+        leaf.reach_weight = parent_reach * reach_by_candidate[sampled]
+        self._advance_leaf(
+            leaf, self._action_for(actor, phase, sampled), appends, alive_next
+        )
 
     def _expand_bid_split(
         self,
@@ -1068,9 +1090,7 @@ class SeqRolloutCollector:
 
         if first_pass:
             candidates, mc_weights, deterministic_count, inclusion = (
-                self._branch_candidates(
-                    leaf, Phase.BIDDING, legal, probs, sampled
-                )
+                self._branch_candidates(leaf, Phase.BIDDING, legal, probs, sampled)
             )
             if len(candidates) <= 1:
                 # Nothing to split; fall back to the ordinary path.
@@ -1078,8 +1098,17 @@ class SeqRolloutCollector:
                 self._split_plan = None
                 try:
                     self._decide_and_step(
-                        leaf, Phase.BIDDING, probs, sampled, legal, position,
-                        True, appends, alive_next, row_counters, branch_copies,
+                        leaf,
+                        Phase.BIDDING,
+                        probs,
+                        sampled,
+                        legal,
+                        position,
+                        True,
+                        appends,
+                        alive_next,
+                        row_counters,
+                        branch_copies,
                         set(),
                     )
                 finally:
@@ -1104,6 +1133,7 @@ class SeqRolloutCollector:
             )
             tree.split_bid_record = record
             tree.split_bid_candidates = tuple(candidates)
+            tree.split_post_sample_rng_state = leaf.rng.getstate()
             # Same group layout an unsplit tree would build, so the per-group
             # budget each pass sees is identical to the unsplit one.
             tree.bid_groups = len(candidates)
@@ -1115,10 +1145,11 @@ class SeqRolloutCollector:
                 action_index=sampled,
                 old_probs=probs,
                 old_value=leaf.pending.value,
+                reach_weight=leaf.reach_weight,
                 branch=record,
             )
             leaf.decisions.append(decision)
-            leaf.segments.append((leaf.open_positions, record))
+            leaf.segments.append((leaf.open_positions, record, leaf.reach_weight))
             leaf.open_positions = []
             tree.decision_total += 1
             self.stats.decisions += 1
@@ -1135,14 +1166,14 @@ class SeqRolloutCollector:
             tree.branch_layers += 1
         else:
             record = tree.split_bid_record
+            leaf.rng.setstate(tree.split_post_sample_rng_state)
 
         all_candidates = tree.split_bid_candidates
         group = list(all_candidates[group_index::group_total])
         if not group:
             return
-        groups_of = {
-            candidate: all_candidates.index(candidate) for candidate in group
-        }
+        groups_of = {candidate: all_candidates.index(candidate) for candidate in group}
+        reach_by_candidate = dict(zip(record.candidate_indices, record.prior_probs))
         for candidate in group:
             tree.leaves_by_bid_group[groups_of[candidate]] = 1
 
@@ -1174,21 +1205,27 @@ class SeqRolloutCollector:
                 owned_from=position,
                 on_policy_spine=(candidate == record.sampled_index),
                 upstream=(record, candidate),
+                reach_weight=reach_by_candidate[candidate],
                 bid_group=groups_of[candidate],
                 covered_until=position,
                 parent=leaf,
             )
             self._advance_leaf(
-                child, self._action_for(actor, Phase.BIDDING, candidate),
-                appends, alive_next,
+                child,
+                self._action_for(actor, Phase.BIDDING, candidate),
+                appends,
+                alive_next,
             )
         leaf.owned_from = min(leaf.owned_from, position) if first_pass else position
         leaf.on_policy_spine = group[0] == record.sampled_index
         leaf.upstream = (record, group[0])
+        leaf.reach_weight = reach_by_candidate[group[0]]
         leaf.bid_group = groups_of[group[0]]
         self._advance_leaf(
-            leaf, self._action_for(actor, Phase.BIDDING, group[0]),
-            appends, alive_next,
+            leaf,
+            self._action_for(actor, Phase.BIDDING, group[0]),
+            appends,
+            alive_next,
         )
 
     def _is_branch_point(
@@ -1201,9 +1238,7 @@ class SeqRolloutCollector:
         """
 
         config = self.train.branch_budget
-        probability = config.rate_for_shape(
-            leaf.tree.num_players, leaf.tree.hand_size
-        )
+        probability = config.rate_for_shape(leaf.tree.num_players, leaf.tree.hand_size)
         if probability is None:
             raise AssertionError(
                 "No branch_rate for "
@@ -1236,11 +1271,10 @@ class SeqRolloutCollector:
     ) -> tuple[list[int], Optional[list[float]], int, list[float]]:
         """Return (candidates, mc weights or None, deterministic count, q).
 
-        Weights are returned by the sampling rules, whose candidate sets are
-        draws rather than a deterministic top-k, so the backup cannot simply
-        renormalize policy mass over the set: ``sample_k`` weights by empirical
-        frequency, the Gumbel modes by Hajek pi(a)/q(a). The deterministic
-        rules return None and the caller renormalizes.
+        Weights are returned by iid sampling rules whose duplicate draws are
+        collapsed into empirical frequencies. That is the ordinary Monte Carlo
+        estimate of the old-policy value. Deterministic rules return None and
+        the caller renormalizes their covered policy mass.
 
         ``q`` is the inclusion probability of each returned candidate -- the
         chance this rule would have expanded that action at this node. It is
@@ -1254,11 +1288,7 @@ class SeqRolloutCollector:
             mode, top_k = rule.bid_rule()
         else:
             trick_index = len(
-                [
-                    t
-                    for t in leaf.env.state.current_round.tricks
-                    if t.winner is not None
-                ]
+                [t for t in leaf.env.state.current_round.tricks if t.winner is not None]
             )
             mode, top_k = rule.play_rule_for_trick(trick_index)
         return self._candidates_for_mode(leaf, legal, probs, sampled, mode, top_k)
@@ -1309,157 +1339,20 @@ class SeqRolloutCollector:
             # uniform arm is what puts a 1/|legal| floor under q, which is
             # what keeps 1/q bounded.
             inclusion = [
-                1.0
-                - (1.0 - float(probs[action])) ** top_k * (1.0 - uniform_rate)
+                1.0 - (1.0 - float(probs[action])) ** top_k * (1.0 - uniform_rate)
                 for action in candidates
             ]
             return candidates, weights, len(candidates), inclusion
 
-        if mode in ("gumbel_top_k", "gumbel_top_k_plus_random"):
-            if top_k < 1:
-                raise ValueError(f"top_k must be >= 1 for {mode}.")
-            return self._gumbel_candidates(
-                leaf,
-                legal,
-                probs,
-                sampled,
-                top_k,
-                uniform_extra=mode == "gumbel_top_k_plus_random",
-            )
-
-        if mode == "all_legal" or len(legal) <= top_k:
+        if mode == "all_legal":
             ordered = sorted(legal, key=lambda index: (-probs[index], index))
             return ordered, None, len(ordered), [1.0] * len(ordered)
-        ranked = sorted(legal, key=lambda index: (-probs[index], index))
-        selected = ranked[: top_k - 1]
-        deterministic_count = len(selected)
-        inclusion = [1.0] * deterministic_count
-        if sampled not in selected:
-            selected = [*selected, sampled]
-            inclusion.append(float(probs[sampled]))
-        if mode == "top_k_plus_random":
-            extras = [index for index in legal if index not in selected]
-            if extras:
-                chosen = leaf.rng.choice(extras)
-                selected = [*selected, chosen]
-                # Drawn either as the policy sample or as the random extra.
-                inclusion.append(
-                    float(probs[chosen])
-                    + (1.0 - float(probs[chosen])) / len(extras)
-                )
-        return selected, None, deterministic_count, inclusion
+        raise ValueError(f"Unknown branch mode {mode!r}.")
 
     @staticmethod
-    def _gumbel_candidates(
-        leaf: SeqLeaf,
-        legal: list[int],
-        probs: np.ndarray,
-        sampled: int,
-        top_k: int,
-        uniform_extra: bool = False,
-    ) -> tuple[list[int], Optional[list[float]], int, list[float]]:
-        """``top_k`` distinct actions: the realized one plus a Gumbel top-k-1.
-
-        Sampling without replacement, so no candidate is ever a duplicate of
-        another. The realized action is kept as-is (it is what the spine child
-        continues with, and what the paired-tape CRN sampling produced), and
-        the remaining arms come from perturbing the log-policy of the other
-        legal actions with Gumbel noise and taking the largest -- which is
-        exactly a policy-proportional draw without replacement.
-
-        The backup weights are Hajek (self-normalized Horvitz-Thompson):
-        pi(a)/q(a), renormalized. Without replacement the empirical-frequency
-        weighting ``sample_k`` uses is meaningless -- every candidate appears
-        once -- so the correction for over- or under-representation has to come
-        from the inclusion probabilities instead.
-
-        ``uniform_extra`` adds one more arm, drawn uniformly from the legal
-        actions this pass did not already take. It gets backup weight zero: it
-        was reached by exploring, not by the policy, so letting it into the
-        weighted average would pull the parent's value toward actions the policy
-        does not play. Its inclusion probability is real, though, and that is
-        the point -- it puts a floor under q for every legal action, which is
-        what keeps the NeuRD 1/q correction bounded on actions the policy has
-        driven to near-zero probability.
-        """
-
-        rest = [index for index in legal if index != sampled]
-        want = min(top_k - 1, len(rest))
-        log_p = {
-            index: math.log(max(float(probs[index]), 1e-12)) for index in legal
-        }
-        if want <= 0:
-            # Nothing left to draw without replacement, so there is nothing for
-            # the uniform arm to draw either.
-            return [sampled], None, 1, [1.0]
-
-        perturbed = {
-            index: log_p[index]
-            - math.log(-math.log(max(leaf.rng.random(), 1e-12)))
-            for index in rest
-        }
-        ordered = sorted(rest, key=lambda index: -perturbed[index])
-        chosen = ordered[:want]
-
-        if len(ordered) > want:
-            # Conditional on kappa -- the (want+1)-th largest perturbed value --
-            # the selection events are independent Bernoullis with this
-            # probability (Kool et al., Theorem 1). Exact, and O(|legal|).
-            kappa = perturbed[ordered[want]]
-            q_gumbel = {
-                index: -math.expm1(-math.exp(min(log_p[index] - kappa, 50.0)))
-                for index in legal
-            }
-        else:
-            # Everything else was taken, so the set is exhaustive.
-            q_gumbel = {index: 1.0 for index in legal}
-
-        candidates = sorted([sampled, *chosen])
-        # An action lands in the set either as the realized draw or via the
-        # Gumbel pass over the complement. The second term is a plug-in: it
-        # uses the kappa from the complement actually drawn rather than
-        # marginalizing over which action was realized.
-        def policy_inclusion(index: int) -> float:
-            return min(
-                1.0,
-                float(probs[index])
-                + (1.0 - float(probs[index])) * q_gumbel[index],
-            )
-
-        inclusion = [policy_inclusion(index) for index in candidates]
-        hajek = [
-            float(probs[index]) / max(q, 1e-6)
-            for index, q in zip(candidates, inclusion)
-        ]
-        total = sum(hajek)
-        if total <= 0:
-            weights = [1.0 / len(candidates)] * len(candidates)
-        else:
-            weights = [value / total for value in hajek]
-
-        if uniform_extra:
-            extras = [index for index in legal if index not in candidates]
-            if extras:
-                chosen_extra = leaf.rng.choice(extras)
-                # Reached either by the policy pass above or, failing that, by
-                # this uniform draw over whatever the policy pass left. len is
-                # the realized leftover count, matching the plug-in convention
-                # the Gumbel term above already uses.
-                q_policy = policy_inclusion(chosen_extra)
-                extra_q = min(
-                    1.0, q_policy + (1.0 - q_policy) / len(extras)
-                )
-                # Weight zero -- see the docstring. The backup stays the
-                # on-policy estimate over the Gumbel arms alone.
-                position = bisect.bisect_left(candidates, chosen_extra)
-                candidates.insert(position, chosen_extra)
-                inclusion.insert(position, extra_q)
-                weights.insert(position, 0.0)
-
-        return candidates, weights, len(candidates), inclusion
-
-    @staticmethod
-    def _action_for(player: int, phase: Phase, index: int) -> BidAction | PlayCardAction:
+    def _action_for(
+        player: int, phase: Phase, index: int
+    ) -> BidAction | PlayCardAction:
         if phase == Phase.BIDDING:
             return BidAction(player, index)
         return PlayCardAction(player, card_from_id(index))
@@ -1511,7 +1404,7 @@ class SeqRolloutCollector:
         )
         leaf.open_positions.extend(range(leaf.covered_until, total_len))
         leaf.covered_until = total_len
-        leaf.segments.append((leaf.open_positions, None))
+        leaf.segments.append((leaf.open_positions, None, leaf.reach_weight))
         leaf.open_positions = []
         if leaf.upstream is not None:
             leaf.upstream[0].resolve(leaf.upstream[1], leaf.terminal_value)
@@ -1535,9 +1428,7 @@ class SeqRolloutCollector:
                 leaf.history = np.zeros(
                     (
                         tree.num_players,
-                        self.model_config.seq_len(
-                            tree.num_players, tree.hand_size
-                        ),
+                        self.model_config.seq_len(tree.num_players, tree.hand_size),
                         TOKEN_WIDTH,
                     ),
                     dtype=np.int64,
@@ -1594,9 +1485,7 @@ class SeqRolloutCollector:
                 return event.trick_index, event.position_in_trick + 1
         return 0, 0  # the wave was a bid; play opens at the first trick
 
-    def _wave_blocks(
-        self, leaf: SeqLeaf, events: list[GameEvent]
-    ) -> list[np.ndarray]:
+    def _wave_blocks(self, leaf: SeqLeaf, events: list[GameEvent]) -> list[np.ndarray]:
         """Per-seat token rows this wave appends: one [P, WIDTH] block each.
 
         A wave is one action plus whatever it implied (the TRICK_WIN closing a
@@ -1664,20 +1553,26 @@ class SeqRolloutCollector:
         # one forward instead of one per token; the earlier ones exist purely
         # to advance the cache. The cache-free path cannot merge: it re-encodes
         # the prefix from scratch, so every offset has a different length.
-        runs = [(0, event_count)] if self.use_cache else [
-            (offset, 1) for offset in range(event_count)
-        ]
+        runs = (
+            [(0, event_count)]
+            if self.use_cache
+            else [(offset, 1) for offset in range(event_count)]
+        )
         for run_start, run_len in runs:
             t_start = time.perf_counter()
             width = position + run_start + 1 if not self.use_cache else run_len
             # Cached mode addresses rows directly, so the batch is laid out by
             # cache row; rows belonging to already-terminated leaves stay
             # padding and their outputs are ignored.
-            token_arrays: dict[str, np.ndarray] = {
-                policy_id: np.zeros((count, width, TOKEN_WIDTH), dtype=np.int64)
-                for policy_id, count in row_counters.items()
-                if count > 0
-            } if self.use_cache else {}
+            token_arrays: dict[str, np.ndarray] = (
+                {
+                    policy_id: np.zeros((count, width, TOKEN_WIDTH), dtype=np.int64)
+                    for policy_id, count in row_counters.items()
+                    if count > 0
+                }
+                if self.use_cache
+                else {}
+            )
             token_blocks: dict[str, list[np.ndarray]] = {}
             captures: dict[str, list[tuple[int, int, SeqLeaf]]] = {}
             for leaf, blocks in blocks_by_leaf:
@@ -1724,9 +1619,7 @@ class SeqRolloutCollector:
                         output = models[policy_id].forward_prefix(tokens)
                 self._sync()
                 self.stats.forward_rows += row_count * (
-                    run_len
-                    if self.use_cache
-                    else position + run_start + 1
+                    run_len if self.use_cache else position + run_start + 1
                 )
                 capture_list = captures.get(policy_id)
                 if capture_list:

@@ -15,7 +15,6 @@ from plump.state import BidAction, Phase, PlayCardAction
 
 from .config import (
     NEXT_BID,
-    NEXT_NONE,
     NEXT_PLAY,
     NUM_CARDS,
     SEQ_SCHEMA_VERSION,
@@ -102,9 +101,7 @@ class SeqModelPolicy:
         initial_hand = list(observation.my_hand) + list(
             observation.played_cards_by_player[player]
         )
-        pending_phase = (
-            NEXT_BID if observation.phase == Phase.BIDDING else NEXT_PLAY
-        )
+        pending_phase = NEXT_BID if observation.phase == Phase.BIDDING else NEXT_PLAY
         return build_seat_tokens(
             self.config,
             observation.event_log,
@@ -124,9 +121,7 @@ class SeqModelPolicy:
         initial_hand = list(observation.my_hand) + list(
             observation.played_cards_by_player[observer]
         )
-        pending_phase = (
-            NEXT_BID if observation.phase == Phase.BIDDING else NEXT_PLAY
-        )
+        pending_phase = NEXT_BID if observation.phase == Phase.BIDDING else NEXT_PLAY
         return build_seat_tokens(
             self.config,
             observation.event_log,
@@ -274,7 +269,7 @@ class SeqLeagueSnapshot:
 
 
 class SeqLeague:
-    """Uniform draw over saved schema-v6 snapshots with a minimum iteration."""
+    """Uniform draw over recent saved schema-v6 snapshots."""
 
     def __init__(self, max_snapshots: int, min_iteration: int = 0):
         self.max_snapshots = max_snapshots
@@ -290,13 +285,32 @@ class SeqLeague:
             dropped = self.snapshots.pop(0)
             self._policies.pop(dropped.snapshot_id, None)
 
-    def has_snapshots(self) -> bool:
-        return bool(self.snapshots)
+    def eligible_snapshots(
+        self, iteration: int | None = None
+    ) -> list[SeqLeagueSnapshot]:
+        if iteration is None:
+            return list(self.snapshots)
+        lower = (iteration + 1) // 2
+        return [
+            snapshot
+            for snapshot in self.snapshots
+            if lower <= snapshot.iteration <= iteration
+        ]
+
+    def has_snapshots(self, iteration: int | None = None) -> bool:
+        return bool(self.eligible_snapshots(iteration))
 
     def draw(
-        self, rng: random.Random, device: str | torch.device | None = None
+        self,
+        rng: random.Random,
+        *,
+        iteration: int | None = None,
+        device: str | torch.device | None = None,
     ) -> tuple[str, SeqModelPolicy]:
-        snapshot = rng.choice(self.snapshots)
+        eligible = self.eligible_snapshots(iteration)
+        if not eligible:
+            raise LookupError("No historical snapshot is eligible.")
+        snapshot = rng.choice(eligible)
         if snapshot.snapshot_id not in self._policies:
             self._policies[snapshot.snapshot_id] = SeqModelPolicy.from_checkpoint(
                 snapshot.path,

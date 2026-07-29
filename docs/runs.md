@@ -34,6 +34,18 @@ loads the checkpoint named by `latest.json` only after:
 A run lock prevents two trainers from writing the same directory. Stale locks
 are removed only after confirming their process no longer exists.
 
+To intentionally change training/rollout settings while preserving model,
+optimizer, RNG, iteration, and collector state, fork into a new run:
+
+```bash
+uv run plump train NEW_RUN \
+  --from-checkpoint runs/OLD_RUN/checkpoints/iter_000100.pt
+```
+
+The imported checkpoint is immediately rewritten under the new resolved
+configuration and recorded as the new run's `latest` checkpoint. Existing runs
+still reject configuration drift.
+
 ## Checkpoint contents
 
 Every configured interval checkpoint is retained and is fully resumable. It

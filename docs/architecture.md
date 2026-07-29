@@ -55,19 +55,21 @@ configuration. The active preset branches bids to the top four candidates,
 fully branches games of seven cards or fewer, and tapers the rate for longer
 games under a fixed cache-row budget.
 
-Play candidates come from `gumbel_top_k_plus_random`: three *distinct*
-policy-weighted actions drawn without replacement (`argtop(log π + Gumbel)` is
-exactly sampling without replacement), plus one more drawn uniformly from the
-legal actions that pass did not take. The two groups do different jobs. The
-three policy arms are what the value backup averages over, weighted Hájek
-(π(a)/q(a), renormalized). The uniform arm carries **backup weight zero** — it
-was reached by exploring, not by the policy, so admitting it to the average
-would pull the parent's value toward actions the policy does not play. Its
-inclusion probability is real, though, and that is its purpose: it puts a floor
-under q for every legal action, which keeps the policy objective's 1/q
-correction bounded on actions the policy has driven toward zero. Drawing it
-from the complement rather than from all legal actions is what makes it always
-a new subtree instead of sometimes a duplicate of one already expanded.
+Play candidates come from `sample_k_plus_uniform`: three iid old-policy draws
+plus one independent legal-uniform draw. Duplicate actions collapse into
+empirical multiplicities. The policy draws therefore give an ordinary unbiased
+Monte Carlo value backup, while the uniform-only arm has zero backup and
+downstream reach weight. For legal action `a`, its exact inclusion probability
+is:
+
+```text
+q(a) = 1 - (1 - pi_old(a))^k * (1 - 1 / |legal|)
+```
+
+This closed form is used by the control-variate NeuRD estimator. Drawing the
+uniform arm independently means it can duplicate a policy draw; that small
+efficiency cost is what keeps both the sampling design and its correction
+exact.
 
 ## Heads
 

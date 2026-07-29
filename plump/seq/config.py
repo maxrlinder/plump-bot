@@ -52,7 +52,7 @@ SLOT_NEXT_PHASE = 11
 #           costs P tokens instead of P + N*P)
 #   all  -> before every bid and every card play
 TurnTokenMode = Literal["off", "bid", "all"]
-PolicyObjective = Literal["neurd", "mirror_descent"]
+PolicyObjective = Literal["neurd", "sampled_mirror"]
 POLICY_OBJECTIVES: frozenset[str] = frozenset(get_args(PolicyObjective))
 
 
@@ -104,7 +104,6 @@ class SeqModelConfig:
     # rel_player differs per observer), which is what keeps the wave loop
     # rectangular -- see the note in rollout._append_wave.
     turn_token: TurnTokenMode = "off"
-
 
     d_model: int = 256
     n_layers: int = 6
@@ -223,8 +222,6 @@ class SeqModelConfig:
 
 PlayBranchMode = Literal[
     "all_legal",
-    "top_k",
-    "top_k_plus_random",
     # k i.i.d. draws from the masked policy (the realized action is the first
     # draw). Duplicates collapse into multiplicity weights, so the backup is
     # the unbiased Monte-Carlo value estimate rather than a top-k truncation.
@@ -234,22 +231,6 @@ PlayBranchMode = Literal[
     # the unbiased on-policy estimate; it exists purely so the policy loss sees
     # a Q-value at an action the policy currently under-weights.
     "sample_k_plus_uniform",
-    # k *distinct* actions: the realized action, then a Gumbel-top-(k-1) draw
-    # over the rest. argtop(log pi + Gumbel) is exactly sampling without
-    # replacement (Kool et al., ICML 2019), so the extra arms still follow the
-    # policy but can never repeat. Duplicates are pure waste in a branching
-    # tree -- a second copy of an action costs a full subtree and adds no
-    # counterfactual -- so this dominates ``sample_k`` at equal k.
-    "gumbel_top_k",
-    # ``gumbel_top_k`` plus one extra arm drawn uniformly from the legal actions
-    # the Gumbel pass did *not* take. Two different jobs: the k policy-weighted
-    # arms are what the value backup is built from, and the uniform arm is there
-    # so the policy loss occasionally sees a Q-value at an action the current
-    # policy has written off. Drawing it from the complement rather than from
-    # all legal actions is what makes the extra arm always a new subtree instead
-    # of sometimes a duplicate of one already expanded. It carries zero backup
-    # weight, so it cannot tilt the parent's value toward off-policy actions.
-    "gumbel_top_k_plus_random",
     "none",
 ]
 
@@ -263,13 +244,9 @@ BidBranchMode = Literal[
     # property that has to survive someone retuning the play rule and not
     # noticing the bid has its own copy of the numbers.
     "same_as_play",
-    # Deterministic: the top (bid_top_k - 1) bids by policy probability, plus
-    # the realized sample if it is not already among them. Those arms have
-    # inclusion probability 1, but the set is a hard truncation -- a bid the
-    # policy currently ranks fourth is never expanded, however close it is.
-    "top_k",
-    "gumbel_top_k",
-    "gumbel_top_k_plus_random",
+    "all_legal",
+    "sample_k",
+    "sample_k_plus_uniform",
 ]
 BID_BRANCH_MODES: frozenset[str] = frozenset(get_args(BidBranchMode))
 
@@ -314,21 +291,17 @@ class ShapeBranchRate:
 class BranchRuleConfig:
     """Pluggable branching restrictions; tunable without code changes."""
 
-    # Bidding. ``bid_top_k`` is how many arms the mode gets: under "top_k" the
-    # top (bid_top_k - 1) bids by policy probability plus the unconditional
-    # raw-policy sample, and 0 disables the cap (branch every legal bid); under
-    # the Gumbel modes it is k, the number of *distinct* policy-drawn arms, and
-    # "plus_random" adds one uniform explorer on top. Both are ignored under
-    # "same_as_play", which takes the play rule's mode and k instead.
+    # Bidding. ``bid_top_k`` is the number of iid old-policy action draws.
+    # Duplicates collapse into empirical multiplicities. ``plus_uniform`` adds
+    # one independent uniform draw with zero value-backup/reach weight. Both
+    # are ignored under "same_as_play", which takes the play rule's mode and k.
     #
     # Sharing the play rule is usually right. The bid is the root of the tree
     # and the only decision expanded unconditionally, so a truncation there is
     # not one missed counterfactual -- it is a whole subtree of the round that
-    # never gets played out. "top_k" can never expand a bid the policy
-    # currently ranks below the cut, so an early misvaluation is self-sealing;
-    # the sampling modes reach it with probability proportional to its policy
-    # mass, and the uniform arm floors that at 1/|legal|.
-    bid_mode: BidBranchMode = "top_k"
+    # never gets played out. The uniform draw keeps every legal bid observable
+    # with known nonzero inclusion probability.
+    bid_mode: BidBranchMode = "sample_k_plus_uniform"
     bid_top_k: int = 4
     play_mode: PlayBranchMode = "all_legal"
     play_top_k: int = 4
@@ -388,9 +361,7 @@ class BranchBudgetConfig:
     # push exploration towards the endgame.
     branch_rate_decay: float = 0.0
 
-    def rate_for_shape(
-        self, num_players: int, hand_size: int
-    ) -> Optional[float]:
+    def rate_for_shape(self, num_players: int, hand_size: int) -> Optional[float]:
         """The branch rate this shape should use, or None if uncovered."""
 
         rate = self.branch_rate
@@ -403,7 +374,7 @@ class BranchBudgetConfig:
         return rate
 
 
-HistoricalArmMode = Literal["off", "paired", "separate"]
+HistoricalArmMode = Literal["off", "concurrent", "sequential"]
 BidPositionMode = Literal["uniform", "cycle"]
 # Literals are erased at runtime and both of these come straight from a TOML
 # string, so validate() checks membership against these instead. An unknown
@@ -422,6 +393,10 @@ class RolloutOptions:
     # Games are fixed length, so same-shape deals stay in lockstep and simply
     # widen the batch. >1 raises GPU utilisation on small hands.
     deals_per_batch: int = 1
+    # When set, ``deals_per_batch`` applies only through this hand size; larger
+    # hands run one deal per wave loop. This keeps the small, wave-bound games
+    # batched without making wide long-game trees share the memory budget.
+    parallel_deals_max_hand_size: Optional[int] = None
 
     # Choose deals_per_batch per shape instead, from measured cache rows per
     # deal. One global value cannot be right: a 3-card 3-player deal occupies
@@ -446,15 +421,10 @@ class RolloutOptions:
     bid_position_mode: BidPositionMode = "cycle"
 
     # off      -> self-play only, no historical opponents.
-    # paired   -> historical arm shares the deal and the same wave loop
-    #             (matched pair, common random numbers).
-    # separate -> historical arm runs as its own wave loop, which frees it to
-    #             use a different deal.
-    historical_arm: HistoricalArmMode = "paired"
-    # Only meaningful for "separate": reuse the self arm's deal or draw a new
-    # one. A fresh deal buys hand diversity; the same deal keeps the matched
-    # comparison.
-    historical_same_deal: bool = True
+    # Historical games always use a fresh independent deal and focal seat:
+    # concurrent -> share the self games' wave loop for wider forwards.
+    # sequential -> use a separate wave loop to minimize peak memory.
+    historical_arm: HistoricalArmMode = "off"
 
     # Memory the KV cache may occupy. Rows are derived from this and the
     # model's actual bytes-per-row, because that cost scales with depth and
@@ -487,6 +457,11 @@ class RolloutOptions:
     def validate(self) -> None:
         if self.deals_per_batch < 1:
             raise ValueError("deals_per_batch must be >= 1.")
+        if (
+            self.parallel_deals_max_hand_size is not None
+            and self.parallel_deals_max_hand_size < 1
+        ):
+            raise ValueError("parallel_deals_max_hand_size must be >= 1.")
         if self.bid_split_groups < 1:
             raise ValueError("bid_split_groups must be >= 1.")
         if self.max_deals_per_batch < 1:
@@ -542,9 +517,7 @@ def _apportion(weights: dict, total: int) -> dict:
     exact = {key: total * weight / mass for key, weight in weights.items()}
     counts = {key: int(value) for key, value in exact.items()}
     shortfall = total - sum(counts.values())
-    order = sorted(
-        exact, key=lambda key: (-(exact[key] - counts[key]), key)
-    )
+    order = sorted(exact, key=lambda key: (-(exact[key] - counts[key]), key))
     for key in order[:shortfall]:
         counts[key] += 1
     return counts
@@ -777,9 +750,11 @@ class SeqTrainingConfig:
     # Policy objective. Both choices consume the same counterfactual rows and
     # leave collection unchanged:
     #
-    #   neurd          direct per-logit regret updates (the legacy objective)
-    #   mirror_descent fit an exponentiated, KL-bounded policy-improvement
-    #                  target constructed from the sampled action values
+    #   neurd          direct per-logit regret updates from an unbiased,
+    #                  full-legal-action control-variate estimate
+    #   sampled_mirror fit an exponentiated target constructed from that same
+    #                  stochastic estimate (lower variance, intentionally not
+    #                  an unbiased full-information mirror step)
     policy_objective: PolicyObjective = "neurd"
 
     # NeuRD. One loss over every focal decision, with gradient on the logit of
@@ -796,46 +771,43 @@ class SeqTrainingConfig:
     neurd_regret_coef: float = 1.0
     neurd_kl_coef: float = 1.0
     policy_kl_cap: float = 0.005
+    # The mean guard can hide a small tail of badly moved states. The proposed
+    # step must satisfy both caps; max KL is reported but deliberately not a
+    # hard guard because one nearly-degenerate row is too noisy.
+    policy_kl_p99_cap: float = 0.02
     # Clamp on A(a) = Q(a) - V. Relative rewards reach ~+/-20 at five players
     # and the value baseline is untrained early, so one outlier row could
     # otherwise dominate the normalized weight sum. 0 disables.
     neurd_advantage_clip: float = 10.0
 
-    # Correction for *which* actions got expanded. An action expanded with
-    # probability q receives q*A(a) in expectation over updates, so a rule
-    # that expands by sampling the policy silently reintroduces the pi(a)
-    # prefactor NeuRD exists to remove. Weighting by q**-exponent restores
-    # A(a):
-    #   1.0  true NeuRD -- every legal action's logit moves by its own regret
-    #   0.0  no correction, i.e. back to policy-gradient-shaped weighting
-    # This is MCCFR's importance correction on sampled regret. Normally 1/q
-    # is a variance disaster, but the uniform arm floors q at 1/|legal| and
-    # |legal| <= 11 here, so the cap below is rarely reached.
+    # Correction for which Q(a) values were observed. The exact estimator uses
+    # exponent 1 and no cap (cap=0). Other values are explicit bias/variance
+    # ablations, not exact NeuRD.
     neurd_inclusion_exponent: float = 1.0
-    neurd_inclusion_cap: float = 12.0
+    neurd_inclusion_cap: float = 0.0
 
-    # Sampled entropic policy mirror descent. Candidate advantages form a
-    # Horvitz-Thompson estimate of the full legal advantage vector:
+    # Sampled entropic policy mirror descent. The collector first constructs
+    # the same full legal-action Q/advantage estimate used by NeuRD:
     #
-    #   A_hat(a) = 1[a expanded] * (Q(a) - V) / q(a)^exponent
+    #   Q_hat(a) = b + 1[a expanded] * (Q(a) - b) / q(a)
+    #   A_hat(a) = Q_hat(a) - sum_b pi_old(b) Q_hat(b)
     #
-    # The non-parametric improvement target is the exact exponentiated update
-    # for that estimate:
+    # It then takes the exact exponentiated update for this stochastic vector:
     #
     #   pi_target(a) proportional to pi_old(a) * exp(step_size * A_hat(a))
     #
-    # ``mirror_uniform_mix`` replaces pi_old in the proximal anchor by a small
+    # ``sampled_mirror_uniform_mix`` replaces pi_old in the proximal anchor by a small
     # mixture with the legal uniform distribution. It gives a deliberately
     # suppressed action finite recovery velocity; zero is plain mirror descent.
     # The whole exponentiated direction is scaled per row until
-    # KL(pi_old || pi_target) <= mirror_target_kl, then fitted by forward
+    # KL(pi_old || pi_target) <= sampled_mirror_target_kl, then fitted by forward
     # cross-entropy. A zero target KL disables this inner bound.
-    mirror_step_size: float = 1.0
-    mirror_target_kl: float = 0.003
-    mirror_uniform_mix: float = 0.0
-    mirror_advantage_clip: float = 10.0
-    mirror_inclusion_exponent: float = 1.0
-    mirror_inclusion_cap: float = 12.0
+    sampled_mirror_step_size: float = 1.0
+    sampled_mirror_target_kl: float = 0.003
+    sampled_mirror_uniform_mix: float = 0.0
+    sampled_mirror_advantage_clip: float = 10.0
+    sampled_mirror_inclusion_exponent: float = 1.0
+    sampled_mirror_inclusion_cap: float = 12.0
 
     # If the shared neural update still exceeds ``policy_kl_cap``, retry the
     # same Adam step from the exact pre-step model/optimizer state at
@@ -932,23 +904,23 @@ class SeqTrainingConfig:
                 f"Unknown policy_objective {self.policy_objective!r}; expected "
                 f"one of {sorted(POLICY_OBJECTIVES)}."
             )
-        if self.policy_kl_cap <= 0:
-            raise ValueError("policy_kl_cap must be > 0.")
-        if self.neurd_advantage_clip < 0 or self.mirror_advantage_clip < 0:
+        if self.policy_kl_cap <= 0 or self.policy_kl_p99_cap <= 0:
+            raise ValueError("Policy KL caps must be > 0.")
+        if self.neurd_advantage_clip < 0 or self.sampled_mirror_advantage_clip < 0:
             raise ValueError("Advantage clips must be >= 0.")
         if (
             self.neurd_inclusion_exponent < 0
-            or self.mirror_inclusion_exponent < 0
+            or self.sampled_mirror_inclusion_exponent < 0
         ):
             raise ValueError("Inclusion exponents must be >= 0.")
-        if self.neurd_inclusion_cap <= 0 or self.mirror_inclusion_cap <= 0:
-            raise ValueError("Inclusion caps must be > 0.")
-        if self.mirror_step_size <= 0:
-            raise ValueError("mirror_step_size must be > 0.")
-        if self.mirror_target_kl < 0:
-            raise ValueError("mirror_target_kl must be >= 0.")
-        if not 0.0 <= self.mirror_uniform_mix < 1.0:
-            raise ValueError("mirror_uniform_mix must be in [0, 1).")
+        if self.neurd_inclusion_cap < 0 or self.sampled_mirror_inclusion_cap < 0:
+            raise ValueError("Inclusion caps must be >= 0.")
+        if self.sampled_mirror_step_size <= 0:
+            raise ValueError("sampled_mirror_step_size must be > 0.")
+        if self.sampled_mirror_target_kl < 0:
+            raise ValueError("sampled_mirror_target_kl must be >= 0.")
+        if not 0.0 <= self.sampled_mirror_uniform_mix < 1.0:
+            raise ValueError("sampled_mirror_uniform_mix must be in [0, 1).")
         if self.kl_backtrack_attempts < 0:
             raise ValueError("kl_backtrack_attempts must be >= 0.")
         if not 0.0 < self.kl_backtrack_factor < 1.0:
@@ -966,10 +938,7 @@ class SeqTrainingConfig:
                 f"Unknown bid_mode {self.branch_rule.bid_mode!r}; expected one "
                 f"of {sorted(BID_BRANCH_MODES)}."
             )
-        # The Gumbel modes need at least the realized arm to draw around, and
-        # unlike "top_k" they have no "0 means uncapped" reading. "same_as_play"
-        # ignores bid_top_k entirely.
-        if self.branch_rule.bid_mode in ("gumbel_top_k", "gumbel_top_k_plus_random"):
+        if self.branch_rule.bid_mode in ("sample_k", "sample_k_plus_uniform"):
             if self.branch_rule.bid_top_k < 1:
                 raise ValueError(
                     f"bid_top_k must be >= 1 for bid_mode "
@@ -1027,5 +996,8 @@ class SeqTrainingConfig:
         for cell in self.schedule_cells:
             if not 3 <= cell.hand_size <= 10:
                 raise ValueError("Schedule hand sizes must be in 3..10.")
-            if cell.num_players is not None and cell.num_players not in self.player_counts:
+            if (
+                cell.num_players is not None
+                and cell.num_players not in self.player_counts
+            ):
                 raise ValueError("Schedule cell player count not in player_counts.")

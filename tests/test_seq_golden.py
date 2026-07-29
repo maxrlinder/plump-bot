@@ -21,7 +21,6 @@ from plump.seq.config import (
 from plump.seq.model import SeqPlumpModel
 from plump.seq.trainer import SeqTrainer, build_training_groups
 
-
 # Regenerated when suit presence became opponent-only. Note that *every* hash
 # moves on a change like that, including ``trees``, even though collection was
 # not touched: the suit head is one Linear narrower, so it draws less from the
@@ -32,11 +31,11 @@ from plump.seq.trainer import SeqTrainer, build_training_groups
 # two apart, force the changed module back to its old width and re-hash: if the
 # old value returns, the difference was only the init stream.
 EXPECTED = {
-    "groups": "93ba644d814244a060c4bed8b19014d5f7afa4118e96c18e2bff0ffd4de45644",
-    "summary": "b693288522648cbab51bfae6803728b4d9acdfe0811f5d690b4f60b48e7e042a",
-    "trees": "433aeca3c04587fb2c1254f225b14955dc413b8f41515d90496f57bb34599d07",
-    "update": "72bb0a1154498a29eceb31d499383f92a8fa10f2c42da0374a11e02ddf96f260",
-    "weights": "7e5ad4a32f4c06e13a4b99b18285291c575d3c15fdd08475bd084b7aa11cff0f",
+    "groups": "48ca82562ab3bb80a55dcfce52979a4300934ecd7019632a9a6add036ebc6c25",
+    "summary": "d6a03a852b2b8b7b78397b7bd0c0f4c0d8737d71e48e5c3d3ab46a6bf2f61cb5",
+    "trees": "19f48905f997f4139cfb405b1b9260d07434d5557e57d2987aeeebe7bce19417",
+    "update": "897e620cd2bfd53bb05df45ea66e234afb313cf3c60d487e84dd96b075603cec",
+    "weights": "99f5cc4f11c753e3683fedb9dd80d54939e81f5440e6646cbee152ca1d3a6935",
 }
 
 
@@ -118,12 +117,14 @@ def _tree_payload(tree):
                 "events": leaf.env.state.event_log,
                 "owned_from": leaf.owned_from,
                 "terminal_value": leaf.terminal_value,
+                "reach_weight": leaf.reach_weight,
                 "segments": [
                     (
                         positions,
                         None if resolver is None else resolver.backed_value,
+                        reach,
                     )
-                    for positions, resolver in leaf.segments
+                    for positions, resolver, reach in leaf.segments
                 ],
                 "value_targets": leaf.value_targets(),
                 "decisions": [
@@ -133,6 +134,7 @@ def _tree_payload(tree):
                         "action_index": record.action_index,
                         "old_probs": record.old_probs,
                         "old_value": record.old_value,
+                        "reach_weight": record.reach_weight,
                         "depth": record.depth,
                         "branch": _branch_payload(record.branch),
                     }
@@ -151,7 +153,7 @@ def _group_payload(group):
         "tokens": group.tokens,
         "owned": group.owned,
         "value_targets": group.value_targets,
-        "seq_weight": group.seq_weight,
+        "position_weight": group.position_weight,
         "trick_targets": group.trick_targets,
         "trick_masks": group.trick_masks,
         "suit_targets": group.suit_targets,
@@ -160,7 +162,7 @@ def _group_payload(group):
     }
 
 
-def test_schema_v6_collection_and_update_match_pre_refactor_golden_hashes():
+def test_schema_v6_collection_and_update_match_corrected_golden_hashes():
     torch.manual_seed(123)
     model_config = SeqModelConfig(
         d_model=32,
@@ -174,7 +176,7 @@ def test_schema_v6_collection_and_update_match_pre_refactor_golden_hashes():
         schedule_cells=(GameScheduleCell(hand_size=3, num_players=3),),
         branch_rule=BranchRuleConfig(
             bid_top_k=3,
-            play_mode="gumbel_top_k",
+            play_mode="sample_k_plus_uniform",
             play_top_k=2,
         ),
         branch_budget=BranchBudgetConfig(branch_rate=0.7),
@@ -214,7 +216,8 @@ def test_schema_v6_collection_and_update_match_pre_refactor_golden_hashes():
                 {
                     key: value
                     for key, value in dataclasses.asdict(stats).items()
-                    if key not in {
+                    if key
+                    not in {
                         "update_sec",
                         "build_sec",
                         # Reporting-only trust-region diagnostics. The hashes

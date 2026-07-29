@@ -8,7 +8,6 @@ import torch
 
 from plump.cli import main
 
-
 TINY_OVERRIDES = (
     "run.iterations=1",
     "run.checkpoint_every=1",
@@ -27,7 +26,7 @@ TINY_OVERRIDES = (
     "training.exhaustive_until=2",
     # The tiny run wants no branching at all, including the preset's explicit
     # multi-arm bid exploration.
-    'training.bid_mode="top_k"',
+    'training.bid_mode="sample_k"',
     "training.bid_top_k=1",
     'training.play_mode="none"',
     "training.play_top_k=1",
@@ -68,6 +67,26 @@ def test_cli_tiny_run_resume_and_mismatch(tmp_path, monkeypatch, capsys):
         weights_only=False,
     )
     assert payload["resolved_config"]["run"]["iterations"] == 1
+
+    fork_args = _train_args("forked")
+    fork_args.extend(
+        (
+            "--set",
+            "training.suit_coef=0.1",
+            "--from-checkpoint",
+            str(run / "checkpoints" / "iter_000001.pt"),
+        )
+    )
+    assert main(fork_args) == 0
+    forked_checkpoint = tmp_path / "forked" / "checkpoints" / "iter_000001.pt"
+    forked = torch.load(
+        forked_checkpoint,
+        map_location="cpu",
+        weights_only=False,
+    )
+    assert forked["iteration"] == 1
+    assert forked["training_config"]["suit_coef"] == 0.1
+    assert forked["resolved_config"]["training"]["suit_coef"] == 0.1
 
     assert main(_train_args("tiny")) == 0
     assert (run / "metrics.csv").read_text().count("\n") == 2

@@ -1,6 +1,6 @@
 [run]
 iterations = 4000
-checkpoint_every = 100
+checkpoint_every = 50
 dashboard_every = 5
 device = "auto"
 
@@ -26,39 +26,41 @@ games_per_cell = 0
 reference_rate = 0.5
 branch_rate_player_exponent = 0.0
 exhaustive_until = 7
-# Bidding is the root of every counterfactual tree: take four distinct
-# policy-drawn bids plus one guaranteed distinct uniform explorer.
-bid_mode = "gumbel_top_k_plus_random"
+# Bidding is the root of every counterfactual tree: take four iid policy draws
+# plus one independent uniform draw. Duplicates collapse with multiplicity, so
+# both the backup and inclusion probabilities remain exact.
+bid_mode = "sample_k_plus_uniform"
 bid_top_k = 4
-play_mode = "gumbel_top_k_plus_random"
+play_mode = "sample_k_plus_uniform"
 play_top_k = 3
 learning_rate = 0.0002
 lr_warmup_updates = 100
 epochs = 1
 microbatch_positions = 16384
-policy_objective = "mirror_descent"
+policy_objective = "neurd"
 policy_coef = 1.0
 policy_kl_cap = 0.005
+policy_kl_p99_cap = 0.02
 neurd_regret_coef = 1.0
 neurd_kl_coef = 1.0
-neurd_advantage_clip = 10.0
+neurd_advantage_clip = 0.0
 neurd_inclusion_exponent = 1.0
-neurd_inclusion_cap = 12.0
-mirror_step_size = 1.0
-mirror_target_kl = 0.003
-mirror_uniform_mix = 0.02
-mirror_advantage_clip = 10.0
-mirror_inclusion_exponent = 1.0
-mirror_inclusion_cap = 12.0
+neurd_inclusion_cap = 0.0
+sampled_mirror_step_size = 1.0
+sampled_mirror_target_kl = 0.003
+sampled_mirror_uniform_mix = 0.02
+sampled_mirror_advantage_clip = 10.0
+sampled_mirror_inclusion_exponent = 1.0
+sampled_mirror_inclusion_cap = 12.0
 kl_backtrack_attempts = 8
 kl_backtrack_factor = 0.5
 # Counterfactual nodes multiply with depth. Pull policy weight toward the root
 # so bidding and early plays are not drowned out by thousands of deep leaves.
 branch_depth_exponent = -1.0
 value_coef = 0.5
-suit_coef = 0.15
+suit_coef = 0.05
 bid_hit_coef = 0.0
-trick_coef = 0.15
+trick_coef = 0.05
 entropy_coef = 0.0
 league_max_snapshots = 8
 league_min_iteration = 0
@@ -66,13 +68,13 @@ league_min_iteration = 0
 [rollout]
 max_cache_rows = 65536
 cache_budget_gb = 10.0
-# One deal per wave loop, always. Batching same-shape deals together
-# would make them share the row cap, so a 10-card tree would branch to
-# half the width it can reach alone -- exactly the shape that needs the
-# room most. One rollout per hand keeps the whole cap per tree.
+# The two independently dealt seats/hands for a shape share one wave through
+# five cards. Six cards and above run one at a time so each wide tree gets the
+# full cache budget.
 auto_deals_per_batch = false
-deals_per_batch = 1
-historical_arm = "paired"
+deals_per_batch = 2
+parallel_deals_max_hand_size = 5
+historical_arm = "off"
 kv_dtype = "fp16"
 bid_position_mode = "uniform"
 

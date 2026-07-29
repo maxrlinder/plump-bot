@@ -30,7 +30,6 @@ from plump.seq.model import SeqPlumpModel
 from plump.seq.policy import SeqModelPolicy, best_seq_device
 from plump.seq.trainer import SeqTrainer
 
-
 METRIC_COLUMNS = (
     "iteration",
     "optimizer_steps",
@@ -59,6 +58,9 @@ METRIC_COLUMNS = (
     "loss_bid_hit",
     "entropy",
     "policy_kl",
+    "policy_kl_p95",
+    "policy_kl_p99",
+    "policy_kl_max",
     "backtracks",
     "step_scale",
     "rolled_back",
@@ -99,6 +101,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     train.add_argument("--iterations", type=int)
     train.add_argument("--device")
+    train.add_argument(
+        "--from-checkpoint",
+        type=Path,
+        help="start a new run from a compatible schema-v6 checkpoint",
+    )
     train.set_defaults(handler=train_command)
 
     dashboard = subparsers.add_parser(
@@ -159,6 +166,8 @@ def train_command(args: argparse.Namespace) -> int:
     requested = load_training_config(args.config, overrides=overrides)
     run = RunDirectory(args.run)
     existed = run.exists
+    if existed and args.from_checkpoint is not None:
+        raise ValueError("--from-checkpoint requires a new run name.")
 
     with run.acquire_lock():
         if existed:
@@ -167,8 +176,7 @@ def train_command(args: argparse.Namespace) -> int:
             if differences:
                 rendered = "\n  ".join(differences)
                 raise ValueError(
-                    "Run configuration differs from the recorded config:\n  "
-                    + rendered
+                    "Run configuration differs from the recorded config:\n  " + rendered
                 )
             resolved = resolve_training_config(recorded_raw)
         else:
@@ -177,9 +185,7 @@ def train_command(args: argparse.Namespace) -> int:
 
         device_value = str(resolved.run["device"])
         device = (
-            str(best_seq_device())
-            if device_value in {"", "auto"}
-            else device_value
+            str(best_seq_device()) if device_value in {"", "auto"} else device_value
         )
         seed = int(resolved.training.seed)
         torch.manual_seed(seed)
@@ -199,6 +205,25 @@ def train_command(args: argparse.Namespace) -> int:
                 f"Resumed {run.name} from {checkpoint.name} "
                 f"at iteration {trainer.iteration}.",
             )
+        elif args.from_checkpoint is not None:
+            source = args.from_checkpoint.expanduser().resolve()
+            trainer.load_checkpoint(
+                source,
+                allow_training_config_mismatch=True,
+            )
+            trainer.resolved_config = resolved.raw
+            imported = run.interval_checkpoint(trainer.iteration)
+            trainer.save_checkpoint(imported)
+            run.record_latest(imported, trainer.iteration)
+            run.update_metadata(
+                parent_checkpoint=str(source),
+                parent_iteration=trainer.iteration,
+            )
+            _emit(
+                run,
+                f"Forked {run.name} from {source.name} "
+                f"at iteration {trainer.iteration}.",
+            )
         else:
             _emit(run, f"Created run {run.name} on {device}.")
 
@@ -215,12 +240,7 @@ def train_command(args: argparse.Namespace) -> int:
         eval_bank = DealBank.generate(
             player_counts=resolved.training.player_counts,
             hand_sizes=tuple(
-                sorted(
-                    {
-                        cell.hand_size
-                        for cell in resolved.training.schedule_cells
-                    }
-                )
+                sorted({cell.hand_size for cell in resolved.training.schedule_cells})
             ),
             deals_per_configuration=int(evaluation["deals"]),
             seed=int(evaluation["seed"]),
@@ -279,8 +299,7 @@ def train_command(args: argparse.Namespace) -> int:
             elapsed_before += total
 
             if (
-                checkpoint_every > 0
-                and iteration % checkpoint_every == 0
+                checkpoint_every > 0 and iteration % checkpoint_every == 0
             ) or iteration == target:
                 checkpoint = run.interval_checkpoint(iteration)
                 snapshot_id = f"iter_{iteration}"
@@ -359,12 +378,7 @@ def evaluate_command(args: argparse.Namespace) -> int:
     bank = DealBank.generate(
         player_counts=resolved.training.player_counts,
         hand_sizes=tuple(
-            sorted(
-                {
-                    cell.hand_size
-                    for cell in resolved.training.schedule_cells
-                }
-            )
+            sorted({cell.hand_size for cell in resolved.training.schedule_cells})
         ),
         deals_per_configuration=int(evaluation["deals"]),
         seed=int(evaluation["seed"]),
@@ -375,11 +389,7 @@ def evaluate_command(args: argparse.Namespace) -> int:
         bank,
         batch_size=int(evaluation["batch_size"]),
     )
-    output = (
-        run.evaluations
-        / _checkpoint_output_name(checkpoint)
-        / "heuristic.json"
-    )
+    output = run.evaluations / _checkpoint_output_name(checkpoint) / "heuristic.json"
     atomic_write_json(output, dataclasses.asdict(report))
     print(
         f"{checkpoint.name}: reward={report.macro_relative_reward:.4f} "
@@ -457,12 +467,13 @@ def _metric_row(
         "loss_bid_hit": stats.loss_bid_hit,
         "entropy": stats.entropy,
         "policy_kl": stats.policy_kl,
+        "policy_kl_p95": stats.policy_kl_p95,
+        "policy_kl_p99": stats.policy_kl_p99,
+        "policy_kl_max": stats.policy_kl_max,
         "backtracks": stats.backtracks,
         "step_scale": stats.step_scale,
         "rolled_back": int(stats.rolled_back),
-        "eval_reward_vs_heuristic": (
-            "" if eval_reward is None else eval_reward
-        ),
+        "eval_reward_vs_heuristic": ("" if eval_reward is None else eval_reward),
         "eval_bid_hit": "" if eval_bid_hit is None else eval_bid_hit,
         "peak_cache_rows": collector.peak_cache_rows,
         "cache_rows_allocated": collector.cache_rows_allocated,
@@ -477,8 +488,7 @@ def _metric_row(
         "token_build_sec": collector.token_build_sec,
         "forward_sec": collector.forward_sec,
         "positions_per_sec": stats.positions / max(total, 1e-9),
-        "forward_rows_per_sec": collector.forward_rows
-        / max(summary.collect_sec, 1e-9),
+        "forward_rows_per_sec": collector.forward_rows / max(summary.collect_sec, 1e-9),
     }
 
 
