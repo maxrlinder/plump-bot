@@ -19,6 +19,12 @@ pressure, device memory, and rollback state. Learning rate is hidden unless
 `--include-learning-rate` is passed. Sparse evaluation results and resumed CSV
 files are supported.
 
+Every continuous per-iteration training series uses a trailing 50-iteration
+mean by default, with raw observations retained as faint lines underneath.
+Checkpoint evaluations, confidence intervals, trust-region cap lines,
+backtrack/rollback markers, and cache-cap events remain at their exact
+iterations. `--smooth N` changes the trailing window for an on-demand render.
+
 The trust-region panel distinguishes the exact nominal Adam proposal from the
 accepted post-backtracking update. The dashed `proposed mean KL` series is
 measured before any reduction; accepted mean, weighted p99, and max retain

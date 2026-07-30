@@ -8,9 +8,11 @@ import json
 import numpy as np
 
 from plump.dashboard import (
+    DEFAULT_SMOOTH_WINDOW,
     _duration,
     _evaluation_points,
     _has_signal,
+    _smooth,
     render_dashboard,
 )
 
@@ -112,6 +114,16 @@ def test_dashboard_formats_elapsed_time_compactly():
     assert _duration(42.0) == "42s"
     assert _duration(90.0) == "1.5m"
     assert _duration(7200.0) == "2.0h"
+
+
+def test_dashboard_uses_trailing_fifty_iteration_means_by_default():
+    values = np.arange(1.0, 61.0)
+    smoothed = _smooth(values, DEFAULT_SMOOTH_WINDOW)
+
+    assert DEFAULT_SMOOTH_WINDOW == 50
+    assert smoothed[0] == 1.0
+    assert smoothed[49] == np.mean(values[:50])
+    assert smoothed[59] == np.mean(values[10:60])
 
 
 def test_sidecar_evaluation_overrides_inline_checkpoint_score(tmp_path):

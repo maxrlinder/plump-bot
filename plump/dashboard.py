@@ -18,6 +18,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 Field = tuple[str, str]
+DEFAULT_SMOOTH_WINDOW = 50
 
 
 def render_dashboard(
@@ -25,12 +26,15 @@ def render_dashboard(
     output_path: str | Path,
     *,
     title: str | None = None,
-    smooth: int = 20,
+    smooth: int = DEFAULT_SMOOTH_WINDOW,
     dpi: int = 150,
     include_learning_rate: bool = False,
     evaluations_path: str | Path | None = None,
 ) -> int:
-    """Render comparable quantities together and discrete events without smoothing."""
+    """Render per-iteration trends and exact sparse/discrete observations."""
+
+    if smooth < 1:
+        raise ValueError("smooth must be at least 1")
 
     metrics_path = Path(metrics_path)
     output_path = Path(output_path)
@@ -79,7 +83,7 @@ def render_dashboard(
         iteration,
         rows,
         metrics_path=metrics_path,
-        smooth=min(smooth, 5),
+        smooth=smooth,
         include_learning_rate=include_learning_rate,
     )
     _dual_lines(
@@ -156,8 +160,8 @@ def render_dashboard(
             ("cache_rows_allocated", "rows reserved"),
         ),
         right=(("peak_device_gb", "device high-water"),),
-        smooth=1,
-        title="Memory (raw, unsmoothed)",
+        smooth=smooth,
+        title="Memory",
         left_label="KV-cache rows",
         right_label="device GB",
     )
@@ -182,6 +186,7 @@ def render_dashboard(
             f"step scale {_number(last, 'step_scale'):.3f}",
             f"backtracks {backtracks}",
             f"rollbacks {rollbacks}",
+            f"rolling mean {smooth} iters",
             f"elapsed {_duration(_number(last, 'elapsed_sec'))}",
         )
     )
@@ -418,6 +423,17 @@ def _plot_fields(
         if not _has_signal(values, omit_zero=omit_zero):
             continue
         rendered = _smooth(values, smooth)
+        color = f"C{color_offset + index}"
+        raw_valid = np.isfinite(iteration) & np.isfinite(values)
+        if smooth > 1 and raw_valid.any():
+            ax.plot(
+                iteration[raw_valid],
+                values[raw_valid],
+                linewidth=0.65,
+                alpha=0.16,
+                color=color,
+                zorder=1,
+            )
         valid = np.isfinite(iteration) & np.isfinite(rendered)
         if not valid.any():
             continue
@@ -425,8 +441,9 @@ def _plot_fields(
             iteration[valid],
             rendered[valid],
             linewidth=1.7,
-            color=f"C{color_offset + index}",
+            color=color,
             label=label,
+            zorder=2,
         )
         handles.append(line)
     return handles
@@ -488,6 +505,21 @@ def _trust_region(
     proposed_signal = _has_signal(proposed, omit_zero=True)
     if proposed_signal:
         rendered = _smooth(proposed, smooth)
+        raw_valid = (
+            np.isfinite(iteration)
+            & np.isfinite(proposed)
+            & (proposed > 0)
+        )
+        if smooth > 1 and raw_valid.any():
+            ax.plot(
+                iteration[raw_valid],
+                proposed[raw_valid],
+                linewidth=0.65,
+                linestyle="--",
+                alpha=0.16,
+                color="C3",
+                zorder=1,
+            )
         valid = (
             np.isfinite(iteration)
             & np.isfinite(rendered)
@@ -501,6 +533,7 @@ def _trust_region(
                 linestyle="--",
                 color="C3",
                 label="proposed mean KL (before backtracking)",
+                zorder=2,
             )
             handles.append(line)
 
@@ -540,7 +573,7 @@ def _trust_region(
             iteration,
             rows,
             (("learning_rate", "learning rate"),),
-            smooth=1,
+            smooth=smooth,
             omit_zero=True,
             color_offset=4,
         )

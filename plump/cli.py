@@ -14,7 +14,7 @@ from typing import Any
 import numpy as np
 import torch
 
-from plump.dashboard import render_dashboard
+from plump.dashboard import DEFAULT_SMOOTH_WINDOW, render_dashboard
 from plump.evaluation import DealBank, evaluate_policy
 from plump.gui.app import run as run_gui
 from plump.policies import HeuristicPolicy
@@ -136,7 +136,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="render a run's static metrics dashboard",
     )
     dashboard.add_argument("run")
-    dashboard.add_argument("--smooth", type=int, default=20)
+    dashboard.add_argument(
+        "--smooth",
+        type=int,
+        default=DEFAULT_SMOOTH_WINDOW,
+        help=(
+            "trailing window for per-iteration series "
+            f"(default: {DEFAULT_SMOOTH_WINDOW})"
+        ),
+    )
     dashboard.add_argument("--dpi", type=int, default=150)
     dashboard.add_argument(
         "--include-learning-rate",
