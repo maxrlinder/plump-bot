@@ -241,11 +241,11 @@ select {
 .layout {
   display: grid;
   grid-template-columns:
-    minmax(320px, 410px)
+    minmax(280px, 330px)
     minmax(420px, 1fr)
     minmax(210px, 285px);
   gap: 10px;
-  max-width: 1600px;
+  max-width: 1550px;
   margin: 0 auto;
 }
 
