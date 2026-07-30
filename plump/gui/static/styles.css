@@ -240,9 +240,12 @@ select {
 
 .layout {
   display: grid;
-  grid-template-columns: minmax(210px, 250px) minmax(520px, 1fr) minmax(230px, 285px);
+  grid-template-columns:
+    minmax(320px, 410px)
+    minmax(420px, 1fr)
+    minmax(210px, 285px);
   gap: 10px;
-  max-width: 1500px;
+  max-width: 1600px;
   margin: 0 auto;
 }
 
@@ -381,7 +384,8 @@ select {
 }
 
 .prediction-head {
-  grid-template-columns: minmax(54px, 1fr) auto;
+  grid-template-columns: 1fr;
+  gap: 1px;
   color: var(--felt-dark);
   font-weight: 850;
 }
