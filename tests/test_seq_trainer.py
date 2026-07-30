@@ -57,16 +57,37 @@ def test_group_weights_normalize_to_one():
     assert groups
 
     position_weight_total = 0.0
+    value_weight_total = 0.0
     policy_weight_total = 0.0
     for group in groups:
         position_weight_total += float(group.position_weight.sum())
+        value_weight_total += float(group.value_weight.sum())
         for rows in group.policy.values():
             policy_weight_total += float(np.sum(rows.weight))
     # Each loss family's weights sum to exactly 1, whatever the exponent and
     # however many trees happen to have rows of that kind, so the effective
     # learning rate cannot drift with how the deals happened to come out.
     assert position_weight_total == pytest.approx(1.0)
+    assert value_weight_total == pytest.approx(1.0)
     assert policy_weight_total == pytest.approx(1.0)
+
+
+def test_value_weights_match_focal_policy_rows_only():
+    trainer = make_trainer(branch_depth_exponent=-0.5)
+    trees, _ = trainer.collect()
+    groups = build_training_groups(trees, MODEL_CONFIG, trainer.train)
+
+    for group in groups:
+        expected = np.zeros_like(group.value_weight)
+        for rows in group.policy.values():
+            for row, position, weight in zip(
+                rows.seq_index,
+                rows.position,
+                rows.weight,
+            ):
+                expected[row, position] += weight
+        assert np.array_equal(group.value_weight > 0, expected > 0)
+        assert group.value_weight == pytest.approx(expected)
 
 
 def test_rollout_summary_separates_focal_and_non_focal_outcomes():
@@ -107,6 +128,10 @@ def test_update_produces_finite_losses_and_changes_weights():
     stats = trainer.update(trees)
     assert np.isfinite(stats.loss_value)
     assert np.isfinite(stats.loss_value_zero)
+    assert np.isfinite(stats.value_rmse)
+    assert np.isfinite(stats.value_zero_rmse)
+    assert np.isfinite(stats.value_correlation)
+    assert stats.value_rows == stats.policy_rows
     assert np.isfinite(stats.loss_trick)
     assert np.isfinite(stats.loss_suit)
     assert np.isfinite(stats.loss_bid_hit)
@@ -326,6 +351,8 @@ def test_kl_backtracking_accepts_a_smaller_adam_step(monkeypatch):
     trainer = make_trainer(
         policy_objective="sampled_mirror",
         learning_rate=0.1,
+        core_learning_rate=0.1,
+        auxiliary_learning_rate=0.03,
         lr_warmup_updates=0,
         policy_kl_cap=1e-4,
         policy_kl_p99_cap=4e-4,
@@ -358,9 +385,32 @@ def test_kl_backtracking_accepts_a_smaller_adam_step(monkeypatch):
     assert stats.policy_kl_p99 <= trainer.train.policy_kl_p99_cap
     assert trainer.optimizer_steps == 1
     assert attempted_lrs[-1][0] == pytest.approx(
-        trainer.train.learning_rate * stats.step_scale
+        trainer.train.core_lr * stats.step_scale
     )
-    assert attempted_lrs[-1][1] == pytest.approx(trainer.train.learning_rate)
+    assert attempted_lrs[-1][1] == pytest.approx(trainer.train.auxiliary_lr)
+
+
+def test_core_and_auxiliary_gradients_are_clipped_independently(monkeypatch):
+    trainer = make_trainer(trick_coef=0.25)
+    trees, _ = trainer.collect()
+    calls = []
+    original = torch.nn.utils.clip_grad_norm_
+
+    def record(parameters, *args, **kwargs):
+        materialized = tuple(parameters)
+        calls.append({id(parameter) for parameter in materialized})
+        return original(materialized, *args, **kwargs)
+
+    monkeypatch.setattr(torch.nn.utils, "clip_grad_norm_", record)
+    stats = trainer.update(trees)
+
+    assert len(calls) == 2
+    assert calls[0].isdisjoint(calls[1])
+    assert calls[0] | calls[1] == {
+        id(parameter) for parameter in trainer.model.parameters()
+    }
+    assert np.isfinite(stats.core_grad_norm)
+    assert np.isfinite(stats.auxiliary_grad_norm)
 
 
 def test_proven_early_p99_rejection_matches_full_backtracking(monkeypatch):
@@ -425,7 +475,7 @@ def test_lr_warmup_ramps_and_survives_the_kl_cap():
     the warmup ramp is what lets the first updates survive."""
 
     trainer = make_trainer(lr_warmup_updates=10)
-    base = trainer.train.learning_rate
+    base = trainer.train.core_lr
     trees, _ = trainer.collect()
     stats = trainer.update(trees)
     assert not stats.rolled_back

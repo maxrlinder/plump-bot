@@ -33,6 +33,9 @@ def test_dashboard_renders_sparse_partial_and_resumed_rows(tmp_path):
                 "policy_kl_p99",
                 "policy_kl_max",
                 "proposed_policy_kl",
+                "value_rmse",
+                "value_zero_rmse",
+                "value_correlation",
                 "rolled_back",
             ),
         )
@@ -51,6 +54,9 @@ def test_dashboard_renders_sparse_partial_and_resumed_rows(tmp_path):
                 "policy_kl_p99": 0.004,
                 "policy_kl_max": 0.006,
                 "proposed_policy_kl": 0.08,
+                "value_rmse": 4.8,
+                "value_zero_rmse": 5.0,
+                "value_correlation": 0.1,
                 "rolled_back": 0,
             }
         )
@@ -68,6 +74,9 @@ def test_dashboard_renders_sparse_partial_and_resumed_rows(tmp_path):
                 "policy_kl_p99": 0.007,
                 "policy_kl_max": 0.009,
                 "proposed_policy_kl": 0.12,
+                "value_rmse": 4.5,
+                "value_zero_rmse": 5.1,
+                "value_correlation": 0.2,
                 "rolled_back": 1,
             }
         )

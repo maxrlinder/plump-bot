@@ -27,12 +27,14 @@ iterations that backtracked and sit at the accepted mean KL—they are events,
 not rejected-candidate measurements. Runs created before this telemetry simply
 begin the dashed series after their next resumed update.
 
-The auxiliary-loss panel includes a `value: predict zero` reference computed
-with the same Smooth-L1 objective and branch-reach weights as the learned value
-loss. A learned value below that line is adding predictive information; a high
-raw loss with a similarly high reference mostly reflects the return scale and
-irreducible outcome variance. This series starts at the first update produced
-by the newer reporting schema.
+The value-quality panel is scoped to focal decision states. It compares raw
+reward-point RMSE against an always-zero predictor and puts weighted
+prediction/target correlation on its own axis. RMSE below the zero line says
+the baseline reduces squared error; correlation distinguishes genuine
+state-dependent discrimination from merely learning a constant offset.
+`value_prediction_std`, normalized MSE, value-row count, and separate
+core/readout pre-clip gradient norms remain available in `metrics.csv`. These
+series start at the first update produced by the newer reporting schema.
 
 While an older trainer process is still refreshing `dashboard.png`, a sidecar
 evaluator writes the new layout to `dashboard-eval.png`.

@@ -59,9 +59,12 @@ remembered when interpreting or changing the tail cap.
 Backtracking scales the shared trunk and bid/card action heads because those
 parameters can move the policy. It does not scale the value, suit-presence,
 trick-count, or bid-hit readout heads: those heads only consume the shared
-representation and cannot change policy KL. Their Adam moments, clipping, and
-nominal learning-rate schedule are otherwise unchanged. Older one-group
-checkpoints are split losslessly at load time.
+representation and cannot change policy KL. The current preset starts the core
+at `2.5e-5` and retains `2e-4` for auxiliary readouts; the older
+`learning_rate` field remains the fallback when a group-specific value is
+omitted. Core and readout gradients are clipped independently, so an exact
+NeuRD correction with a large norm cannot rescale the readout-head sample
+before Adam. Older one-group checkpoints are split losslessly at load time.
 
 ### Sampled mirror target
 
@@ -81,15 +84,32 @@ enumerated. The depth factors are normalized within each tree, so this changes
 where its policy weight lands without changing that tree's total weight.
 
 The optimizer also trains relative value plus suit-presence and final
-trick-count auxiliaries. Both auxiliaries use coefficient `0.05`; value remains
-`0.5`. Bid hit and entropy remain disabled.
+trick-count auxiliaries. Both belief auxiliaries use coefficient `0.05`; value
+remains `0.5`. Bid hit and entropy remain disabled.
+
+Value is a control variate for the focal policy update, so the current
+objective is normalized MSE at exactly the focal bid/play readout positions:
+
+```text
+L_value = 0.5 * ((V(s) - backed_return) / value_reward_scale)^2
+```
+
+MSE is intentional: it learns the conditional mean `E[R | s]` required by a
+variance-reducing state value. Smooth-L1 becomes mostly absolute error for the
+game's discrete ±5–20 point returns and therefore approaches a conditional
+median, which can stay close to zero even when the expected return is
+state-dependent. Decision rows use the same per-tree, reach, and branch-depth
+weights as the policy objective. This both preserves the old-policy state
+distribution and avoids spending most value supervision on event-token
+positions where the baseline is never consumed. `value_positions="all"` and
+`value_objective="smooth_l1"` remain explicit diagnostic alternatives.
 
 Counterfactual branches do not turn these into off-policy labels. Descendant
 positions carry their represented old-policy reach; the reaches sum to the
-ordinary live-policy state distribution in expectation. Prefix values use the
-recursive unbiased branch backup, while outcome beliefs use the originally
-sampled on-policy continuation. Consequently, large value loss can reflect
-reward scale, partial observability, and Monte Carlo variance rather than an
+ordinary live-policy state distribution in expectation. Decision-state values
+use the recursive unbiased branch backup, while outcome beliefs use the
+originally sampled on-policy continuation. Consequently, residual value error
+can reflect partial observability and Monte Carlo variance rather than an
 unweighted exploratory policy.
 
 The beliefs are chosen so each asks something the prefix does not already
@@ -140,7 +160,8 @@ Use typed dotted overrides:
 ```bash
 uv run plump train experiment \
   --set model.d_model=320 \
-  --set training.learning_rate=0.0001 \
+  --set training.core_learning_rate=0.00002 \
+  --set training.auxiliary_learning_rate=0.0002 \
   --set rollout.kv_dtype=\"fp16\"
 ```
 

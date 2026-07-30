@@ -93,7 +93,8 @@ class SeqTrainingGroup:
     tokens: np.ndarray  # [B, L, WIDTH]
     owned: np.ndarray  # [B, L] bool
     value_targets: np.ndarray  # [B, L] float32
-    position_weight: np.ndarray  # [B, L] on-policy aux/value weight
+    value_weight: np.ndarray  # [B, L] focal-decision value weight
+    position_weight: np.ndarray  # [B, L] on-policy dense-auxiliary weight
     trick_targets: np.ndarray  # [B, max_players]
     trick_masks: np.ndarray
     suit_targets: np.ndarray
@@ -106,6 +107,10 @@ class SeqUpdateStats:
     loss_policy: float = 0.0
     loss_value: float = 0.0
     loss_value_zero: float = 0.0
+    value_rmse: float = 0.0
+    value_zero_rmse: float = 0.0
+    value_correlation: float = 0.0
+    value_prediction_std: float = 0.0
     loss_suit: float = 0.0
     loss_trick: float = 0.0
     loss_bid_hit: float = 0.0
@@ -131,7 +136,10 @@ class SeqUpdateStats:
     # feed the same loss.
     branched_rows: int = 0
     unbranched_rows: int = 0
+    value_rows: int = 0
     positions: int = 0
+    core_grad_norm: float = 0.0
+    auxiliary_grad_norm: float = 0.0
     update_sec: float = 0.0
     build_sec: float = 0.0
 
@@ -448,6 +456,7 @@ def build_training_groups(
         tokens = np.zeros((batch, length, 12), dtype=np.int64)
         owned = np.zeros((batch, length), dtype=bool)
         value_targets = np.zeros((batch, length), dtype=np.float32)
+        value_weight = np.zeros((batch, length), dtype=np.float32)
         position_weight = np.zeros((batch, length), dtype=np.float32)
         trick_targets = np.full(
             (batch, model_config.max_players), IGNORE_LABEL, np.int64
@@ -516,6 +525,8 @@ def build_training_groups(
                 value_targets[row, position] = value
             for position, reach in leaf.position_reach_weights().items():
                 position_weight[row, position] = seq_weight_for(tree) * reach
+            if train_config.value_positions == "all":
+                value_weight[row] = position_weight[row]
             trick_targets[row] = arrays.trick_targets
             trick_masks[row] = arrays.trick_masks
             suit_targets[row] = arrays.suit_targets
@@ -524,6 +535,13 @@ def build_training_groups(
             for record in leaf.decisions:
                 phase_key = "bid" if record.phase == NEXT_BID else "play"
                 rows = policy[phase_key]
+                decision_weight = (
+                    policy_weight_for(tree)
+                    * record.reach_weight
+                    * depth_scale.get(id(record), 1.0)
+                )
+                if train_config.value_positions == "policy":
+                    value_weight[row, record.position] += decision_weight
                 rows.seq_index.append(row)
                 rows.position.append(record.position)
                 rows.old_probs_full.append(record.old_probs)
@@ -561,11 +579,7 @@ def build_training_groups(
                         np.asarray(b.inclusion_probs, dtype=np.float32)
                     )
                     rows.branched.append(True)
-                rows.weight.append(
-                    policy_weight_for(tree)
-                    * record.reach_weight
-                    * depth_scale.get(id(record), 1.0)
-                )
+                rows.weight.append(decision_weight)
 
         groups.append(
             SeqTrainingGroup(
@@ -574,6 +588,7 @@ def build_training_groups(
                 tokens=tokens,
                 owned=owned,
                 value_targets=value_targets,
+                value_weight=value_weight,
                 position_weight=position_weight,
                 trick_targets=trick_targets,
                 trick_masks=trick_masks,
@@ -611,6 +626,8 @@ class SeqTrainer:
                 else core_parameters
             )
             target.append(parameter)
+        self._core_parameters = core_parameters
+        self._auxiliary_parameters = auxiliary_parameters
         self.optimizer = torch.optim.Adam(
             (
                 {
@@ -618,11 +635,13 @@ class SeqTrainer:
                     # Shared trunk plus action heads: these parameters can
                     # move the policy and must follow KL backtracking.
                     "kl_sensitive": True,
+                    "lr": train_config.core_lr,
                 },
                 {
                     "params": auxiliary_parameters,
                     # Readout-only heads cannot change bid/card logits.
                     "kl_sensitive": False,
+                    "lr": train_config.auxiliary_lr,
                 },
             ),
             lr=train_config.learning_rate,
@@ -673,6 +692,9 @@ class SeqTrainer:
             sum(rows.branched) for g in groups for rows in g.policy.values()
         )
         stats.unbranched_rows = stats.policy_rows - stats.branched_rows
+        stats.value_rows = int(
+            sum(np.count_nonzero(group.value_weight) for group in groups)
+        )
         stats.positions = int(sum(g.owned.sum() for g in groups))
 
         for _ in range(self.train.epochs):
@@ -683,8 +705,15 @@ class SeqTrainer:
             self.model.train()
             self.optimizer.zero_grad(set_to_none=True)
             self._epoch_backward(groups, stats)
-            torch.nn.utils.clip_grad_norm_(
-                self.model.parameters(), self.train.max_grad_norm
+            stats.core_grad_norm = float(
+                torch.nn.utils.clip_grad_norm_(
+                    self._core_parameters, self.train.max_grad_norm
+                )
+            )
+            stats.auxiliary_grad_norm = float(
+                torch.nn.utils.clip_grad_norm_(
+                    self._auxiliary_parameters, self.train.max_grad_norm
+                )
             )
             self._apply_warmup_lr()
             nominal_lrs = [float(group["lr"]) for group in self.optimizer.param_groups]
@@ -766,7 +795,12 @@ class SeqTrainer:
         warmup = self.train.lr_warmup_updates
         scale = 1.0 if warmup <= 0 else min(1.0, (self.optimizer_steps + 1) / warmup)
         for group in self.optimizer.param_groups:
-            group["lr"] = self.train.learning_rate * scale
+            base = (
+                self.train.core_lr
+                if group.get("kl_sensitive", True)
+                else self.train.auxiliary_lr
+            )
+            group["lr"] = base * scale
 
     def _release_device_memory(self) -> None:
         # MPS's caching allocator keeps its high-water mark resident; with a
@@ -806,6 +840,34 @@ class SeqTrainer:
         stats.loss_policy = totals["policy"]
         stats.loss_value = totals["value"]
         stats.loss_value_zero = totals["value_zero"]
+        value_weight = totals["value_weight"]
+        if value_weight > 0:
+            stats.value_rmse = math.sqrt(
+                max(totals["value_squared_error"] / value_weight, 0.0)
+            )
+            stats.value_zero_rmse = math.sqrt(
+                max(totals["value_target_squared"] / value_weight, 0.0)
+            )
+            prediction_mean = totals["value_prediction_sum"] / value_weight
+            target_mean = totals["value_target_sum"] / value_weight
+            prediction_variance = max(
+                totals["value_prediction_squared"] / value_weight
+                - prediction_mean**2,
+                0.0,
+            )
+            target_variance = max(
+                totals["value_target_squared"] / value_weight - target_mean**2,
+                0.0,
+            )
+            covariance = (
+                totals["value_prediction_target"] / value_weight
+                - prediction_mean * target_mean
+            )
+            stats.value_prediction_std = math.sqrt(prediction_variance)
+            denominator = math.sqrt(prediction_variance * target_variance)
+            stats.value_correlation = (
+                covariance / denominator if denominator > 0 else 0.0
+            )
         stats.loss_suit = totals["suit"]
         stats.loss_trick = totals["trick"]
         stats.loss_bid_hit = totals["bid_hit"]
@@ -838,21 +900,58 @@ class SeqTrainer:
         term_parts: dict[str, list[torch.Tensor]] = defaultdict(list)
         loss = tokens.new_zeros((), dtype=torch.float32)
 
-        # Value.
+        # Value. The baseline is consumed only at focal policy decisions, so
+        # the default value_weight is aligned exactly to those rows. Normalized
+        # MSE learns E[R|s]; Smooth-L1 remains an explicit legacy option.
         value_targets = torch.from_numpy(group.value_targets[start:stop]).to(device)
-        value_loss = (
-            F.smooth_l1_loss(output.value, value_targets, reduction="none")
-            * position_weight
-        ).sum()
-        target_magnitude = value_targets.abs()
-        value_zero_loss = (
-            torch.where(
-                target_magnitude < 1.0,
-                0.5 * target_magnitude.square(),
-                target_magnitude - 0.5,
-            )
-            * position_weight
-        ).sum()
+        value_weight = (
+            torch.from_numpy(group.value_weight[start:stop]).to(device)
+            * owned.float()
+        )
+        if train.value_objective == "mse":
+            scaled_error = (
+                output.value - value_targets
+            ) / train.value_reward_scale
+            value_loss = (0.5 * scaled_error.square() * value_weight).sum()
+            value_zero_loss = (
+                0.5
+                * (value_targets / train.value_reward_scale).square()
+                * value_weight
+            ).sum()
+        else:
+            value_loss = (
+                F.smooth_l1_loss(output.value, value_targets, reduction="none")
+                * value_weight
+            ).sum()
+            target_magnitude = value_targets.abs()
+            value_zero_loss = (
+                torch.where(
+                    target_magnitude < 1.0,
+                    0.5 * target_magnitude.square(),
+                    target_magnitude - 0.5,
+                )
+                * value_weight
+            ).sum()
+        raw_error = output.value - value_targets
+        term_parts["value_weight"].append(value_weight.sum().detach())
+        term_parts["value_squared_error"].append(
+            (raw_error.square() * value_weight).sum().detach()
+        )
+        term_parts["value_target_squared"].append(
+            (value_targets.square() * value_weight).sum().detach()
+        )
+        term_parts["value_prediction_sum"].append(
+            (output.value * value_weight).sum().detach()
+        )
+        term_parts["value_target_sum"].append(
+            (value_targets * value_weight).sum().detach()
+        )
+        term_parts["value_prediction_squared"].append(
+            (output.value.square() * value_weight).sum().detach()
+        )
+        term_parts["value_prediction_target"].append(
+            (output.value * value_targets * value_weight).sum().detach()
+        )
         loss = loss + train.value_coef * value_loss
         term_parts["value"].append(value_loss.detach())
         term_parts["value_zero"].append(value_zero_loss.detach())

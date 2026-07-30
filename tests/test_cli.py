@@ -62,12 +62,20 @@ def test_legacy_metrics_header_is_upgraded_for_reporting_fields(tmp_path):
         "reward_focal",
         "reward_non_focal",
         "loss_value_zero",
+        "auxiliary_learning_rate",
+        "value_rmse",
+        "value_zero_rmse",
+        "value_correlation",
+        "value_prediction_std",
+        "value_rows",
         "proposed_policy_kl",
         "proposed_policy_kl_p95",
         "proposed_policy_kl_p99",
         "proposed_policy_kl_max",
         "proposed_mean_exceeded",
         "proposed_p99_exceeded",
+        "core_grad_norm",
+        "auxiliary_grad_norm",
     }
     legacy = tuple(column for column in METRIC_COLUMNS if column not in new_fields)
     with metrics.open("w", newline="") as handle:

@@ -75,11 +75,12 @@ are unbiased.
 
 - Bid logits over `0..hand_size`.
 - Card logits over all 52 cards, masked to legal cards.
-- Per-position relative value.
+- Relative value readout, supervised at focal policy decisions by default.
 - Per-opponent suit-presence logits (sigmoid, four suits).
 - Per-seat final trick-count logits (softmax over `0..hand_size`,
   feasibility-masked), the observer included.
 - Optional per-seat bid-hit logits (sigmoid), off in the current preset.
 
-The policy reads only the final visible position. Training can supervise value
-and beliefs at every owned position of every branch leaf.
+The policy reads only the final visible position. Beliefs are supervised at
+every owned position of every branch leaf; value is supervised at the focal
+decision positions where it is actually used as a control variate.

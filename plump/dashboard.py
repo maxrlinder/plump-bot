@@ -82,20 +82,19 @@ def render_dashboard(
         smooth=min(smooth, 5),
         include_learning_rate=include_learning_rate,
     )
-    _lines(
+    _dual_lines(
         axes[1, 0],
         iteration,
         rows,
-        (
-            ("loss_value", "value"),
-            ("loss_value_zero", "value: predict zero"),
-            ("loss_suit", "suit presence"),
-            ("loss_trick", "trick count"),
-            ("loss_bid_hit", "bid-hit belief"),
+        left=(
+            ("value_rmse", "learned value"),
+            ("value_zero_rmse", "predict zero"),
         ),
+        right=(("value_correlation", "value correlation"),),
         smooth=smooth,
-        title="Active auxiliary losses",
-        ylabel="loss",
+        title="Decision-state value quality",
+        left_label="RMSE (reward points)",
+        right_label="weighted correlation",
         omit_zero=True,
     )
     _lines(

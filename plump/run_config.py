@@ -133,6 +133,16 @@ def resolve_training_config(raw: dict[str, Any]) -> ResolvedTraining:
             bid_position_mode=str(rollout_raw.get("bid_position_mode", "cycle")),
         ),
         learning_rate=float(training_raw["learning_rate"]),
+        core_learning_rate=(
+            None
+            if training_raw.get("core_learning_rate") is None
+            else float(training_raw["core_learning_rate"])
+        ),
+        auxiliary_learning_rate=(
+            None
+            if training_raw.get("auxiliary_learning_rate") is None
+            else float(training_raw["auxiliary_learning_rate"])
+        ),
         lr_warmup_updates=int(training_raw["lr_warmup_updates"]),
         epochs=int(training_raw["epochs"]),
         microbatch_positions=int(training_raw["microbatch_positions"]),
@@ -160,6 +170,9 @@ def resolve_training_config(raw: dict[str, Any]) -> ResolvedTraining:
         kl_backtrack_attempts=int(training_raw["kl_backtrack_attempts"]),
         kl_backtrack_factor=float(training_raw["kl_backtrack_factor"]),
         branch_depth_exponent=float(training_raw["branch_depth_exponent"]),
+        value_objective=str(training_raw.get("value_objective", "mse")),
+        value_positions=str(training_raw.get("value_positions", "policy")),
+        value_reward_scale=float(training_raw.get("value_reward_scale", 5.0)),
         value_coef=float(training_raw["value_coef"]),
         suit_coef=float(training_raw["suit_coef"]),
         bid_hit_coef=float(training_raw["bid_hit_coef"]),

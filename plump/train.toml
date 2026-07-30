@@ -34,6 +34,8 @@ bid_top_k = 5
 play_mode = "stratified"
 play_top_k = 4
 learning_rate = 0.0002
+core_learning_rate = 0.000025
+auxiliary_learning_rate = 0.0002
 lr_warmup_updates = 100
 epochs = 1
 microbatch_positions = 16384
@@ -57,6 +59,9 @@ kl_backtrack_factor = 0.5
 # Counterfactual nodes multiply with depth. Pull policy weight toward the root
 # so bidding and early plays are not drowned out by thousands of deep leaves.
 branch_depth_exponent = -0.5
+value_objective = "mse"
+value_positions = "policy"
+value_reward_scale = 5.0
 value_coef = 0.5
 suit_coef = 0.05
 bid_hit_coef = 0.0

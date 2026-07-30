@@ -21,15 +21,15 @@ from plump.seq.config import (
 from plump.seq.model import SeqPlumpModel
 from plump.seq.trainer import SeqTrainer, build_training_groups
 
-# Regenerated for the intentional switch from duplicate-collapsed iid branches
-# to fixed-width, disjoint policy-mass strata. This golden exercises stochastic
+# Regenerated for decision-aligned expected-value training and separately
+# clipped optimizer groups. This golden still exercises stochastic
 # stratification at the bid and exhaustive-within-budget play expansion.
 EXPECTED = {
-    "groups": "616c45ba26b97d053ab6b6de6ba081410a88848649fd16c03521d5e0afc26ae8",
+    "groups": "a54f006bb08fb1a031096665267ab68ba2f5bd7b2c9477891596f9a1bc615900",
     "summary": "5dcdb89befa1747a1cacb8387b0d17c8fb640dac48498318f45507d8b32e15ed",
     "trees": "fb6fdaa6b002e015c4da805826fc80e08c30f0435ce65169b2b0d8554e96d168",
-    "update": "0aa959c4e42ec2689a9b5c2e0136954b14e2c5511ffb7a0d91099931a7446d3e",
-    "weights": "7473e60b2c7403460fb35a4a67024f0b14cbe72894bcea8b9a20a80908936f55",
+    "update": "871bbcf76d1d20b604533e8c8e94c510df2f65166cfc451c302c8d89c8f7eb2e",
+    "weights": "1715e292645c0afff516457aa3631d787d7f236417e37453d089f44990db359e",
 }
 
 
@@ -147,6 +147,7 @@ def _group_payload(group):
         "tokens": group.tokens,
         "owned": group.owned,
         "value_targets": group.value_targets,
+        "value_weight": group.value_weight,
         "position_weight": group.position_weight,
         "trick_targets": group.trick_targets,
         "trick_masks": group.trick_masks,

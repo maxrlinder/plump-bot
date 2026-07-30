@@ -51,6 +51,11 @@ def test_run_creation_records_config_and_rejects_field_changes(tmp_path):
     resolved = load_training_config()
     assert resolved.training.policy_objective == "neurd"
     assert resolved.training.branch_depth_exponent == -0.5
+    assert resolved.training.value_objective == "mse"
+    assert resolved.training.value_positions == "policy"
+    assert resolved.training.value_reward_scale == 5.0
+    assert resolved.training.core_lr == 2.5e-5
+    assert resolved.training.auxiliary_lr == 2e-4
     assert resolved.training.kl_backtrack_attempts == 8
     assert resolved.training.branch_rule.bid_rule() == (
         "stratified",

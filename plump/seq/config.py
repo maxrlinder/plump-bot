@@ -737,6 +737,12 @@ class SeqTrainingConfig:
 
     # Optimization.
     learning_rate: float = 2e-4
+    # Optional per-group rates. ``learning_rate`` remains the compatibility
+    # fallback for callers and old configs. The policy-sensitive trunk/action
+    # group is KL guarded; auxiliary readout heads cannot move the policy and
+    # can therefore retain a larger independent rate.
+    core_learning_rate: Optional[float] = None
+    auxiliary_learning_rate: Optional[float] = None
     adam_betas: tuple[float, float] = (0.9, 0.999)
     # Optimizer steps over which the learning rate ramps linearly to
     # learning_rate. Adam's first steps are sign steps (m_hat/sqrt(v_hat) is
@@ -860,6 +866,15 @@ class SeqTrainingConfig:
     # -1.0 roughly equalizes weight across depths for a branching factor of 2.
     branch_depth_exponent: float = 0.0
 
+    # Value is a control variate for focal policy decisions, so its statistically
+    # correct target is the conditional expected return. Normalized MSE learns
+    # that mean; Smooth-L1 is retained only for explicit legacy experiments.
+    # Restricting supervision to policy readouts avoids spending most of the
+    # value gradient on event-token positions where the baseline is never used.
+    value_objective: Literal["mse", "smooth_l1"] = "mse"
+    value_positions: Literal["policy", "all"] = "policy"
+    value_reward_scale: float = 5.0
+
     # Auxiliary losses. A coefficient of exactly 0 skips computing that loss and
     # skips running its head at all, so an unused belief costs nothing.
     #
@@ -900,8 +915,34 @@ class SeqTrainingConfig:
     use_kv_cache: bool = True
     seed: int = 0
 
+    @property
+    def core_lr(self) -> float:
+        return (
+            self.learning_rate
+            if self.core_learning_rate is None
+            else self.core_learning_rate
+        )
+
+    @property
+    def auxiliary_lr(self) -> float:
+        return (
+            self.learning_rate
+            if self.auxiliary_learning_rate is None
+            else self.auxiliary_learning_rate
+        )
+
     def validate(self) -> None:
         self.rollout.validate()
+        if self.learning_rate <= 0 or self.core_lr <= 0 or self.auxiliary_lr <= 0:
+            raise ValueError("Learning rates must be > 0.")
+        if self.value_objective not in ("mse", "smooth_l1"):
+            raise ValueError(
+                "value_objective must be either 'mse' or 'smooth_l1'."
+            )
+        if self.value_positions not in ("policy", "all"):
+            raise ValueError("value_positions must be either 'policy' or 'all'.")
+        if self.value_reward_scale <= 0:
+            raise ValueError("value_reward_scale must be > 0.")
         if self.policy_objective not in POLICY_OBJECTIVES:
             raise ValueError(
                 f"Unknown policy_objective {self.policy_objective!r}; expected "
