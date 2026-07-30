@@ -80,12 +80,15 @@ class CheckpointModel:
 
         predictions: dict[int, dict[str, Any]] = {}
         round_state = env.state.current_round
-        players_with_bids = {bid.player for bid in round_state.bids}
+        completed_tricks = sum(
+            trick.winner is not None for trick in round_state.tricks
+        )
+        unresolved_tricks = round_state.hand_size - completed_tricks
         observers = list(range(env.config.num_players))
         output = self.policy.predict_many(
             [env] * env.config.num_players,
             observers=observers,
-            aux_heads=("suit", "bid_hit"),
+            aux_heads=("suit", "trick"),
         )
         for observer in range(env.config.num_players):
             suit_presence = (
@@ -93,23 +96,36 @@ class CheckpointModel:
                 if output.suit_logits is not None
                 else None
             )
-            bid_hit = (
-                torch.sigmoid(output.bid_hit_logits[observer])
-                if output.bid_hit_logits is not None
+            trick_logits = (
+                output.trick_logits[observer]
+                if output.trick_logits is not None
                 else None
             )
 
             rows = []
             for rel in range(env.config.num_players):
                 abs_player = (observer + rel) % env.config.num_players
+                trick_forecast = (
+                    self._trick_count_forecast(
+                        trick_logits[rel],
+                        tricks_won=round_state.tricks_won.get(abs_player, 0),
+                        unresolved_tricks=unresolved_tricks,
+                    )
+                    if trick_logits is not None
+                    else None
+                )
                 rows.append(
                     {
                         "player": abs_player,
-                        "bid_hit_prob": (
-                            float(bid_hit[rel].item())
-                            if bid_hit is not None
-                            and abs_player in players_with_bids
+                        "expected_final_tricks": (
+                            trick_forecast["expected"]
+                            if trick_forecast is not None
                             else None
+                        ),
+                        "top_final_tricks": (
+                            trick_forecast["top"]
+                            if trick_forecast is not None
+                            else []
                         ),
                         "suit_presence": (
                             {
@@ -139,6 +155,48 @@ class CheckpointModel:
                 output,
             )
         return predictions, action_probabilities
+
+    @staticmethod
+    def _trick_count_forecast(
+        logits: torch.Tensor,
+        *,
+        tricks_won: int,
+        unresolved_tricks: int,
+    ) -> dict[str, Any]:
+        """Return a feasible final-trick distribution summary.
+
+        Training masks the trick-count head to totals reachable from the
+        public state. Apply that same mask here: raw logits outside the
+        feasible interval receive no loss and must never be presented as
+        beliefs.
+        """
+
+        counts = torch.arange(logits.shape[-1], device=logits.device)
+        upper = min(
+            tricks_won + unresolved_tricks,
+            logits.shape[-1] - 1,
+        )
+        feasible = (counts >= tricks_won) & (counts <= upper)
+        probabilities = torch.softmax(
+            logits.float().masked_fill(~feasible, float("-inf")),
+            dim=-1,
+        )
+        expected = float((counts * probabilities).sum().item())
+        top_k = min(3, int(feasible.sum().item()))
+        top_probabilities, top_counts = probabilities.topk(top_k)
+        return {
+            "expected": expected,
+            "top": [
+                {
+                    "tricks": int(count.item()),
+                    "probability": float(probability.item()),
+                }
+                for probability, count in zip(
+                    top_probabilities,
+                    top_counts,
+                )
+            ],
+        }
 
     def predictions(self, env: PlumpEnv) -> dict[int, dict[str, Any]]:
         """Backward-compatible belief-only helper."""

@@ -169,13 +169,18 @@ class GuiControllerTest(unittest.TestCase):
                 batch = len(envs)
                 bid_logits = torch.zeros(batch, 11)
                 bid_logits[0] = torch.arange(11)
+                trick_logits = torch.arange(11, dtype=torch.float32).repeat(
+                    batch,
+                    5,
+                    1,
+                )
                 return SimpleNamespace(
                     bid_logits=bid_logits,
                     card_logits=torch.zeros(batch, 52),
                     value=torch.zeros(batch),
-                    trick_logits=None,
+                    trick_logits=trick_logits,
                     suit_logits=torch.zeros(batch, 5, 4),
-                    bid_hit_logits=torch.zeros(batch, 5),
+                    bid_hit_logits=None,
                 )
 
         checkpoint = object.__new__(CheckpointModel)
@@ -188,9 +193,24 @@ class GuiControllerTest(unittest.TestCase):
         self.assertEqual(checkpoint.policy.observers, [0, 1, 2])
         self.assertEqual(
             checkpoint.policy.aux_heads,
-            ("suit", "bid_hit"),
+            ("suit", "trick"),
         )
         self.assertEqual(set(predictions), {0, 1, 2})
+        self.assertEqual(
+            [
+                row["tricks"]
+                for row in predictions[0]["rows"][0]["top_final_tricks"]
+            ],
+            [3, 2, 1],
+        )
+        self.assertAlmostEqual(
+            sum(
+                row["probability"]
+                for row in predictions[0]["rows"][0]["top_final_tricks"]
+            ),
+            1.0,
+            places=1,
+        )
         self.assertEqual(action_policy["phase"], Phase.BIDDING.value)
         self.assertEqual(
             {row["bid"] for row in action_policy["actions"]},
@@ -209,6 +229,27 @@ class GuiControllerTest(unittest.TestCase):
             include_action_probabilities=False,
         )
         self.assertIsNone(hidden_action_policy)
+
+    def test_trick_forecast_masks_publicly_impossible_totals(self):
+        logits = torch.tensor([100.0, 90.0, 80.0, 3.0, 2.0, 1.0, 50.0])
+
+        forecast = CheckpointModel._trick_count_forecast(
+            logits,
+            tricks_won=3,
+            unresolved_tricks=2,
+        )
+
+        self.assertEqual(
+            [row["tricks"] for row in forecast["top"]],
+            [3, 4, 5],
+        )
+        self.assertAlmostEqual(
+            sum(row["probability"] for row in forecast["top"]),
+            1.0,
+            places=6,
+        )
+        self.assertGreaterEqual(forecast["expected"], 3.0)
+        self.assertLessEqual(forecast["expected"], 5.0)
 
     def test_play_probabilities_contain_only_legal_cards(self):
         controller = GuiController()

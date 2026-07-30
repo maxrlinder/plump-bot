@@ -374,7 +374,7 @@ select {
 .prediction-head,
 .prediction-row {
   display: grid;
-  grid-template-columns: minmax(54px, 1fr) 38px minmax(92px, auto);
+  grid-template-columns: minmax(54px, 0.8fr) 38px minmax(168px, 1.6fr);
   gap: 5px;
   align-items: center;
   font-size: 0.7rem;
@@ -398,6 +398,12 @@ select {
 .prediction-row strong {
   color: var(--ink);
   text-align: right;
+}
+
+.trick-forecast {
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
 }
 
 .play-area {

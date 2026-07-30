@@ -447,8 +447,11 @@ async function advanceBot() {
   }
 }
 
-function pointLabel(pointProb) {
-  return pointProb == null ? "—" : `${Math.round(pointProb * 100)}%`;
+function trickForecastLabel(forecast) {
+  if (!forecast?.length) return "—";
+  return forecast
+    .map(({ tricks, probability }) => `${tricks}: ${Math.round(probability * 100)}%`)
+    .join(" · ");
 }
 
 function suitPresenceHtml(suitPresence) {
@@ -471,15 +474,18 @@ function predictionHtml(player) {
   const prediction = player.prediction;
   if (!prediction?.rows?.length) return "";
   const self = prediction.rows.find((row) => row.player === player.id);
-  const point = pointLabel(self?.bid_hit_prob);
+  const expected =
+    self?.expected_final_tricks == null
+      ? "—"
+      : self.expected_final_tricks.toFixed(1);
   const rows = prediction.rows
     .map((row) => {
       const name = playerName(row.player);
       return `
         <div class="prediction-row">
           <span>${escapeHtml(name)}</span>
-          <strong>Bid hit</strong>
-          <span>${pointLabel(row.bid_hit_prob)}</span>
+          <strong>Final</strong>
+          <span class="trick-forecast">${trickForecastLabel(row.top_final_tricks)}</span>
         </div>
         ${suitPresenceHtml(row.suit_presence)}
       `;
@@ -489,7 +495,7 @@ function predictionHtml(player) {
     <div class="prediction-box">
       <div class="prediction-head">
         <span>Schema-v6 model POV</span>
-        <strong>Your bid hit ${point}</strong>
+        <strong>Your expected tricks ${expected}</strong>
       </div>
       <div class="prediction-grid">
         ${rows}
