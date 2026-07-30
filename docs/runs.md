@@ -17,7 +17,9 @@ runs/<name>/
     latest.json
     best.pt
     best.json
-  evaluations/<checkpoint>/heuristic.json
+  evaluations/<checkpoint>/
+    heuristic.json
+    heuristic_sample.json
   analysis/<checkpoint>/
 ```
 
@@ -74,7 +76,7 @@ the evaluate, analyze, and play commands.
 Evaluate every completed interval checkpoint on the same fixed deal bank:
 
 ```bash
-uv run plump evaluate RUN --checkpoint all
+uv run plump evaluate RUN --checkpoint all --action-mode both
 ```
 
 The heuristic protocol covers every configured player-count/hand-size cell,
@@ -82,12 +84,17 @@ every focal hand, and every initial bidding position. Reports include
 confidence intervals and are written atomically below
 `evaluations/iter_NNNNNN/`. Existing reports with an identical protocol are
 reused unless `--force` is supplied.
+`--action-mode argmax` is the deterministic default and measures the strongest
+legal action without penalizing retained entropy. `sample` draws reproducibly
+from the learned legal-action distribution. `both` stores and dashboards the
+two protocols separately.
 
 Evaluation can follow a live trainer without sharing its run lock or metrics
 writer:
 
 ```bash
-uv run plump evaluate RUN --checkpoint all --watch --batch-size 64
+uv run plump evaluate RUN --checkpoint all --action-mode both --watch \
+  --batch-size 64
 ```
 
 Only one checkpoint model is resident at a time. `--batch-size` trades a small

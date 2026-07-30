@@ -7,6 +7,7 @@ from plump.run_evaluation import (
     EvaluationProtocol,
     checkpoint_iteration,
     discover_interval_checkpoints,
+    evaluation_output,
     result_matches_protocol,
 )
 from plump.runs import RunDirectory, atomic_write_json
@@ -66,4 +67,14 @@ def test_cached_result_requires_identical_protocol(tmp_path):
                 "deals_per_configuration": 12,
             }
         ),
+    )
+
+
+def test_sampled_evaluation_has_a_separate_sidecar(tmp_path):
+    run = RunDirectory("sample", root=tmp_path)
+
+    assert evaluation_output(run, 50, "heuristic").name == "heuristic.json"
+    assert (
+        evaluation_output(run, 50, "heuristic", greedy=False).name
+        == "heuristic_sample.json"
     )

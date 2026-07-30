@@ -145,9 +145,41 @@ def test_sidecar_evaluation_overrides_inline_checkpoint_score(tmp_path):
     assert points == [
         {
             "iteration": 5.0,
+            "mode": "argmax",
             "reward": 0.35,
             "bid_hit": 0.42,
             "ci_low": 0.1,
             "ci_high": 0.6,
         }
+    ]
+
+
+def test_dashboard_loads_argmax_and_sample_checkpoint_evaluations(tmp_path):
+    evaluations = tmp_path / "evaluations"
+    output = evaluations / "iter_000050"
+    output.mkdir(parents=True)
+    report = {
+        "macro_relative_reward": 0.2,
+        "macro_bid_hit_rate": 0.4,
+        "relative_reward_ci_low": -0.1,
+        "relative_reward_ci_high": 0.5,
+    }
+    (output / "heuristic.json").write_text(
+        json.dumps({"iteration": 50, "protocol": {"greedy": True}, "report": report})
+    )
+    (output / "heuristic_sample.json").write_text(
+        json.dumps(
+            {
+                "iteration": 50,
+                "protocol": {"greedy": False},
+                "report": {**report, "macro_relative_reward": -0.3},
+            }
+        )
+    )
+
+    points = _evaluation_points([], evaluations)
+
+    assert [(point["mode"], point["reward"]) for point in points] == [
+        ("argmax", 0.2),
+        ("sample", -0.3),
     ]

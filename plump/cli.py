@@ -162,6 +162,15 @@ def build_parser() -> argparse.ArgumentParser:
     evaluate.add_argument("--action-seed", type=int, default=17)
     evaluate.add_argument("--bootstrap-samples", type=int, default=2000)
     evaluate.add_argument(
+        "--action-mode",
+        choices=("argmax", "sample", "both"),
+        default="argmax",
+        help=(
+            "choose deterministic legal-action argmax, reproducible policy "
+            "sampling, or evaluate both (default: argmax)"
+        ),
+    )
+    evaluate.add_argument(
         "--batch-size",
         type=int,
         help="inference batch size (default: min(configured value, 64))",
@@ -455,37 +464,51 @@ def evaluate_command(args: argparse.Namespace) -> int:
     hand_sizes = tuple(
         sorted({cell.hand_size for cell in resolved.training.schedule_cells})
     )
-    protocol = EvaluationProtocol(
-        opponent=args.opponent,
-        player_counts=resolved.training.player_counts,
-        hand_sizes=hand_sizes,
-        deals_per_configuration=deals,
-        deal_seed=deal_seed,
-        action_seed=int(args.action_seed),
-        bootstrap_samples=int(args.bootstrap_samples),
-        batch_size=batch_size,
+    action_modes = (
+        ("argmax", "sample")
+        if args.action_mode == "both"
+        else (args.action_mode,)
+    )
+    protocols = tuple(
+        EvaluationProtocol(
+            opponent=args.opponent,
+            player_counts=resolved.training.player_counts,
+            hand_sizes=hand_sizes,
+            deals_per_configuration=deals,
+            deal_seed=deal_seed,
+            action_seed=int(args.action_seed),
+            bootstrap_samples=int(args.bootstrap_samples),
+            batch_size=batch_size,
+            greedy=mode == "argmax",
+        )
+        for mode in action_modes
     )
     bank = DealBank.generate(
-        player_counts=protocol.player_counts,
-        hand_sizes=protocol.hand_sizes,
-        deals_per_configuration=protocol.deals_per_configuration,
-        seed=protocol.deal_seed,
+        player_counts=protocols[0].player_counts,
+        hand_sizes=protocols[0].hand_sizes,
+        deals_per_configuration=protocols[0].deals_per_configuration,
+        seed=protocols[0].deal_seed,
     )
-    processed: set[Path] = set()
+    processed: set[tuple[Path, bool]] = set()
     metrics_signature: tuple[int, int] | None = None
     while True:
         if args.checkpoint == "all":
             checkpoints = discover_interval_checkpoints(run)
         else:
             checkpoints = [run.resolve_checkpoint(args.checkpoint)]
-        pending = [path for path in checkpoints if path not in processed]
+        pending = [
+            (path, protocol)
+            for path in checkpoints
+            for protocol in protocols
+            if (path, protocol.greedy) not in processed
+        ]
         if not checkpoints and not args.watch:
             raise FileNotFoundError(
                 f"No interval checkpoints in {run.checkpoints}"
             )
 
         refreshed = False
-        for checkpoint in pending:
+        for checkpoint, protocol in pending:
             payload, created = evaluate_checkpoint(
                 run,
                 checkpoint,
@@ -496,17 +519,19 @@ def evaluate_command(args: argparse.Namespace) -> int:
             )
             report = payload["report"]
             status = "evaluated" if created else "cached"
+            action_mode = "argmax" if protocol.greedy else "sample"
             print(
-                f"{checkpoint.name}: {status} on {device} in "
+                f"{checkpoint.name} [{action_mode}]: {status} on {device} in "
                 f"{float(payload['elapsed_sec']):.1f}s | "
                 f"reward={float(report['macro_relative_reward']):.4f} "
                 f"[{float(report['relative_reward_ci_low']):.4f}, "
                 f"{float(report['relative_reward_ci_high']):.4f}] | "
                 f"bid_hit={float(report['macro_bid_hit_rate']):.4f} "
+                f"raw_score={float(report['macro_raw_score']):.4f} "
                 f"rounds={int(report['rounds'])}",
                 flush=True,
             )
-            processed.add(checkpoint)
+            processed.add((checkpoint, protocol.greedy))
             refreshed = True
 
         current_signature = _file_signature(run.metrics)

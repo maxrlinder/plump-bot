@@ -11,8 +11,9 @@ uv run plump dashboard RUN
 
 The top-left graph combines run-scoped checkpoint evaluations against the
 heuristic with any older inline evaluation rows. Sidecar reports take
-precedence and show relative reward with its confidence band plus bid
-accuracy. The remaining panels show rollout outcomes, objective losses,
+precedence and show separate deterministic-argmax and policy-sampled relative
+reward/confidence bands plus bid accuracy. The remaining panels show rollout
+outcomes, objective losses,
 entropy and KL, branch/data volume, throughput, wall-time breakdown, cache
 pressure, device memory, and rollback state. Learning rate is hidden unless
 `--include-learning-rate` is passed. Sparse evaluation results and resumed CSV

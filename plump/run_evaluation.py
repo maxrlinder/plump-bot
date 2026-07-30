@@ -68,8 +68,15 @@ def evaluation_output(
     run: RunDirectory,
     iteration: int,
     opponent: str,
+    *,
+    greedy: bool = True,
 ) -> Path:
-    return run.evaluations / f"iter_{iteration:06d}" / f"{opponent}.json"
+    suffix = "" if greedy else "_sample"
+    return (
+        run.evaluations
+        / f"iter_{iteration:06d}"
+        / f"{opponent}{suffix}.json"
+    )
 
 
 def load_evaluation(path: str | Path) -> dict[str, Any]:
@@ -103,7 +110,12 @@ def evaluate_checkpoint(
 
     checkpoint = Path(checkpoint).resolve()
     iteration = checkpoint_iteration(checkpoint)
-    output = evaluation_output(run, iteration, protocol.opponent)
+    output = evaluation_output(
+        run,
+        iteration,
+        protocol.opponent,
+        greedy=protocol.greedy,
+    )
     if not force and result_matches_protocol(output, protocol):
         return load_evaluation(output), False
     if protocol.opponent != "heuristic":

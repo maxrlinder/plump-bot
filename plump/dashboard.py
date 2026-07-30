@@ -217,17 +217,18 @@ def _read_rows(path: Path) -> list[dict[str, str]]:
 def _evaluation_points(
     rows: list[dict[str, str]],
     evaluations_path: Path,
-) -> list[dict[str, float]]:
+) -> list[dict[str, float | str]]:
     """Merge inline legacy scores with checkpoint-scoped sidecar reports."""
 
-    points: dict[int, dict[str, float]] = {}
+    points: dict[tuple[str, int], dict[str, float | str]] = {}
     iterations = _series(rows, "iteration")
     rewards = _series(rows, "eval_reward_vs_heuristic")
     bids = _series(rows, "eval_bid_hit")
     for iteration, reward, bid in zip(iterations, rewards, bids):
         if np.isfinite(iteration) and (np.isfinite(reward) or np.isfinite(bid)):
-            points[int(iteration)] = {
+            points[("argmax", int(iteration))] = {
                 "iteration": float(iteration),
+                "mode": "argmax",
                 "reward": float(reward),
                 "bid_hit": float(bid),
                 "ci_low": math.nan,
@@ -235,10 +236,19 @@ def _evaluation_points(
             }
 
     if evaluations_path.is_dir():
-        for path in sorted(evaluations_path.glob("iter_*/heuristic.json")):
+        paths = sorted(evaluations_path.glob("iter_*/heuristic.json"))
+        paths.extend(
+            sorted(evaluations_path.glob("iter_*/heuristic_sample.json"))
+        )
+        for path in paths:
             try:
                 payload = json.loads(path.read_text())
                 report = payload.get("report", payload)
+                protocol = payload.get("protocol", {})
+                greedy = bool(
+                    protocol.get("greedy", path.stem != "heuristic_sample")
+                )
+                mode = "argmax" if greedy else "sample"
                 raw_iteration = payload.get("iteration")
                 if raw_iteration is None:
                     match = re.fullmatch(r"iter_(\d+)", path.parent.name)
@@ -246,8 +256,9 @@ def _evaluation_points(
                         continue
                     raw_iteration = match.group(1)
                 iteration = int(raw_iteration)
-                points[iteration] = {
+                points[(mode, iteration)] = {
                     "iteration": float(iteration),
+                    "mode": mode,
                     "reward": float(report["macro_relative_reward"]),
                     "bid_hit": float(report["macro_bid_hit_rate"]),
                     "ci_low": float(report.get("relative_reward_ci_low", math.nan)),
@@ -260,7 +271,10 @@ def _evaluation_points(
     return [points[key] for key in sorted(points)]
 
 
-def _checkpoint_evaluation(ax, points: list[dict[str, float]]) -> None:
+def _checkpoint_evaluation(
+    ax,
+    points: list[dict[str, float | str]],
+) -> None:
     right_ax = ax.twinx()
     ax.set_title("Checkpoint evaluation vs heuristic")
     if not points:
@@ -269,55 +283,82 @@ def _checkpoint_evaluation(ax, points: list[dict[str, float]]) -> None:
         _no_data(ax)
         return
 
-    iteration = np.asarray(
-        [point["iteration"] for point in points],
-        dtype=np.float64,
-    )
-    reward = np.asarray([point["reward"] for point in points], dtype=np.float64)
-    bid_hit = np.asarray([point["bid_hit"] for point in points], dtype=np.float64)
-    ci_low = np.asarray([point["ci_low"] for point in points], dtype=np.float64)
-    ci_high = np.asarray([point["ci_high"] for point in points], dtype=np.float64)
-
     handles = []
-    reward_valid = np.isfinite(iteration) & np.isfinite(reward)
-    if reward_valid.any():
-        (reward_line,) = ax.plot(
-            iteration[reward_valid],
-            reward[reward_valid],
-            color="C0",
-            linewidth=1.8,
-            marker="o",
-            label="relative reward",
+    any_bid = False
+    styles = {
+        "argmax": ("C0", "C1", "-", "argmax"),
+        "sample": ("C2", "C3", "--", "sample"),
+    }
+    for mode in ("argmax", "sample"):
+        selected = [point for point in points if point.get("mode") == mode]
+        if not selected:
+            continue
+        reward_color, bid_color, line_style, label = styles[mode]
+        iteration = np.asarray(
+            [point["iteration"] for point in selected],
+            dtype=np.float64,
         )
-        handles.append(reward_line)
-        ci_valid = (
-            reward_valid
-            & np.isfinite(ci_low)
-            & np.isfinite(ci_high)
+        reward = np.asarray(
+            [point["reward"] for point in selected],
+            dtype=np.float64,
         )
-        if ci_valid.any():
-            ax.fill_between(
-                iteration[ci_valid],
-                ci_low[ci_valid],
-                ci_high[ci_valid],
-                color="C0",
-                alpha=0.12,
-                linewidth=0,
-            )
-        ax.axhline(0.0, color="#777777", linewidth=0.8, alpha=0.45)
-        ax.set_ylabel("relative reward")
+        bid_hit = np.asarray(
+            [point["bid_hit"] for point in selected],
+            dtype=np.float64,
+        )
+        ci_low = np.asarray(
+            [point["ci_low"] for point in selected],
+            dtype=np.float64,
+        )
+        ci_high = np.asarray(
+            [point["ci_high"] for point in selected],
+            dtype=np.float64,
+        )
 
-    bid_valid = np.isfinite(iteration) & np.isfinite(bid_hit)
-    if bid_valid.any():
-        (bid_line,) = right_ax.plot(
-            iteration[bid_valid],
-            bid_hit[bid_valid],
-            color="C1",
-            linewidth=1.8,
-            marker="s",
-            label="bid accuracy",
-        )
-        handles.append(bid_line)
+        reward_valid = np.isfinite(iteration) & np.isfinite(reward)
+        if reward_valid.any():
+            (reward_line,) = ax.plot(
+                iteration[reward_valid],
+                reward[reward_valid],
+                color=reward_color,
+                linestyle=line_style,
+                linewidth=1.8,
+                marker="o",
+                label=f"reward · {label}",
+            )
+            handles.append(reward_line)
+            ci_valid = (
+                reward_valid
+                & np.isfinite(ci_low)
+                & np.isfinite(ci_high)
+            )
+            if ci_valid.any():
+                ax.fill_between(
+                    iteration[ci_valid],
+                    ci_low[ci_valid],
+                    ci_high[ci_valid],
+                    color=reward_color,
+                    alpha=0.10,
+                    linewidth=0,
+                )
+
+        bid_valid = np.isfinite(iteration) & np.isfinite(bid_hit)
+        if bid_valid.any():
+            (bid_line,) = right_ax.plot(
+                iteration[bid_valid],
+                bid_hit[bid_valid],
+                color=bid_color,
+                linestyle=line_style,
+                linewidth=1.8,
+                marker="s",
+                label=f"bid accuracy · {label}",
+            )
+            handles.append(bid_line)
+            any_bid = True
+
+    ax.axhline(0.0, color="#777777", linewidth=0.8, alpha=0.45)
+    ax.set_ylabel("relative reward")
+    if any_bid:
         right_ax.set_ylabel("bid accuracy")
         right_ax.grid(False)
     else:
