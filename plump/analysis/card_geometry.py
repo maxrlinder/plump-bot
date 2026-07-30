@@ -29,6 +29,7 @@ from .card_pca import (
     SUIT_STYLE,
     action_head_card_vectors,
     cards,
+    exact_card_input_vectors,
     input_card_vectors,
     save_pca,
 )
@@ -41,6 +42,8 @@ def card_labels() -> list[str]:
 def normalized_card_vectors(model, source: str) -> np.ndarray:
     if source == "input":
         vectors = input_card_vectors(model)
+    elif source == "exact-input":
+        vectors = exact_card_input_vectors(model)
     else:
         vectors = action_head_card_vectors(model)
     vectors = vectors.numpy().astype(np.float64)
@@ -433,9 +436,23 @@ def analyze_checkpoint(
             dpi,
         )
         plot_umap(vectors, title, label, outputs["umap"], seed, dpi)
+        # The effective input representation deliberately adds explicit rank
+        # and suit embeddings, making its cosine blocks mostly a schema
+        # property. For the input heatmap, isolate the 52 exact-card rows so
+        # the visible structure reflects learning by card identity alone.
+        heatmap_vectors = (
+            normalized_card_vectors(policy.model, "exact-input")
+            if source == "input"
+            else vectors
+        )
+        heatmap_title = (
+            "Exact-card slot input embedding"
+            if source == "input"
+            else title
+        )
         plot_similarity_heatmap(
-            vectors,
-            title,
+            heatmap_vectors,
+            heatmap_title,
             label,
             outputs["heatmap"],
             dpi,
@@ -459,6 +476,11 @@ def analyze_checkpoint(
             "suit_probe_p": suit_p,
             "rank_probe_mae": rank_mae,
             "rank_probe_p": rank_p,
+            "cosine_heatmap_representation": (
+                "exact-card-only"
+                if source == "input"
+                else "action-head"
+            ),
         }
 
     atomic_write_json(output_dir / "report.json", report)

@@ -18,7 +18,7 @@ import matplotlib.pyplot as plt
 import torch
 
 from plump.cards import RANK_LABELS, SUIT_SYMBOLS, Card, Suit
-from plump.seq.config import SLOT_CARD, SLOT_RANK, SLOT_SUIT
+from plump.seq.config import NUM_CARDS, SLOT_CARD, SLOT_RANK, SLOT_SUIT
 from plump.seq.tokens import RANKS, SUITS, card_id
 
 
@@ -76,6 +76,22 @@ def input_card_vectors(model) -> torch.Tensor:
         embedding.index_select(0, card_indices)
         + embedding.index_select(0, rank_indices)
         + embedding.index_select(0, suit_indices)
+    )
+
+
+def exact_card_input_vectors(model) -> torch.Tensor:
+    """Return only the 52 exact-card slot embeddings.
+
+    Unlike ``input_card_vectors``, this excludes the explicitly shared rank and
+    suit slot embeddings, so any geometry here was learned by the individual
+    card identities rather than supplied by the token schema.
+    """
+
+    offsets = model.slot_offsets.detach().cpu()
+    indices = torch.arange(NUM_CARDS, dtype=torch.long) + int(offsets[SLOT_CARD])
+    return model.slot_embedding.weight.detach().float().cpu().index_select(
+        0,
+        indices,
     )
 
 

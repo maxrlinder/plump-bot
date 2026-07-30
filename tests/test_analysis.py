@@ -89,4 +89,8 @@ def test_analysis_loads_seq_checkpoint_and_scopes_every_output(
     report_paths = [type(output)(path) for path in report["outputs"]]
     assert all(path.is_relative_to(output) for path in report_paths)
     assert all(path.is_file() for path in report_paths)
+    assert (
+        report["representations"]["input"]["cosine_heatmap_representation"]
+        == "exact-card-only"
+    )
     assert (output / "report.json").is_file()
