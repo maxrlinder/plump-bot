@@ -1,3 +1,4 @@
+import random
 import unittest
 
 from plump.cards import Card, Rank, Suit
@@ -6,6 +7,22 @@ from plump.state import BidAction, EventType, GameConfig, IllegalActionError, Ph
 
 
 class EnvTest(unittest.TestCase):
+    def test_unchecked_step_matches_validated_step_for_legal_trajectory(self):
+        env = PlumpEnv(
+            GameConfig(num_players=4, hand_sizes=[5], trump_policy=TrumpPolicy.NONE),
+            seed=9182,
+        )
+        env.reset(seed=9182)
+        chooser = random.Random(71)
+
+        while not env.is_done():
+            action = chooser.choice(env.legal_actions())
+            unchecked = env.clone()
+            validated_result = env.step(action)
+            unchecked_result = unchecked.step_unchecked(action)
+            self.assertEqual(unchecked.state, env.state)
+            self.assertEqual(unchecked_result, validated_result)
+
     def test_clone_is_independent_and_preserves_decision_state(self):
         env = PlumpEnv(GameConfig(num_players=3, hand_sizes=[3]), seed=41)
         env.reset()

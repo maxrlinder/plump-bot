@@ -245,6 +245,7 @@ def benchmark_rollout_widths(
     run_name: str = DEFAULT_RUN,
     deals_per_shape: int = 8,
     widths: str = "2,4,8",
+    profile: bool = False,
 ) -> dict[str, object]:
     """Compare rollout packing at a fixed trajectory count, without updates."""
 
@@ -283,9 +284,29 @@ def benchmark_rollout_widths(
         trainer.resolved_config = resolved.raw
         trainer.load_checkpoint(checkpoint, allow_training_config_mismatch=True)
         trainer.iteration += 1
+        trainer.collector.profile_sync = True
+        profiler = None
+        if profile:
+            import cProfile
+
+            profiler = cProfile.Profile()
+            profiler.enable()
         started = time.perf_counter()
         trees, summary = trainer.collect()
         elapsed = time.perf_counter() - started
+        if profiler is not None:
+            import io
+            import pstats
+
+            profiler.disable()
+            profile_stream = io.StringIO()
+            pstats.Stats(profiler, stream=profile_stream).sort_stats(
+                "cumulative"
+            ).print_stats(40)
+            profile_text = profile_stream.getvalue()
+            print(profile_text, flush=True)
+        else:
+            profile_text = None
         stats = trainer.collector.stats
         width_result = {
             "wave_deals": width,
@@ -294,11 +315,17 @@ def benchmark_rollout_widths(
             "trees_heuristic": summary.trees_heuristic,
             "leaves": summary.leaves,
             "seconds": elapsed,
+            "sample_seconds": stats.sample_sec,
+            "step_seconds": stats.step_sec,
+            "compact_seconds": stats.compact_sec,
+            "token_build_seconds": stats.token_build_sec,
+            "forward_seconds": stats.forward_sec,
             "forward_rows": stats.forward_rows,
             "forward_rows_per_second": stats.forward_rows / max(elapsed, 1e-9),
             "peak_collection_gib": stats.peak_device_bytes / (1024**3),
             "cache_rows_allocated": stats.cache_rows_allocated,
             "blocked_by_cache": stats.blocked_by_cache,
+            "profile": profile_text,
         }
         print(
             "ROLLOUT_WIDTH_RESULT "

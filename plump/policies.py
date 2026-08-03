@@ -10,7 +10,14 @@ from typing import Protocol, runtime_checkable
 from plump.cards import Card, Rank, Suit
 from plump.env import PlumpEnv
 from plump.rules import determine_trick_winner
-from plump.state import BidAction, Observation, Phase, PlayCardAction, Trick, TrickPlay
+from plump.state import (
+    Bid,
+    BidAction,
+    Observation,
+    Phase,
+    PlayCardAction,
+    Trick,
+)
 
 
 class ActionPolicy(Protocol):
@@ -64,34 +71,41 @@ class HeuristicPolicy:
 
     def act(self, env: PlumpEnv, *, rng: random.Random | None = None) -> BidAction | PlayCardAction:
         player = env.current_player()
-        observation = env.get_observation(player)
+        round_state = env.state.current_round
         if env.phase() == Phase.BIDDING:
             card_distribution = _rank_only_trick_distribution(
-                observation.my_hand,
+                round_state.current_hands[player],
                 num_players=env.config.num_players,
             )
             card_only_bid = _select_expected_score_bid(
                 card_distribution,
-                observation.legal_bids,
+                env.legal_bid_values(),
             )
             adjusted_distribution = _adjust_distribution_for_prior_bids(
                 card_distribution,
-                prior_bids=[bid.value for bid in observation.bids],
-                hand_size=observation.hand_size,
+                prior_bids=[bid.value for bid in round_state.bids],
+                hand_size=round_state.hand_size,
                 num_players=env.config.num_players,
                 strength=self.bid_signal_strength,
                 max_signal=self.max_bid_signal,
             )
             nearby_legal_bids = [
                 value
-                for value in observation.legal_bids
+                for value in env.legal_bid_values()
                 if abs(value - card_only_bid) <= 1
             ]
             bid = _select_expected_score_bid(adjusted_distribution, nearby_legal_bids)
             return BidAction(player, bid)
         if env.phase() == Phase.PLAYING:
-            card = _select_heuristic_play(
-                observation,
+            card = _select_heuristic_play_values(
+                player=player,
+                hand_size=round_state.hand_size,
+                remaining_tricks=len(round_state.current_hands[player]),
+                bids=round_state.bids,
+                tricks_won=round_state.tricks_won,
+                current_trick=env._current_trick(),
+                trump_suit=round_state.trump_suit,
+                legal_cards=env.legal_card_values(),
                 num_players=env.config.num_players,
             )
             return PlayCardAction(player, card)
@@ -223,42 +237,67 @@ def _select_heuristic_play(
 ) -> Card:
     """Play toward the bid, or disrupt opponents once our bid is lost."""
 
-    player = observation.player_id
-    bid_by_player = {bid.player: bid.value for bid in observation.bids}
+    return _select_heuristic_play_values(
+        player=observation.player_id,
+        hand_size=observation.hand_size,
+        remaining_tricks=len(observation.my_hand),
+        bids=observation.bids,
+        tricks_won=observation.tricks_won,
+        current_trick=observation.current_trick,
+        trump_suit=observation.trump_suit,
+        legal_cards=observation.legal_cards,
+        num_players=num_players,
+    )
+
+
+def _select_heuristic_play_values(
+    *,
+    player: int,
+    hand_size: int,
+    remaining_tricks: int,
+    bids: list[Bid],
+    tricks_won: dict[int, int],
+    current_trick: Trick | None,
+    trump_suit: Suit | None,
+    legal_cards: list[Card],
+    num_players: int,
+) -> Card:
+    """Observation-free implementation shared by live and rollout policies."""
+
+    bid_by_player = {bid.player: bid.value for bid in bids}
     own_bid = bid_by_player[player]
-    tricks_won = observation.tricks_won.get(player, 0)
-    remaining_tricks = len(observation.my_hand)
-    gone_over = tricks_won > own_bid
-    cannot_reach = tricks_won + remaining_tricks < own_bid
+    player_tricks_won = tricks_won.get(player, 0)
+    gone_over = player_tricks_won > own_bid
+    cannot_reach = player_tricks_won + remaining_tricks < own_bid
 
     if gone_over or cannot_reach:
         total_bid = sum(bid_by_player.values())
-        if gone_over and total_bid > observation.hand_size:
+        if gone_over and total_bid > hand_size:
             wants_trick = True
-        elif cannot_reach and total_bid < observation.hand_size:
+        elif cannot_reach and total_bid < hand_size:
             wants_trick = False
         else:
             current_winner = _current_trick_winner(
-                observation.current_trick,
-                observation.trump_suit,
+                current_trick,
+                trump_suit,
             )
             wants_trick = _lost_player_should_take(
                 player=player,
                 bids=bid_by_player,
-                tricks_won=observation.tricks_won,
+                tricks_won=tricks_won,
                 remaining_tricks=remaining_tricks,
                 current_winner=current_winner,
                 num_players=num_players,
-                total_round_tricks=observation.hand_size,
+                total_round_tricks=hand_size,
             )
     else:
-        wants_trick = tricks_won < own_bid
+        wants_trick = player_tricks_won < own_bid
 
     return _select_card_for_intent(
-        observation.legal_cards,
+        legal_cards,
         player=player,
-        current_trick=observation.current_trick,
-        trump_suit=observation.trump_suit,
+        current_trick=current_trick,
+        trump_suit=trump_suit,
         wants_trick=wants_trick,
     )
 
@@ -301,19 +340,27 @@ def _card_is_current_winner(
     current_trick: Trick | None,
     trump_suit: Suit | None,
 ) -> bool:
-    if current_trick is None:
+    if current_trick is None or not current_trick.plays:
         return True
-    led_suit = current_trick.led_suit
-    if not current_trick.plays:
-        led_suit = card.suit
-    trial = Trick(
-        trick_index=current_trick.trick_index,
-        leader=current_trick.leader,
-        led_suit=led_suit,
-        plays=list(current_trick.plays)
-        + [TrickPlay(player=player, card=card, position=len(current_trick.plays))],
+    if trump_suit is not None:
+        trump_ranks = [
+            int(play.card.rank)
+            for play in current_trick.plays
+            if play.card.suit == trump_suit
+        ]
+        if card.suit == trump_suit:
+            return not trump_ranks or int(card.rank) > max(trump_ranks)
+        if trump_ranks:
+            return False
+
+    if card.suit != current_trick.led_suit:
+        return False
+    best_led_rank = max(
+        int(play.card.rank)
+        for play in current_trick.plays
+        if play.card.suit == current_trick.led_suit
     )
-    return determine_trick_winner(trial, trump_suit) == player
+    return int(card.rank) > best_led_rank
 
 
 def _current_trick_winner(

@@ -83,6 +83,21 @@ class PlumpEnv:
     def clone(self) -> "PlumpEnv":
         """Copy mutable game state without recursively copying configuration."""
 
+        return self._clone(share_completed_tricks=False)
+
+    def clone_for_rollout(self) -> "PlumpEnv":
+        """Clone for forward-only search, sharing immutable completed tricks.
+
+        Normal game progression never mutates a completed trick. Rollout trees
+        can therefore share that historical prefix and copy only the open
+        trick, while the public ``clone`` retains full mutation isolation.
+        """
+
+        return self._clone(share_completed_tricks=True)
+
+    def _clone(self, *, share_completed_tricks: bool) -> "PlumpEnv":
+        """Implementation shared by isolated and forward-only clones."""
+
         clone = object.__new__(PlumpEnv)
         clone.config = self.config
         # __new__ rather than Random(): the constructor draws 32 bytes from the
@@ -114,16 +129,31 @@ class PlumpEnv:
                         )
                     },
                     bids=list(round_state.bids),
-                    tricks=[
-                        Trick(
-                            trick_index=trick.trick_index,
-                            leader=trick.leader,
-                            led_suit=trick.led_suit,
-                            plays=list(trick.plays),
-                            winner=trick.winner,
-                        )
-                        for trick in round_state.tricks
-                    ],
+                    tricks=(
+                        list(round_state.tricks[:-1])
+                        + [
+                            Trick(
+                                trick_index=round_state.tricks[-1].trick_index,
+                                leader=round_state.tricks[-1].leader,
+                                led_suit=round_state.tricks[-1].led_suit,
+                                plays=list(round_state.tricks[-1].plays),
+                                winner=round_state.tricks[-1].winner,
+                            )
+                        ]
+                        if share_completed_tricks
+                        and round_state.tricks
+                        and round_state.tricks[-1].winner is None
+                        else [
+                            Trick(
+                                trick_index=trick.trick_index,
+                                leader=trick.leader,
+                                led_suit=trick.led_suit,
+                                plays=list(trick.plays),
+                                winner=trick.winner,
+                            )
+                            for trick in round_state.tricks
+                        ]
+                    ),
                     tricks_won=dict(round_state.tricks_won),
                     round_scores=dict(round_state.round_scores),
                     cumulative_scores_after_round=dict(
@@ -158,11 +188,25 @@ class PlumpEnv:
     def legal_actions(self) -> list[Action]:
         if self.state.phase == Phase.BIDDING:
             player = self.current_player()
-            return [BidAction(player, bid) for bid in self._legal_bids_for_current_player()]
+            return [BidAction(player, bid) for bid in self.legal_bid_values()]
         if self.state.phase == Phase.PLAYING:
             player = self.current_player()
-            return [PlayCardAction(player, card) for card in self._legal_cards_for_current_player()]
+            return [PlayCardAction(player, card) for card in self.legal_card_values()]
         return []
+
+    def legal_bid_values(self) -> list[int]:
+        """Legal bid values without allocating ``BidAction`` wrappers."""
+
+        if self.state.phase != Phase.BIDDING:
+            return []
+        return self._legal_bids_for_current_player()
+
+    def legal_card_values(self) -> list[Card]:
+        """Legal cards without allocating ``PlayCardAction`` wrappers."""
+
+        if self.state.phase != Phase.PLAYING:
+            return []
+        return self._legal_cards_for_current_player()
 
     def step(self, action: Action) -> StepResult:
         """Validate and apply one bid or card-play action."""
@@ -173,6 +217,22 @@ class PlumpEnv:
             return self._step_bid(action)
         if isinstance(action, PlayCardAction):
             return self._step_play(action)
+        raise IllegalActionError(f"Unsupported action: {action!r}")
+
+    def step_unchecked(self, action: Action) -> StepResult:
+        """Apply an action already selected from this state's legal actions.
+
+        Search and rollout engines often enumerate legality immediately before
+        stepping. Revalidating there repeats the most expensive part of card
+        play (filtering and sorting the hand) for every branch. The ordinary
+        public ``step`` remains fully validating; this narrow fast path is for
+        trusted internal callers that already hold a legal action.
+        """
+
+        if isinstance(action, BidAction):
+            return self._step_bid(action, validate=False)
+        if isinstance(action, PlayCardAction):
+            return self._step_play(action, validate=False)
         raise IllegalActionError(f"Unsupported action: {action!r}")
 
     def get_observation(self, player_id: int) -> Observation:
@@ -252,14 +312,15 @@ class PlumpEnv:
             hand_size_schedule=list(self.config.hand_sizes),
         )
 
-    def _step_bid(self, action: BidAction) -> StepResult:
+    def _step_bid(self, action: BidAction, *, validate: bool = True) -> StepResult:
         round_state = self.state.current_round
-        if self.state.phase != Phase.BIDDING:
-            raise IllegalActionError("Bids are only legal during the bidding phase.")
-        if action.player != self.state.current_player:
-            raise IllegalActionError(f"Player {action.player} cannot bid; player {self.state.current_player} is to act.")
-        if action.bid not in self._legal_bids_for_current_player():
-            raise IllegalActionError(f"Illegal bid {action.bid} for player {action.player}.")
+        if validate:
+            if self.state.phase != Phase.BIDDING:
+                raise IllegalActionError("Bids are only legal during the bidding phase.")
+            if action.player != self.state.current_player:
+                raise IllegalActionError(f"Player {action.player} cannot bid; player {self.state.current_player} is to act.")
+            if action.bid not in self._legal_bids_for_current_player():
+                raise IllegalActionError(f"Illegal bid {action.bid} for player {action.player}.")
 
         position = len(round_state.bids)
         round_state.bids.append(Bid(action.player, action.bid, position))
@@ -283,23 +344,27 @@ class PlumpEnv:
 
         return self._result({player: 0 for player in range(self.config.num_players)})
 
-    def _step_play(self, action: PlayCardAction) -> StepResult:
+    def _step_play(
+        self, action: PlayCardAction, *, validate: bool = True
+    ) -> StepResult:
         round_state = self.state.current_round
-        if self.state.phase != Phase.PLAYING:
-            raise IllegalActionError("Cards are only legal during the playing phase.")
-        if action.player != self.state.current_player:
-            raise IllegalActionError(f"Player {action.player} cannot play; player {self.state.current_player} is to act.")
+        if validate:
+            if self.state.phase != Phase.PLAYING:
+                raise IllegalActionError("Cards are only legal during the playing phase.")
+            if action.player != self.state.current_player:
+                raise IllegalActionError(f"Player {action.player} cannot play; player {self.state.current_player} is to act.")
 
         hand = round_state.current_hands[action.player]
-        if action.card not in hand:
+        if validate and action.card not in hand:
             raise IllegalActionError(f"Player {action.player} does not hold {action.card}.")
 
         current_trick = self._current_trick()
         if current_trick is None:
             raise RuntimeError("Playing phase has no current trick.")
-        legal = legal_cards(hand, current_trick)
-        if action.card not in legal:
-            raise IllegalActionError(f"Illegal play {action.card}; player must follow suit when able.")
+        if validate:
+            legal = legal_cards(hand, current_trick)
+            if action.card not in legal:
+                raise IllegalActionError(f"Illegal play {action.card}; player must follow suit when able.")
 
         hand.remove(action.card)
         if not current_trick.plays:
@@ -332,7 +397,7 @@ class PlumpEnv:
                 )
             )
 
-            if len([trick for trick in round_state.tricks if trick.winner is not None]) == round_state.hand_size:
+            if current_trick.trick_index + 1 == round_state.hand_size:
                 rewards = self._finish_round()
                 info["round_ended"] = True
                 info["round_index"] = round_state.round_index
@@ -457,7 +522,19 @@ class PlumpEnv:
     def _legal_cards_for_current_player(self) -> list[Card]:
         round_state = self.state.current_round
         player = self.current_player()
-        return legal_cards(round_state.current_hands[player], self._current_trick())
+        hand = round_state.current_hands[player]
+        current_trick = self._current_trick()
+        # Hands are sorted when dealt and removal preserves that order. Keep
+        # the public helper defensive for arbitrary callers, but avoid sorting
+        # the environment's already-sorted hand at every rollout decision.
+        if (
+            current_trick is None
+            or not current_trick.plays
+            or current_trick.led_suit is None
+        ):
+            return list(hand)
+        suited = [card for card in hand if card.suit == current_trick.led_suit]
+        return suited if suited else list(hand)
 
     def _current_trick(self) -> Optional[Trick]:
         if not self.state.rounds:

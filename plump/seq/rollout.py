@@ -334,8 +334,12 @@ class SeqRolloutCollector:
         self.stats = SeqCollectionStats()
 
     def _sync(self) -> None:
-        if self.profile_sync and self.device.type == "mps":
+        if not self.profile_sync:
+            return
+        if self.device.type == "mps":
             torch.mps.synchronize()
+        elif self.device.type == "cuda":
+            torch.cuda.synchronize(self.device)
 
     def release_caches(self) -> None:
         """Drop the KV pools between collection and the training update.
@@ -360,6 +364,7 @@ class SeqRolloutCollector:
     # Schedule                                                            #
     # ------------------------------------------------------------------ #
 
+    @torch.inference_mode()
     def collect(
         self,
         league: Optional[SeqLeague],
@@ -658,7 +663,7 @@ class SeqRolloutCollector:
             # its training positions a second time.
             owned_from = 0 if split_group == 0 else self._split_position(tree)
             leaf = SeqLeaf(
-                env=deal_env.clone(),
+                env=deal_env.clone_for_rollout(),
                 tree=tree,
                 rng=leaf_rng,
                 slots=slots,
@@ -953,9 +958,9 @@ class SeqRolloutCollector:
                 pending.bid_logits if phase == Phase.BIDDING else pending.card_logits
             )
             if phase == Phase.BIDDING:
-                legal = [action.bid for action in leaf.env.legal_actions()]
+                legal = leaf.env.legal_bid_values()
             else:
-                legal = [card_id(action.card) for action in leaf.env.legal_actions()]
+                legal = [card_id(card) for card in leaf.env.legal_card_values()]
             masks[index, legal] = True
             legal_lists.append(legal)
         probs = masked_probabilities(logits, masks)
@@ -1142,7 +1147,7 @@ class SeqRolloutCollector:
             else:
                 child_slots = dict(leaf.slots)
             child = SeqLeaf(
-                env=leaf.env.clone(),
+                env=leaf.env.clone_for_rollout(),
                 tree=leaf.tree,
                 rng=child_rng,
                 history=None if leaf.history is None else leaf.history.copy(),
@@ -1301,7 +1306,7 @@ class SeqRolloutCollector:
             else:
                 child_slots = dict(leaf.slots)
             child = SeqLeaf(
-                env=leaf.env.clone(),
+                env=leaf.env.clone_for_rollout(),
                 tree=tree,
                 rng=child_rng,
                 history=None if leaf.history is None else leaf.history.copy(),
@@ -1523,13 +1528,14 @@ class SeqRolloutCollector:
     ) -> None:
         env = leaf.env
         log_start = len(env.state.event_log)
-        env.step(action)
+        env.step_unchecked(action)
         if not env.is_done() and self._is_forced_runout(env):
             while not env.is_done():
-                legal = env.legal_actions()
-                if len(legal) != 1:
+                player = env.current_player()
+                hand = env.state.current_round.current_hands[player]
+                if len(hand) != 1:
                     raise AssertionError("Forced run-out expects one legal action.")
-                env.step(legal[0])
+                env.step_unchecked(PlayCardAction(player, hand[0]))
         if env.is_done():
             self._finalize_leaf(leaf)
             return
@@ -1545,10 +1551,11 @@ class SeqRolloutCollector:
     def _is_forced_runout(env: PlumpEnv) -> bool:
         if env.phase() != Phase.PLAYING:
             return False
-        # max(map(len, ...)) rather than all(len(h) <= 1 for h in ...): this runs
-        # once per leaf per step, and the genexpr's frame setup costs more than
-        # the whole comparison over 3-5 hands.
-        return max(map(len, env.state.current_round.current_hands.values())) <= 1
+        # At a valid decision the next actor is one of the players with the
+        # most cards remaining. One lookup is therefore equivalent to scanning
+        # every hand, and this predicate runs once per leaf per public step.
+        player = env.current_player()
+        return len(env.state.current_round.current_hands[player]) <= 1
 
     def _finalize_leaf(self, leaf: SeqLeaf) -> None:
         scores = leaf.env.state.current_round.round_scores
@@ -1611,13 +1618,12 @@ class SeqRolloutCollector:
                 np.stack([tokens for _, _, tokens in entries])
             ).to(self.device)
             # Root rows were assigned densely in this same iteration order.
-            with torch.inference_mode():
-                if self.use_cache:
-                    output = models[policy_id].forward_prefill(
-                        tokens, self._caches[policy_id], None
-                    )
-                else:
-                    output = models[policy_id].forward_prefix(tokens)
+            if self.use_cache:
+                output = models[policy_id].forward_prefill(
+                    tokens, self._caches[policy_id], None
+                )
+            else:
+                output = models[policy_id].forward_prefix(tokens)
             self.stats.forward_rows += len(entries) * prefix_len
             bid_logits = output.bid_logits.float().cpu().numpy()
             card_logits = output.card_logits.float().cpu().numpy()
@@ -1662,7 +1668,8 @@ class SeqRolloutCollector:
         seats = np.arange(num_players)
 
         def tile(row: list[int], reference_player: int) -> np.ndarray:
-            block = np.tile(np.asarray(row, dtype=np.int64), (num_players, 1))
+            block = np.empty((num_players, TOKEN_WIDTH), dtype=np.int64)
+            block[:] = row
             block[:, SLOT_REL_PLAYER] = (reference_player - seats) % num_players
             return block
 
@@ -1767,16 +1774,15 @@ class SeqRolloutCollector:
             for policy_id, block_array in batches.items():
                 row_count = block_array.shape[0]
                 tokens = torch.from_numpy(block_array).to(self.device)
-                with torch.inference_mode():
-                    if self.use_cache:
-                        output = models[policy_id].forward_step(
-                            tokens,
-                            position + run_start,
-                            self._caches[policy_id],
-                            None,
-                        )
-                    else:
-                        output = models[policy_id].forward_prefix(tokens)
+                if self.use_cache:
+                    output = models[policy_id].forward_step(
+                        tokens,
+                        position + run_start,
+                        self._caches[policy_id],
+                        None,
+                    )
+                else:
+                    output = models[policy_id].forward_prefix(tokens)
                 self._sync()
                 self.stats.forward_rows += row_count * (
                     run_len if self.use_cache else position + run_start + 1
