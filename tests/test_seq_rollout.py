@@ -477,14 +477,71 @@ def test_hand_threshold_batches_short_deals_and_isolates_long_deals():
     )
 
 
-def test_historical_arm_off_produces_only_self_trees():
+def test_opponent_mode_off_produces_only_self_trees():
     cells = [GameScheduleCell(hand_size=4, num_players=3, games=2)]
     collector = options_collector(
-        cells=cells, options=RolloutOptions(historical_arm="off")
+        cells=cells, options=RolloutOptions()
     )
     trees = collect_trees(collector, seed=2)
     assert {tree.arm for tree in trees} == {"self"}
     assert len(trees) == 2
+
+
+def test_fixed_budget_heuristic_mix_uses_only_focal_model_rows():
+    cells = [
+        GameScheduleCell(hand_size=3, num_players=3, games=2),
+        GameScheduleCell(hand_size=4, num_players=3, games=2),
+    ]
+    mixed = options_collector(
+        cells=cells,
+        branch_rate=0.2,
+        options=RolloutOptions(
+            deals_per_batch=2,
+            opponent_mode="heuristic_then_historical",
+            opponent_fraction=0.5,
+            opponent_packing="concurrent",
+        ),
+    )
+    self_only = options_collector(
+        cells=cells,
+        branch_rate=0.2,
+        options=RolloutOptions(deals_per_batch=2),
+    )
+    self_only.model.load_state_dict(mixed.model.state_dict())
+
+    trees = collect_trees(mixed, seed=9)
+    self_trees = collect_trees(self_only, seed=9)
+
+    assert len(trees) == mixed.stats.games == 4
+    assert [tree.arm for tree in trees].count("self") == 2
+    assert [tree.arm for tree in trees].count("heuristic") == 2
+    assert not [tree for tree in trees if tree.arm == "historical"]
+    for tree in trees:
+        for leaf in tree.leaves:
+            expected_slots = tree.num_players if tree.arm == "self" else 1
+            assert len(leaf.slots) == expected_slots
+            if tree.arm == "heuristic":
+                assert set(leaf.slots) == {tree.focal}
+    assert mixed.stats.forward_rows < self_only.stats.forward_rows
+
+
+def test_opponent_fraction_apportions_the_whole_update_exactly():
+    cells = [
+        GameScheduleCell(hand_size=hand, num_players=players, games=2)
+        for players in (3, 4, 5)
+        for hand in range(3, 11)
+    ]
+    collector = options_collector(
+        cells=cells,
+        options=RolloutOptions(
+            opponent_mode="heuristic",
+            opponent_fraction=0.5,
+        ),
+    )
+    counts = collector._opponent_games_by_cell("heuristic")
+    assert sum(cell.games for cell in cells) == 48
+    assert sum(counts) == 24
+    assert counts == [1] * 24
 
 
 def test_bid_split_matches_unsplit_tree():
@@ -754,15 +811,15 @@ def test_deals_per_shape_makes_the_update_size_independent_of_table_size():
 
 
 def test_string_valued_modes_are_rejected_rather_than_silently_downgraded():
-    """historical_arm and bid_position_mode come from TOML as bare strings.
+    """Opponent and bid-position modes come from TOML as bare strings.
 
     Both Literals are erased at runtime and both dispatch sites fall through
     on an unknown value -- to no historical arm, and to a uniform seat.
     """
 
-    RolloutOptions(historical_arm="off", bid_position_mode="uniform").validate()
-    with pytest.raises(ValueError, match="historical_arm"):
-        RolloutOptions(historical_arm="none").validate()
+    RolloutOptions(bid_position_mode="uniform").validate()
+    with pytest.raises(ValueError, match="opponent_mode"):
+        RolloutOptions(opponent_mode="none").validate()
     with pytest.raises(ValueError, match="bid_position_mode"):
         RolloutOptions(bid_position_mode="random").validate()
 

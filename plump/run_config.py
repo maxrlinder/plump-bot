@@ -108,6 +108,29 @@ def resolve_training_config(raw: dict[str, Any]) -> ResolvedTraining:
     rollout_raw = raw["rollout"]
     run_raw = raw["run"]
     evaluation_raw = raw["evaluation"]
+    legacy_historical_arm = str(rollout_raw.get("historical_arm", "off"))
+    opponent_mode = str(
+        rollout_raw.get(
+            "opponent_mode",
+            "off" if legacy_historical_arm == "off" else "historical",
+        )
+    )
+    opponent_fraction = float(
+        rollout_raw.get(
+            "opponent_fraction",
+            0.0 if opponent_mode == "off" else 0.5,
+        )
+    )
+    opponent_packing = str(
+        rollout_raw.get(
+            "opponent_packing",
+            (
+                legacy_historical_arm
+                if legacy_historical_arm in ("concurrent", "sequential")
+                else "concurrent"
+            ),
+        )
+    )
     training = SeqTrainingConfig(
         schedule_cells=cells,
         player_counts=player_counts,
@@ -129,7 +152,9 @@ def resolve_training_config(raw: dict[str, Any]) -> ResolvedTraining:
             ),
             cache_budget_gb=float(rollout_raw["cache_budget_gb"]),
             max_cache_rows=int(rollout_raw["max_cache_rows"]),
-            historical_arm=str(rollout_raw["historical_arm"]),
+            opponent_mode=opponent_mode,
+            opponent_fraction=opponent_fraction,
+            opponent_packing=opponent_packing,
             bid_position_mode=str(rollout_raw.get("bid_position_mode", "cycle")),
         ),
         learning_rate=float(training_raw["learning_rate"]),
@@ -188,6 +213,29 @@ def resolve_training_config(raw: dict[str, Any]) -> ResolvedTraining:
     )
     model.validate()
     training.validate()
+    action_mode = str(evaluation_raw.get("training_action_mode", "argmax"))
+    if action_mode not in ("argmax", "sample"):
+        raise ValueError(
+            "evaluation.training_action_mode must be 'argmax' or 'sample'."
+        )
+    if (
+        training.rollout.opponent_mode == "heuristic_then_historical"
+        and action_mode != "sample"
+    ):
+        raise ValueError(
+            "heuristic_then_historical requires "
+            "evaluation.training_action_mode='sample'."
+        )
+    if (
+        training.rollout.opponent_mode == "heuristic_then_historical"
+        and int(evaluation_raw["every"]) <= 0
+    ):
+        raise ValueError(
+            "heuristic_then_historical requires evaluation.every > 0."
+        )
+    consecutive = int(evaluation_raw.get("opponent_switch_consecutive", 1))
+    if consecutive < 1:
+        raise ValueError("evaluation.opponent_switch_consecutive must be >= 1.")
     return ResolvedTraining(raw=raw, model=model, training=training)
 
 

@@ -90,15 +90,16 @@ def render_dashboard(
         axes[1, 0],
         iteration,
         rows,
-        left=(
-            ("value_rmse", "learned value"),
-            ("value_zero_rmse", "predict zero"),
+        left=(("value_rmse", "value RMSE"),),
+        right=(
+            ("value_correlation", "value correlation"),
+            ("loss_suit", "suit-presence loss"),
+            ("loss_trick", "trick-count loss"),
         ),
-        right=(("value_correlation", "value correlation"),),
         smooth=smooth,
-        title="Decision-state value quality",
-        left_label="RMSE (reward points)",
-        right_label="weighted correlation",
+        title="Value and belief learning",
+        left_label="value RMSE (reward points)",
+        right_label="correlation / belief loss",
         omit_zero=True,
     )
     _lines(
@@ -127,16 +128,11 @@ def render_dashboard(
         title="Policy entropy",
         ylabel="nats",
     )
-    _dual_lines(
+    _gradient_norms(
         axes[2, 0],
         iteration,
         rows,
-        left=(("positions_per_sec", "positions/s"),),
-        right=(("forward_rows_per_sec", "forward rows/s"),),
         smooth=smooth,
-        title="Throughput",
-        left_label="positions/s",
-        right_label="forward rows/s",
     )
     _lines(
         axes[2, 1],
@@ -166,7 +162,7 @@ def render_dashboard(
         right_label="device GB",
     )
     _mark_cache_cap_hits(axes[2, 2], iteration, rows)
-    _mark_policy_events(axes[0, 2], iteration, rows)
+    _mark_policy_rollbacks(axes[0, 2], iteration, rows)
 
     for ax in axes.flat:
         ax.set_xlabel("Iteration")
@@ -593,6 +589,43 @@ def _trust_region(
         _no_data(ax)
 
 
+def _gradient_norms(
+    ax,
+    iteration: np.ndarray,
+    rows: list[dict[str, str]],
+    *,
+    smooth: int,
+) -> None:
+    """Show the separately clipped parameter-group norms before clipping."""
+
+    handles = _plot_fields(
+        ax,
+        iteration,
+        rows,
+        (
+            ("core_grad_norm", "core/shared pre-clip"),
+            ("auxiliary_grad_norm", "value/belief heads pre-clip"),
+        ),
+        smooth=smooth,
+        omit_zero=True,
+    )
+    ax.set_title("Pre-clip gradient norms")
+    if handles:
+        ax.set_yscale("log")
+        ax.set_ylabel("L2 norm (log scale)")
+        ax.axhline(
+            1.0,
+            linewidth=1.0,
+            linestyle=":",
+            color="#666666",
+            alpha=0.8,
+            label="clip threshold (1.0)",
+        )
+        ax.legend(handles=[*handles, ax.lines[-1]], fontsize=8, loc="best")
+    else:
+        _no_data(ax)
+
+
 def _current_kl_caps(metrics_path: Path) -> tuple[float, float] | None:
     """Read current run caps for dashboard reference lines, if available."""
 
@@ -707,29 +740,24 @@ def _mark_cache_cap_hits(
     )
 
 
-def _mark_policy_events(
+def _mark_policy_rollbacks(
     ax,
     iteration: np.ndarray,
     rows: list[dict[str, str]],
 ) -> None:
     kl = _series(rows, "policy_kl")
-    backtracks = _series(rows, "backtracks")
     rollbacks = _series(rows, "rolled_back")
     finite = np.isfinite(iteration) & np.isfinite(kl)
-    for values, marker, color in (
-        (backtracks, "v", "#ff7f0e"),
-        (rollbacks, "x", "#d62728"),
-    ):
-        active = finite & np.isfinite(values) & (values > 0)
-        if active.any():
-            ax.scatter(
-                iteration[active],
-                kl[active],
-                marker=marker,
-                s=38,
-                color=color,
-                zorder=5,
-            )
+    active = finite & np.isfinite(rollbacks) & (rollbacks > 0)
+    if active.any():
+        ax.scatter(
+            iteration[active],
+            kl[active],
+            marker="x",
+            s=38,
+            color="#d62728",
+            zorder=5,
+        )
 
 
 def _number(row: dict[str, str], key: str) -> float:

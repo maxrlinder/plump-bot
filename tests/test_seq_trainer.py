@@ -18,7 +18,7 @@ from plump.seq.config import (
     SeqModelConfig,
     SeqTrainingConfig,
 )
-from plump.seq.model import SeqPlumpModel
+from plump.seq.model import STRUCTURED_CARD_OUTPUT_KEYS, SeqPlumpModel
 from plump.seq.policy import SeqLeague, SeqModelPolicy
 from plump.seq.tokens import IGNORE_LABEL
 from plump.seq.trainer import (
@@ -532,6 +532,55 @@ def test_legacy_flat_optimizer_group_migrates_without_losing_state(tmp_path):
     assert len(fresh.optimizer.state) == len(trainer.optimizer.state)
 
 
+def test_pre_structured_card_output_checkpoint_migrates_model_and_adam(tmp_path):
+    trainer = make_trainer(lr_warmup_updates=0)
+    trees, _ = trainer.collect()
+    trainer.update(trees)
+    current = tmp_path / "current.pt"
+    trainer.save_checkpoint(current)
+    payload = torch.load(current, map_location="cpu", weights_only=False)
+
+    for key in STRUCTURED_CARD_OUTPUT_KEYS:
+        del payload["model_state_dict"][key]
+    payload.pop("model_format_version")
+
+    optimizer = payload["optimizer_state_dict"]
+    new_output_ids = optimizer["param_groups"][0]["params"][-2:]
+    old_core_ids = optimizer["param_groups"][0]["params"][:-2]
+    current_auxiliary_ids = optimizer["param_groups"][1]["params"]
+    old_auxiliary_ids = [
+        parameter_id - 2 for parameter_id in current_auxiliary_ids
+    ]
+    identifier_map = {
+        **{parameter_id: parameter_id for parameter_id in old_core_ids},
+        **dict(zip(current_auxiliary_ids, old_auxiliary_ids)),
+    }
+    optimizer["state"] = {
+        identifier_map[parameter_id]: state
+        for parameter_id, state in optimizer["state"].items()
+        if parameter_id not in new_output_ids
+    }
+    optimizer["param_groups"][0]["params"] = old_core_ids
+    optimizer["param_groups"][1]["params"] = old_auxiliary_ids
+
+    old = tmp_path / "old.pt"
+    torch.save(payload, old)
+    fresh = make_trainer(lr_warmup_updates=0)
+    fresh.load_checkpoint(old)
+
+    assert torch.count_nonzero(fresh.model.card_rank_output_embedding.weight) == 0
+    assert torch.count_nonzero(fresh.model.card_suit_output_embedding.weight) == 0
+    for key, expected in payload["model_state_dict"].items():
+        torch.testing.assert_close(fresh.model.state_dict()[key], expected)
+    assert len(fresh.optimizer.state) == len(optimizer["state"])
+    assert fresh.model.card_rank_output_embedding.weight not in fresh.optimizer.state
+    assert fresh.model.card_suit_output_embedding.weight not in fresh.optimizer.state
+
+    policy = SeqModelPolicy.from_checkpoint(old, device="cpu")
+    assert torch.count_nonzero(policy.model.card_rank_output_embedding.weight) == 0
+    assert torch.count_nonzero(policy.model.card_suit_output_embedding.weight) == 0
+
+
 def test_inclusion_exponent_changes_the_gradient_it_does_not_break_it():
     """1/q is the difference between having NeuRD and thinking you have it."""
 
@@ -586,7 +635,11 @@ def test_league_uses_only_the_newest_half_of_training_history():
 def test_league_opponents_join_collection(tmp_path):
     trainer = make_trainer(
         tmp_path,
-        rollout=RolloutOptions(historical_arm="concurrent"),
+        rollout=RolloutOptions(
+            opponent_mode="historical",
+            opponent_fraction=0.5,
+            opponent_packing="concurrent",
+        ),
     )
     trees, _ = trainer.collect()
     trainer.update(trees)
@@ -599,6 +652,50 @@ def test_league_opponents_join_collection(tmp_path):
     historical_tree = next(tree for tree in trees if tree.arm == "historical")
     assert self_tree.initial_hands != historical_tree.initial_hands
     assert summary.reward_historical != 0.0 or summary.reward_self != 0.0
+
+
+def test_heuristic_gate_switches_after_consecutive_wins_and_roundtrips(tmp_path):
+    trainer = make_trainer(
+        rollout=RolloutOptions(
+            opponent_mode="heuristic_then_historical",
+            opponent_fraction=0.5,
+        )
+    )
+    assert trainer.opponent_phase == "heuristic"
+    assert not trainer.record_heuristic_evaluation(
+        0.2, threshold=0.0, consecutive=4
+    )
+    assert not trainer.record_heuristic_evaluation(
+        0.1, threshold=0.0, consecutive=4
+    )
+    assert trainer.heuristic_eval_win_streak == 2
+    assert not trainer.record_heuristic_evaluation(
+        -0.01, threshold=0.0, consecutive=4
+    )
+    assert trainer.heuristic_eval_win_streak == 0
+    for _ in range(3):
+        assert not trainer.record_heuristic_evaluation(
+            0.01, threshold=0.0, consecutive=4
+        )
+    assert trainer.record_heuristic_evaluation(
+        0.01, threshold=0.0, consecutive=4
+    )
+    assert trainer.opponent_phase == "historical"
+
+    checkpoint = tmp_path / "curriculum.pt"
+    trainer.save_checkpoint(checkpoint)
+    fresh = make_trainer(
+        rollout=RolloutOptions(
+            opponent_mode="heuristic_then_historical",
+            opponent_fraction=0.5,
+        )
+    )
+    fresh.load_checkpoint(checkpoint)
+    assert fresh.opponent_phase == "historical"
+    assert fresh.heuristic_eval_win_streak == 4
+    assert not fresh.record_heuristic_evaluation(
+        1.0, threshold=0.0, consecutive=4
+    )
 
 
 @pytest.mark.parametrize(
@@ -745,5 +842,11 @@ def test_unbranched_rows_produce_a_nonzero_policy_gradient():
             total += terms.get("policy", 0.0)
 
     head_grad = trainer.model.card_head.weight.grad
+    rank_grad = trainer.model.card_rank_output_embedding.weight.grad
+    suit_grad = trainer.model.card_suit_output_embedding.weight.grad
     assert head_grad is not None
+    assert rank_grad is not None
+    assert suit_grad is not None
     assert _torch.linalg.vector_norm(head_grad).item() > 0.0
+    assert _torch.linalg.vector_norm(rank_grad).item() > 0.0
+    assert _torch.linalg.vector_norm(suit_grad).item() > 0.0

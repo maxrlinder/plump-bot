@@ -44,6 +44,9 @@ METRIC_COLUMNS = (
     "collect_sec",
     "update_sec",
     "trees",
+    "trees_self",
+    "trees_heuristic",
+    "trees_historical",
     "leaves",
     "decisions",
     "policy_rows",
@@ -58,7 +61,10 @@ METRIC_COLUMNS = (
     "reward_focal",
     "reward_non_focal",
     "reward_self",
+    "reward_heuristic",
     "reward_historical",
+    "opponent_phase",
+    "heuristic_eval_win_streak",
     "spine_entropy",
     "loss_policy",
     "loss_value",
@@ -128,6 +134,35 @@ def build_parser() -> argparse.ArgumentParser:
         "--from-checkpoint",
         type=Path,
         help="start a new run from a compatible schema-v6 checkpoint",
+    )
+    train.add_argument(
+        "--reset-league",
+        action="store_true",
+        help=(
+            "when forking, omit historical checkpoint references from the new "
+            "run so it is self-contained"
+        ),
+    )
+    train.add_argument(
+        "--prepare-only",
+        action="store_true",
+        help=(
+            "create/fork and checkpoint a new run without entering its "
+            "training loop"
+        ),
+    )
+    train.add_argument(
+        "--reconfigure",
+        action="store_true",
+        help=(
+            "explicitly adopt config/--set changes when resuming an existing "
+            "run, writing a resume checkpoint and config audit record first"
+        ),
+    )
+    train.add_argument(
+        "--reconfigure-reason",
+        default="CLI-authorized training reconfiguration",
+        help="reason stored in the run metadata with --reconfigure",
     )
     train.set_defaults(handler=train_command)
 
@@ -234,24 +269,44 @@ def train_command(args: argparse.Namespace) -> int:
     existed = run.exists
     if existed and args.from_checkpoint is not None:
         raise ValueError("--from-checkpoint requires a new run name.")
+    if not existed and args.reconfigure:
+        raise ValueError("--reconfigure requires an existing run.")
+    if args.reset_league and args.from_checkpoint is None:
+        raise ValueError("--reset-league requires --from-checkpoint.")
+    if args.prepare_only and existed:
+        raise ValueError("--prepare-only requires a new run name.")
 
     with run.acquire_lock():
+        reconfiguration_differences: list[str] = []
         if existed:
             recorded_raw = run.recorded_config()
             differences = config_diff(recorded_raw, requested.raw)
-            if differences:
+            if differences and not args.reconfigure:
                 rendered = "\n  ".join(differences)
                 raise ValueError(
                     "Run configuration differs from the recorded config:\n  " + rendered
                 )
-            resolved = resolve_training_config(recorded_raw)
+            if differences:
+                reconfiguration_differences = differences
+                resolved = requested
+            else:
+                resolved = resolve_training_config(recorded_raw)
         else:
             run.create(requested.raw, args.invocation)
             resolved = requested
 
         device_value = str(resolved.run["device"])
+        # Preparing a CUDA run on a laptop only needs to rewrite portable CPU
+        # checkpoint state. Keep the recorded runtime device untouched while
+        # avoiding any attempt to instantiate unavailable accelerator storage.
         device = (
-            str(best_seq_device()) if device_value in {"", "auto"} else device_value
+            "cpu"
+            if args.prepare_only
+            else (
+                str(best_seq_device())
+                if device_value in {"", "auto"}
+                else device_value
+            )
         )
         seed = int(resolved.training.seed)
         torch.manual_seed(seed)
@@ -265,7 +320,10 @@ def train_command(args: argparse.Namespace) -> int:
         trainer.resolved_config = resolved.raw
         if existed:
             checkpoint = run.resolve_checkpoint("latest")
-            trainer.load_checkpoint(checkpoint)
+            trainer.load_checkpoint(
+                checkpoint,
+                allow_training_config_mismatch=bool(reconfiguration_differences),
+            )
             discarded = _truncate_metrics_after(run.metrics, trainer.iteration)
             _emit(
                 run,
@@ -278,6 +336,32 @@ def train_command(args: argparse.Namespace) -> int:
                     f"Discarded {discarded} metric rows newer than the "
                     "resumed checkpoint.",
                 )
+            if reconfiguration_differences:
+                stem = f"resume_{trainer.iteration:06d}_reconfigured"
+                resume = run.checkpoints / f"{stem}.pt"
+                suffix = 1
+                while resume.exists():
+                    resume = run.checkpoints / f"{stem}_{suffix}.pt"
+                    suffix += 1
+                trainer.save_checkpoint(resume)
+                # Point latest at the config-compatible checkpoint before
+                # replacing config.toml. If interrupted between these atomic
+                # writes, rerunning --reconfigure is always recoverable.
+                run.record_latest(resume, trainer.iteration)
+                archive = run.record_reconfiguration(
+                    resolved.raw,
+                    iteration=trainer.iteration,
+                    reason=str(args.reconfigure_reason),
+                    changes=reconfiguration_differences,
+                    source_checkpoint=checkpoint,
+                    resume_checkpoint=resume,
+                )
+                _emit(
+                    run,
+                    f"Reconfigured {run.name} at iteration {trainer.iteration}; "
+                    f"previous config archived as {archive.name} and "
+                    f"resume checkpoint saved as {resume.name}.",
+                )
         elif args.from_checkpoint is not None:
             source = args.from_checkpoint.expanduser().resolve()
             trainer.load_checkpoint(
@@ -285,6 +369,8 @@ def train_command(args: argparse.Namespace) -> int:
                 allow_training_config_mismatch=True,
             )
             trainer.resolved_config = resolved.raw
+            if args.reset_league:
+                trainer.league.clear()
             imported = run.interval_checkpoint(trainer.iteration)
             trainer.save_checkpoint(imported)
             run.record_latest(imported, trainer.iteration)
@@ -305,6 +391,20 @@ def train_command(args: argparse.Namespace) -> int:
             _emit(run, f"Saved reproducible initial checkpoint {initial.name}.")
 
         _ensure_metrics_header(run.metrics)
+        if args.prepare_only:
+            run.update_metadata(
+                status="prepared",
+                prepared_iteration=trainer.iteration,
+                target_device=device_value,
+                seed=seed,
+                target_iterations=int(resolved.run["iterations"]),
+            )
+            _emit(
+                run,
+                f"Prepared {run.name} at iteration {trainer.iteration}; "
+                "training was not started.",
+            )
+            return 0
         elapsed_before = _recorded_elapsed(run.metrics)
         run.update_metadata(
             status="running",
@@ -314,6 +414,13 @@ def train_command(args: argparse.Namespace) -> int:
         )
 
         evaluation = resolved.evaluation
+        training_action_mode = str(
+            evaluation.get("training_action_mode", "argmax")
+        )
+        switch_reward = float(evaluation.get("opponent_switch_reward", 0.0))
+        switch_consecutive = int(
+            evaluation.get("opponent_switch_consecutive", 1)
+        )
         eval_bank = DealBank.generate(
             player_counts=resolved.training.player_counts,
             hand_sizes=tuple(
@@ -336,6 +443,7 @@ def train_command(args: argparse.Namespace) -> int:
 
             eval_reward: float | None = None
             eval_bid_hit: float | None = None
+            opponent_switched = False
             if (
                 int(evaluation["every"]) > 0
                 and iteration % int(evaluation["every"]) == 0
@@ -343,17 +451,23 @@ def train_command(args: argparse.Namespace) -> int:
                 policy = SeqModelPolicy(
                     trainer.model,
                     device=device,
-                    greedy=True,
+                    greedy=training_action_mode == "argmax",
                     name="candidate",
                 )
                 report = evaluate_policy(
                     policy,
                     heuristic,
                     eval_bank,
+                    seed=int(evaluation.get("action_seed", 17)),
                     batch_size=int(evaluation["batch_size"]),
                 )
                 eval_reward = report.macro_relative_reward
                 eval_bid_hit = report.macro_bid_hit_rate
+                opponent_switched = trainer.record_heuristic_evaluation(
+                    eval_reward,
+                    threshold=switch_reward,
+                    consecutive=switch_consecutive,
+                )
                 trainer.model.eval()
                 best = run.best_metric()
                 if best is None or eval_reward > best:
@@ -418,7 +532,17 @@ def train_command(args: argparse.Namespace) -> int:
             if stats.rolled_back:
                 message += " ROLLBACK"
             if eval_reward is not None:
-                message += f" | eval {eval_reward:.4f}"
+                message += (
+                    f" | eval-{training_action_mode} {eval_reward:.4f}"
+                    f" | anchor {trainer.opponent_phase}"
+                )
+                if trainer.opponent_phase == "heuristic":
+                    message += (
+                        f" gate {trainer.heuristic_eval_win_streak}/"
+                        f"{switch_consecutive}"
+                    )
+            if opponent_switched:
+                message += " | HEURISTIC GATE PASSED; SWITCHED TO HISTORY"
             _emit(run, message)
 
         run.update_metadata(
@@ -617,6 +741,9 @@ def _metric_row(
         "collect_sec": summary.collect_sec,
         "update_sec": stats.update_sec,
         "trees": summary.trees,
+        "trees_self": summary.trees_self,
+        "trees_heuristic": summary.trees_heuristic,
+        "trees_historical": summary.trees_historical,
         "leaves": summary.leaves,
         "decisions": summary.decisions,
         "policy_rows": stats.policy_rows,
@@ -631,7 +758,10 @@ def _metric_row(
         "reward_focal": summary.reward_focal,
         "reward_non_focal": summary.reward_non_focal,
         "reward_self": summary.reward_self,
+        "reward_heuristic": summary.reward_heuristic,
         "reward_historical": summary.reward_historical,
+        "opponent_phase": trainer.opponent_phase,
+        "heuristic_eval_win_streak": trainer.heuristic_eval_win_streak,
         "spine_entropy": summary.spine_entropy,
         "loss_policy": stats.loss_policy,
         "loss_value": stats.loss_value,
@@ -691,6 +821,12 @@ def _ensure_metrics_header(path: Path) -> None:
                 "bid_hit_non_focal",
                 "reward_focal",
                 "reward_non_focal",
+                "trees_self",
+                "trees_heuristic",
+                "trees_historical",
+                "reward_heuristic",
+                "opponent_phase",
+                "heuristic_eval_win_streak",
                 "loss_value_zero",
                 "auxiliary_learning_rate",
                 "value_rmse",

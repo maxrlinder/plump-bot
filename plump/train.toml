@@ -35,7 +35,7 @@ play_mode = "stratified"
 play_top_k = 4
 learning_rate = 0.0002
 core_learning_rate = 0.000025
-auxiliary_learning_rate = 0.0002
+auxiliary_learning_rate = 0.000025
 lr_warmup_updates = 100
 epochs = 1
 microbatch_positions = 16384
@@ -79,7 +79,13 @@ cache_budget_gb = 10.0
 auto_deals_per_batch = false
 deals_per_batch = 2
 parallel_deals_max_hand_size = 5
-historical_arm = "off"
+# Keep the update at 48 deals: 24 current-policy self-play and 24 anchor games.
+# The anchor begins as the deterministic heuristic. After the sampled policy's
+# mean evaluation reward is positive four evaluations in a row, it switches
+# permanently to eligible recent checkpoints from the historical league.
+opponent_mode = "heuristic_then_historical"
+opponent_fraction = 0.5
+opponent_packing = "concurrent"
 kv_dtype = "fp16"
 bid_position_mode = "uniform"
 
@@ -87,4 +93,8 @@ bid_position_mode = "uniform"
 every = 100
 deals = 6
 seed = 1234
+action_seed = 17
 batch_size = 256
+training_action_mode = "sample"
+opponent_switch_reward = 0.0
+opponent_switch_consecutive = 4

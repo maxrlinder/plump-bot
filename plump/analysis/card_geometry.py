@@ -2,8 +2,8 @@
 """Schema-v6 card-representation geometry and probe report.
 
 The input representation is the card-dependent part of a PLAY event token:
-exact-card + rank + suit slot embeddings. The action representation is a row
-in ``model.card_head.weight``. Scalar output biases are excluded.
+exact-card + rank + suit slot embeddings. The action representation is its
+effective exact-card + rank + suit output row. Scalar biases are excluded.
 """
 
 from __future__ import annotations
@@ -29,7 +29,6 @@ from .card_pca import (
     SUIT_STYLE,
     action_head_card_vectors,
     cards,
-    exact_card_input_vectors,
     input_card_vectors,
     save_pca,
 )
@@ -42,10 +41,10 @@ def card_labels() -> list[str]:
 def normalized_card_vectors(model, source: str) -> np.ndarray:
     if source == "input":
         vectors = input_card_vectors(model)
-    elif source == "exact-input":
-        vectors = exact_card_input_vectors(model)
-    else:
+    elif source == "action-head":
         vectors = action_head_card_vectors(model)
+    else:
+        raise ValueError(f"Unknown card representation: {source}")
     vectors = vectors.numpy().astype(np.float64)
     norms = np.linalg.norm(vectors, axis=1, keepdims=True)
     return vectors / np.maximum(norms, np.finfo(vectors.dtype).eps)
@@ -408,7 +407,11 @@ def analyze_checkpoint(
 
     for source, title, prefix in (
         ("input", "Effective card input embedding", "card_input_embedding"),
-        ("action-head", "Card action-head", "card_action_head"),
+        (
+            "action-head",
+            "Effective card action output embedding",
+            "card_action_head",
+        ),
     ):
         pca_output = output_dir / f"{prefix}_pca.png"
         projection = save_pca(
@@ -436,23 +439,9 @@ def analyze_checkpoint(
             dpi,
         )
         plot_umap(vectors, title, label, outputs["umap"], seed, dpi)
-        # The effective input representation deliberately adds explicit rank
-        # and suit embeddings, making its cosine blocks mostly a schema
-        # property. For the input heatmap, isolate the 52 exact-card rows so
-        # the visible structure reflects learning by card identity alone.
-        heatmap_vectors = (
-            normalized_card_vectors(policy.model, "exact-input")
-            if source == "input"
-            else vectors
-        )
-        heatmap_title = (
-            "Exact-card slot input embedding"
-            if source == "input"
-            else title
-        )
         plot_similarity_heatmap(
-            heatmap_vectors,
-            heatmap_title,
+            vectors,
+            title,
             label,
             outputs["heatmap"],
             dpi,
@@ -476,11 +465,7 @@ def analyze_checkpoint(
             "suit_probe_p": suit_p,
             "rank_probe_mae": rank_mae,
             "rank_probe_p": rank_p,
-            "cosine_heatmap_representation": (
-                "exact-card-only"
-                if source == "input"
-                else "action-head"
-            ),
+            "cosine_heatmap_representation": "exact-card+rank+suit",
         }
 
     atomic_write_json(output_dir / "report.json", report)

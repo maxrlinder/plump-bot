@@ -29,7 +29,14 @@ NEXT_BID = 1
 NEXT_PLAY = 2
 NUM_NEXT_PHASES = 3
 
-TOKEN_WIDTH = 12
+BASE_TOKEN_WIDTH = 12
+# Every TRICK_WIN row carries the observer's cards still in hand. These are
+# card ids, not independent categorical slots: the model gathers the existing
+# exact-card + rank + suit input directions for each id and adds their sum to
+# that row. Other token types fill all ten positions with CARD_NA.
+REMAINING_HAND_SLOTS = 10
+SLOT_REMAINING_HAND_START = BASE_TOKEN_WIDTH
+TOKEN_WIDTH = BASE_TOKEN_WIDTH + REMAINING_HAND_SLOTS
 
 # Slot indices into a token row.
 SLOT_TYPE = 0
@@ -195,7 +202,7 @@ class SeqModelConfig:
         return self.max_players
 
     @property
-    def slot_vocab_sizes(self) -> tuple[int, ...]:
+    def base_slot_vocab_sizes(self) -> tuple[int, ...]:
         return (
             NUM_TOKEN_TYPES,
             self.max_players + 1,
@@ -211,11 +218,26 @@ class SeqModelConfig:
             NUM_NEXT_PHASES,
         )
 
+    @property
+    def slot_vocab_sizes(self) -> tuple[int, ...]:
+        """Vocabulary limits for every serialized token column.
+
+        The final ten columns all reuse the original card/rank/suit embedding
+        rows at model time, but exposing their card-id vocabulary here keeps
+        schema validation and tooling uniform across the complete token row.
+        """
+
+        return self.base_slot_vocab_sizes + (
+            (NUM_CARDS + 1,) * REMAINING_HAND_SLOTS
+        )
+
     def validate(self) -> None:
         if self.d_model % self.n_heads != 0:
             raise ValueError("d_model must be divisible by n_heads.")
         if self.kv_heads > self.n_heads or self.n_heads % self.kv_heads != 0:
             raise ValueError("n_kv_heads must divide n_heads.")
+        if len(self.base_slot_vocab_sizes) != BASE_TOKEN_WIDTH:
+            raise AssertionError("Base slot vocabulary must match base token width.")
         if len(self.slot_vocab_sizes) != TOKEN_WIDTH:
             raise AssertionError("Slot vocabulary must match TOKEN_WIDTH.")
 
@@ -377,14 +399,19 @@ class BranchBudgetConfig:
         return rate
 
 
-HistoricalArmMode = Literal["off", "concurrent", "sequential"]
+OpponentMode = Literal[
+    "off",
+    "heuristic",
+    "historical",
+    "heuristic_then_historical",
+]
+OpponentPackingMode = Literal["concurrent", "sequential"]
 BidPositionMode = Literal["uniform", "cycle"]
-# Literals are erased at runtime and both of these come straight from a TOML
-# string, so validate() checks membership against these instead. An unknown
-# historical_arm falls through _collect_deal_batch's dispatch to "no arm at
-# all" and an unknown bid_position_mode falls through to a uniform seat --
-# either way a typo trains a different run than the preset names.
-HISTORICAL_ARM_MODES: frozenset[str] = frozenset(get_args(HistoricalArmMode))
+# Literals are erased at runtime and these values come straight from TOML, so
+# validate them explicitly rather than letting a typo silently select a
+# different rollout population or packing strategy.
+OPPONENT_MODES: frozenset[str] = frozenset(get_args(OpponentMode))
+OPPONENT_PACKING_MODES: frozenset[str] = frozenset(get_args(OpponentPackingMode))
 BID_POSITION_MODES: frozenset[str] = frozenset(get_args(BidPositionMode))
 
 
@@ -423,11 +450,17 @@ class RolloutOptions:
     # position unbiased but lumpy at these deal counts.
     bid_position_mode: BidPositionMode = "cycle"
 
-    # off      -> self-play only, no historical opponents.
-    # Historical games always use a fresh independent deal and focal seat:
-    # concurrent -> share the self games' wave loop for wider forwards.
-    # sequential -> use a separate wave loop to minimize peak memory.
-    historical_arm: HistoricalArmMode = "off"
+    # A fixed fraction of the ordinary schedule is assigned to an anchor
+    # opponent; it does not add games on top. ``heuristic_then_historical``
+    # starts with the deterministic heuristic and lets the trainer switch the
+    # anchor to eligible league snapshots after its configured evaluation
+    # gate. The remaining games are ordinary current-policy self-play.
+    opponent_mode: OpponentMode = "off"
+    opponent_fraction: float = 0.0
+    # Same-shape self and anchor games can share a wave for wider forwards.
+    # Sequential packing lowers peak live tree width. Heuristic opponents use
+    # no model/cache rows in either mode; only the focal policy is encoded.
+    opponent_packing: OpponentPackingMode = "concurrent"
 
     # Memory the KV cache may occupy. Rows are derived from this and the
     # model's actual bytes-per-row, because that cost scales with depth and
@@ -471,10 +504,25 @@ class RolloutOptions:
             raise ValueError("max_deals_per_batch must be >= 1.")
         if not 0.0 <= self.auto_deals_headroom < 1.0:
             raise ValueError("auto_deals_headroom must be in [0, 1).")
-        if self.historical_arm not in HISTORICAL_ARM_MODES:
+        if self.opponent_mode not in OPPONENT_MODES:
             raise ValueError(
-                f"Unknown historical_arm {self.historical_arm!r}; expected one "
-                f"of {sorted(HISTORICAL_ARM_MODES)}."
+                f"Unknown opponent_mode {self.opponent_mode!r}; expected one "
+                f"of {sorted(OPPONENT_MODES)}."
+            )
+        if self.opponent_packing not in OPPONENT_PACKING_MODES:
+            raise ValueError(
+                f"Unknown opponent_packing {self.opponent_packing!r}; expected "
+                f"one of {sorted(OPPONENT_PACKING_MODES)}."
+            )
+        if not 0.0 <= self.opponent_fraction <= 1.0:
+            raise ValueError("opponent_fraction must be in [0, 1].")
+        if self.opponent_mode == "off" and self.opponent_fraction != 0.0:
+            raise ValueError(
+                "opponent_fraction must be 0 when opponent_mode is 'off'."
+            )
+        if self.opponent_mode != "off" and self.opponent_fraction <= 0.0:
+            raise ValueError(
+                "opponent_fraction must be > 0 when an opponent is enabled."
             )
         if self.bid_position_mode not in BID_POSITION_MODES:
             raise ValueError(
@@ -486,6 +534,12 @@ class RolloutOptions:
         if hand_size < self.bid_split_min_hand_size:
             return 1
         return self.bid_split_groups
+
+    @property
+    def initial_opponent(self) -> str:
+        if self.opponent_mode == "heuristic_then_historical":
+            return "heuristic"
+        return self.opponent_mode
 
 
 @dataclass(frozen=True)

@@ -91,6 +91,12 @@ def test_analysis_loads_seq_checkpoint_and_scopes_every_output(
     assert all(path.is_file() for path in report_paths)
     assert (
         report["representations"]["input"]["cosine_heatmap_representation"]
-        == "exact-card-only"
+        == "exact-card+rank+suit"
+    )
+    assert (
+        report["representations"]["action-head"][
+            "cosine_heatmap_representation"
+        ]
+        == "exact-card+rank+suit"
     )
     assert (output / "report.json").is_file()

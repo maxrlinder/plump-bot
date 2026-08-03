@@ -45,6 +45,7 @@ class RunDirectory:
         self.dashboard = self.path / "dashboard.png"
         self.evaluation_dashboard = self.path / "dashboard-eval.png"
         self.config = self.path / "config.toml"
+        self.config_history = self.path / "config-history"
         self.metadata = self.path / "metadata.json"
         self.train_log = self.path / "train.log"
         self.lock = self.path / "run.lock"
@@ -82,6 +83,49 @@ class RunDirectory:
         data.update(updates)
         data["updated_at"] = _timestamp()
         atomic_write_json(self.metadata, data)
+
+    def record_reconfiguration(
+        self,
+        raw_config: dict[str, Any],
+        *,
+        iteration: int,
+        reason: str,
+        changes: list[str],
+        source_checkpoint: Path,
+        resume_checkpoint: Path,
+    ) -> Path:
+        """Atomically adopt a new config while retaining an audit trail."""
+
+        self.config_history.mkdir(parents=True, exist_ok=True)
+        archive = self.config_history / f"iter_{iteration:06d}.toml"
+        suffix = 1
+        while archive.exists():
+            archive = self.config_history / f"iter_{iteration:06d}_{suffix}.toml"
+            suffix += 1
+        atomic_write_text(archive, self.config.read_text())
+        atomic_write_text(self.config, dump_toml(raw_config))
+
+        metadata: dict[str, Any] = {}
+        if self.metadata.exists():
+            metadata = json.loads(self.metadata.read_text())
+        migrations = list(metadata.get("config_migrations", []))
+        migrations.append(
+            {
+                "at": _timestamp(),
+                "iteration": iteration,
+                "reason": reason,
+                "changes": changes,
+                "previous_config": str(archive.relative_to(self.path)),
+                "source_checkpoint": source_checkpoint.name,
+                "source_sha256": file_sha256(source_checkpoint),
+                "resume_checkpoint": resume_checkpoint.name,
+                "resume_sha256": file_sha256(resume_checkpoint),
+            }
+        )
+        metadata["config_migrations"] = migrations
+        metadata["updated_at"] = _timestamp()
+        atomic_write_json(self.metadata, metadata)
+        return archive
 
     def interval_checkpoint(self, iteration: int) -> Path:
         return self.checkpoints / f"iter_{iteration:06d}.pt"

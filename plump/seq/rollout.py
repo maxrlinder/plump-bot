@@ -23,6 +23,7 @@ import numpy as np
 import torch
 
 from plump.env import PlumpEnv
+from plump.policies import HeuristicPolicy
 from plump.rewards import compute_relative_rewards
 from plump.rounds import RoundSpec, round_game_config
 from plump.state import BidAction, EventType, GameEvent, Phase, PlayCardAction
@@ -48,12 +49,14 @@ from .tokens import (
     emits_token,
     event_token,
     prefix_tokens,
+    set_remaining_hand,
     turn_token,
     turn_token_for_phase,
 )
 
 CURRENT = "current"
 OPPONENT = "opponent"
+HEURISTIC = "heuristic"
 
 
 def _rng_from_state(state) -> random.Random:
@@ -212,7 +215,7 @@ class SeqLeaf:
 
 @dataclass
 class SeqTree:
-    arm: str  # "self" | "historical"
+    arm: str  # "self" | "heuristic" | "historical"
     focal: int
     num_players: int
     hand_size: int
@@ -311,6 +314,7 @@ class SeqRolloutCollector:
             torch.float16 if train_config.kv_dtype == "fp16" else torch.float32
         )
         self.use_cache = train_config.use_kv_cache
+        self.heuristic = HeuristicPolicy()
         self._total_leaves = 0
         # Widest tree seen per (policy, game shape): what the pool is sized
         # from. Survives across collect() calls so training only pays the
@@ -362,13 +366,29 @@ class SeqRolloutCollector:
         rng: random.Random,
         *,
         iteration: int = 0,
+        opponent_phase: str | None = None,
     ) -> list[SeqTree]:
         started = time.perf_counter()
+        if self.device.type == "cuda":
+            torch.cuda.reset_peak_memory_stats(self.device)
         self.stats = SeqCollectionStats()
         trees: list[SeqTree] = []
         self._total_leaves = 0
-        for cell in self.train.schedule_cells:
-            remaining = cell.games
+        phase = opponent_phase or self.train.rollout.initial_opponent
+        opponent_counts = self._opponent_games_by_cell(phase)
+        for cell_index, cell in enumerate(self.train.schedule_cells):
+            opponent_games = opponent_counts[cell_index]
+            arms = [
+                (
+                    phase
+                    if ((index + 1) * opponent_games) // cell.games
+                    > (index * opponent_games) // cell.games
+                    else "self"
+                )
+                for index in range(cell.games)
+            ]
+            remaining = len(arms)
+            offset = 0
             # Resolve the shape once per cell rather than once per batch: with
             # deals_per_batch > 1 a per-batch draw gives the player mix only a
             # handful of samples per update, so the realized mix wobbles for no
@@ -381,7 +401,12 @@ class SeqRolloutCollector:
                 deals = min(remaining, self._deals_for(cell, num_players, remaining))
                 batch_started = time.perf_counter()
                 batch = self._collect_deal_batch(
-                    cell, league, rng, deals, num_players, iteration
+                    cell,
+                    league,
+                    rng,
+                    arms[offset : offset + deals],
+                    num_players,
+                    iteration,
                 )
                 cost.sec += time.perf_counter() - batch_started
                 cost.deals += deals
@@ -389,6 +414,7 @@ class SeqRolloutCollector:
                 cost.leaves += sum(tree.leaf_total for tree in batch)
                 trees.extend(batch)
                 remaining -= deals
+                offset += deals
         self.stats.collect_sec = time.perf_counter() - started
         self.stats.bytes_per_row = self._bytes_per_row()
         self.stats.cache_rows_allocated = sum(
@@ -398,6 +424,25 @@ class SeqRolloutCollector:
         self.stats.leaves = sum(tree.leaf_total for tree in trees)
         self.stats.decisions = sum(tree.decision_total for tree in trees)
         return trees
+
+    def _opponent_games_by_cell(self, phase: str) -> list[int]:
+        """Largest-remainder split of the fixed schedule into self/anchor games."""
+
+        cells = self.train.schedule_cells
+        if phase == "off" or self.train.rollout.opponent_fraction <= 0.0:
+            return [0] * len(cells)
+        fraction = self.train.rollout.opponent_fraction
+        quotas = [cell.games * fraction for cell in cells]
+        counts = [math.floor(quota) for quota in quotas]
+        target = round(sum(cell.games for cell in cells) * fraction)
+        remaining = target - sum(counts)
+        order = sorted(
+            range(len(cells)),
+            key=lambda index: (-(quotas[index] - counts[index]), index),
+        )
+        for index in order[:remaining]:
+            counts[index] += 1
+        return counts
 
     def _sample_players(self, cell: GameScheduleCell, rng: random.Random) -> int:
         if cell.num_players is not None:
@@ -482,11 +527,11 @@ class SeqRolloutCollector:
         cell: GameScheduleCell,
         league: Optional[SeqLeague],
         rng: random.Random,
-        deals: int,
+        arms: list[str],
         num_players: int,
         iteration: int,
     ) -> list[SeqTree]:
-        """Build the trees for ``deals`` deals and run their wave loops.
+        """Build the requested fixed-budget arms and run their wave loops.
 
         Every deal in a batch shares (players, hand size) so that all leaves
         advance in lockstep and simply widen each forward.
@@ -497,9 +542,8 @@ class SeqRolloutCollector:
 
         models: dict[str, SeqPlumpModel] = {CURRENT: self.model}
         opponent_id: Optional[str] = None
-        historical = options.historical_arm
         if (
-            historical != "off"
+            "historical" in arms
             and league is not None
             and league.has_snapshots(iteration)
         ):
@@ -507,8 +551,11 @@ class SeqRolloutCollector:
                 rng, iteration=iteration, device=self.device
             )
             models[OPPONENT] = opponent_policy.model
-        else:
-            historical = "off"
+        elif "historical" in arms:
+            # A brand-new run may request historical play before its first
+            # checkpoint is eligible. Preserve the fixed game budget and fall
+            # back to self-play until the league is populated.
+            arms = ["self" if arm == "historical" else arm for arm in arms]
 
         # A unit is one wave loop: a list of (tree, env, crn_state).
         concurrent_unit: list[tuple[SeqTree, PlumpEnv, tuple]] = []
@@ -531,24 +578,15 @@ class SeqRolloutCollector:
             trees.append(tree)
             return tree
 
-        for _ in range(deals):
+        for arm in arms:
             env, start, seed = self._new_deal(num_players, hand_size, rng)
             focal = self._focal_seat(cell, num_players, rng, start)
             crn = random.Random(seed ^ 0x5EED).getstate()
-            concurrent_unit.append((make_tree("self", env, start, focal), env, crn))
-            if historical != "off":
-                h_env, h_start, h_seed = self._new_deal(num_players, hand_size, rng)
-                h_crn = random.Random(h_seed ^ 0x5EED).getstate()
-                h_focal = self._focal_seat(cell, num_players, rng, h_start)
-                historical_entry = (
-                    make_tree("historical", h_env, h_start, h_focal),
-                    h_env,
-                    h_crn,
-                )
-                if historical == "concurrent":
-                    concurrent_unit.append(historical_entry)
-                else:
-                    sequential_units.append([historical_entry])
+            entry = (make_tree(arm, env, start, focal), env, crn)
+            if arm != "self" and options.opponent_packing == "sequential":
+                sequential_units.append([entry])
+            else:
+                concurrent_unit.append(entry)
 
         splits = options.splits_for(hand_size)
         for unit in (concurrent_unit, *sequential_units):
@@ -561,7 +599,7 @@ class SeqRolloutCollector:
                 for _, resolver, _ in leaf.segments:
                     if resolver is not None and resolver.backed_value is None:
                         raise AssertionError("Unresolved branch record after game.")
-        self.stats.games += deals
+        self.stats.games += len(arms)
         return trees
 
     def _run_wave_loop(
@@ -585,16 +623,21 @@ class SeqRolloutCollector:
         self._split_plan = (split_group, split_total) if split_total > 1 else None
         self._split_done = set()
 
-        arms = 2 if OPPONENT in models else 1
-        self._loop_row_cap = self._policy_row_cap(arms)
-        shape = (num_players, hand_size, len(unit), split_total)
+        policy_count = 2 if OPPONENT in models else 1
+        self._loop_row_cap = self._policy_row_cap(policy_count)
+        arm_signature = tuple(
+            (arm, sum(tree.arm == arm for tree in trees))
+            for arm in ("self", "heuristic", "historical")
+            if any(tree.arm == arm for tree in trees)
+        )
+        shape = (num_players, hand_size, len(unit), split_total, arm_signature)
         if self.use_cache:
             for policy_id in (CURRENT, OPPONENT):
                 if policy_id != CURRENT and policy_id not in models:
                     continue
                 self._ensure_cache(
                     policy_id,
-                    self._cache_capacity(policy_id, shape, arms),
+                    self._cache_capacity(policy_id, shape, policy_count),
                     self.model_config.max_seq_len,
                     self._loop_row_cap,
                 )
@@ -607,6 +650,8 @@ class SeqRolloutCollector:
             slots = {}
             for seat in range(num_players):
                 policy_id = self._policy_for_seat(tree.arm, tree.focal, seat)
+                if policy_id is None:
+                    continue
                 slots[seat] = (policy_id, row_counters[policy_id])
                 row_counters[policy_id] += 1
             # Later split passes replay the shared prefix but must not claim
@@ -642,17 +687,65 @@ class SeqRolloutCollector:
             alive_next: list[SeqLeaf] = []
             phase = alive[0].env.phase()
             t0 = time.perf_counter()
-            probs_batch, sampled_batch, legal_lists = self._batch_sample(alive, phase)
+            neural_alive = [
+                leaf
+                for leaf in alive
+                if not (
+                    leaf.tree.arm == HEURISTIC
+                    and leaf.env.current_player() != leaf.tree.focal
+                )
+            ]
+            if neural_alive:
+                probs_batch, sampled_batch, legal_lists = self._batch_sample(
+                    neural_alive, phase
+                )
+                sampled_by_leaf = {
+                    id(leaf): (
+                        probs_batch[index],
+                        int(sampled_batch[index]),
+                        legal_lists[index],
+                    )
+                    for index, leaf in enumerate(neural_alive)
+                }
+            else:
+                sampled_by_leaf = {}
+            heuristic_alive = [
+                leaf
+                for leaf in alive
+                if leaf.tree.arm == HEURISTIC
+                and leaf.env.current_player() != leaf.tree.focal
+            ]
+            heuristic_actions = dict(
+                zip(
+                    map(id, heuristic_alive),
+                    self.heuristic.act_many(
+                        [leaf.env for leaf in heuristic_alive],
+                        rngs=[leaf.rng for leaf in heuristic_alive],
+                    ),
+                )
+            )
             t1 = time.perf_counter()
             branch_copies: dict[str, tuple[list[int], list[int]]] = {}
             layer_branched: set[int] = set()
-            for index, leaf in enumerate(alive):
+            for leaf in alive:
+                if (
+                    leaf.tree.arm == HEURISTIC
+                    and leaf.env.current_player() != leaf.tree.focal
+                ):
+                    self._advance_leaf(
+                        leaf,
+                        heuristic_actions[id(leaf)],
+                        appends,
+                        alive_next,
+                    )
+                    continue
+                probs, sampled, legal = sampled_by_leaf[id(leaf)]
                 self._decide_and_step(
                     leaf,
                     phase,
-                    probs_batch[index],
-                    int(sampled_batch[index]),
-                    legal_lists[index],
+                    probs,
+                    sampled,
+                    legal,
                     position,
                     appends,
                     alive_next,
@@ -687,6 +780,11 @@ class SeqRolloutCollector:
                     self.stats.peak_device_bytes,
                     torch.mps.driver_allocated_memory(),
                 )
+            elif self.device.type == "cuda":
+                self.stats.peak_device_bytes = max(
+                    self.stats.peak_device_bytes,
+                    torch.cuda.max_memory_allocated(self.device),
+                )
             self.stats.sample_sec += t1 - t0
             self.stats.step_sec += t2 - t1
             self.stats.compact_sec += t3 - t2
@@ -720,10 +818,16 @@ class SeqRolloutCollector:
         bid_index = (tree.focal - tree.bidding_start_player) % tree.num_players
         return self.model_config.bid_token_position(tree.hand_size, bid_index)
 
-    def _policy_for_seat(self, arm: str, focal: int, seat: int) -> str:
+    def _policy_for_seat(
+        self, arm: str, focal: int, seat: int
+    ) -> str | None:
         if seat == focal or arm == "self":
             return CURRENT
-        return OPPONENT
+        if arm == "historical":
+            return OPPONENT
+        if arm == HEURISTIC:
+            return None
+        raise ValueError(f"Unknown rollout arm {arm!r}.")
 
     def _ensure_cache(
         self, policy_id: str, capacity: int, max_len: int, max_capacity: int
@@ -794,7 +898,7 @@ class SeqRolloutCollector:
         options = self.train.rollout
         if options.cache_preallocate:
             return self._policy_row_cap(arms)
-        _, hand_size, _, _ = shape
+        hand_size = shape[1]
         worst_case = self._policy_row_cap(arms)
         observed = self._peak_rows.get((policy_id, shape))
         if observed is None:
@@ -1486,7 +1590,7 @@ class SeqRolloutCollector:
                     ),
                     dtype=np.int64,
                 )
-            for seat in range(tree.num_players):
+            for seat in leaf.slots:
                 rows = np.asarray(
                     prefix_tokens(
                         self.model_config,
@@ -1562,14 +1666,19 @@ class SeqRolloutCollector:
             block[:, SLOT_REL_PLAYER] = (reference_player - seats) % num_players
             return block
 
-        blocks = [
-            tile(
+        blocks = []
+        for event in events:
+            if not emits_token(config, event):
+                continue
+            block = tile(
                 event_token(config, event, 0, num_players, hand_size),
                 event.player,
             )
-            for event in events
-            if emits_token(config, event)
-        ]
+            if event.type == EventType.TRICK_WIN:
+                current_hands = leaf.env.state.current_round.current_hands
+                for seat in range(num_players):
+                    set_remaining_hand(block[seat], current_hands[seat], hand_size)
+            blocks.append(block)
         next_actor = leaf.env.state.current_player
         bidding = leaf.env.phase() == Phase.BIDDING
         next_phase = NEXT_BID if bidding else NEXT_PLAY
@@ -1629,7 +1738,6 @@ class SeqRolloutCollector:
             token_blocks: dict[str, list[np.ndarray]] = {}
             captures: dict[str, list[tuple[int, int, SeqLeaf]]] = {}
             for leaf, blocks in blocks_by_leaf:
-                num_players = leaf.tree.num_players
                 for step in range(run_len):
                     offset = run_start + step
                     last = offset == event_count - 1
@@ -1637,8 +1745,7 @@ class SeqRolloutCollector:
                     next_actor = leaf.env.state.current_player if last else None
                     if leaf.history is not None:
                         leaf.history[:, position + offset] = block
-                    for seat in range(num_players):
-                        policy_id, row = leaf.slots[seat]
+                    for seat, (policy_id, row) in leaf.slots.items():
                         if self.use_cache:
                             token_arrays[policy_id][row, step] = block[seat]
                             capture_row = row

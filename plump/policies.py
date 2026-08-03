@@ -100,6 +100,25 @@ class HeuristicPolicy:
     def reset_counters(self) -> None:
         self.forward_passes = 0
 
+    def act_many(
+        self,
+        envs: list[PlumpEnv],
+        *,
+        rngs: list[random.Random] | None = None,
+    ) -> list[BidAction | PlayCardAction]:
+        """Batch interface used by rollout/evaluation wave schedulers.
+
+        The heuristic is CPU-only and deterministic, but accepting a whole
+        wave lets callers keep it inside their existing batched orchestration
+        without allocating model/cache rows for heuristic seats.
+        """
+
+        if rngs is None:
+            rngs = [None] * len(envs)
+        if len(rngs) != len(envs):
+            raise ValueError("rngs must match envs.")
+        return [self.act(env, rng=rng) for env, rng in zip(envs, rngs)]
+
 
 def _rank_only_trick_distribution(
     hand: list[Card],

@@ -22,6 +22,7 @@ from plump.cards import Card, Rank, Suit, sort_cards
 from plump.state import EventType, GameEvent
 
 from .config import (
+    BASE_TOKEN_WIDTH,
     NEXT_BID,
     NEXT_NONE,
     NEXT_PLAY,
@@ -35,6 +36,7 @@ from .config import (
     SLOT_POS_IN_TRICK,
     SLOT_RANK,
     SLOT_REL_PLAYER,
+    SLOT_REMAINING_HAND_START,
     SLOT_SUIT,
     SLOT_TRICK,
     SLOT_TYPE,
@@ -93,6 +95,9 @@ def _base_token_template(
     token[SLOT_NUM_PLAYERS] = num_players
     token[SLOT_NEXT_ACTOR] = config.player_na_id
     token[SLOT_NEXT_PHASE] = NEXT_NONE
+    token[SLOT_REMAINING_HAND_START:] = [config.card_na_id] * (
+        TOKEN_WIDTH - BASE_TOKEN_WIDTH
+    )
     return tuple(token)
 
 
@@ -190,6 +195,7 @@ def event_token(
     observer: int,
     num_players: int,
     hand_size: int,
+    remaining_hand: list[Card] | None = None,
 ) -> list[int] | None:
     """Map one public game event to a token row; None for non-token events."""
 
@@ -216,8 +222,28 @@ def event_token(
         token[SLOT_TYPE] = TOKEN_TRICK_WIN
         token[SLOT_REL_PLAYER] = _relative(event.player, observer, num_players)
         token[SLOT_TRICK] = event.trick_index
+        if remaining_hand is not None:
+            set_remaining_hand(token, remaining_hand, hand_size)
         return token
     return None
+
+
+def set_remaining_hand(
+    token: list[int] | np.ndarray,
+    cards: list[Card],
+    hand_size: int,
+) -> None:
+    """Write a sorted observer-visible hand into a TRICK_WIN token."""
+
+    if len(cards) > hand_size:
+        raise ValueError("Remaining hand cannot exceed the round hand size.")
+    values = [card_id(card) for card in sort_cards(cards)]
+    width = TOKEN_WIDTH - SLOT_REMAINING_HAND_START
+    if len(values) > width:
+        raise ValueError("Remaining hand exceeds the token's card capacity.")
+    token[SLOT_REMAINING_HAND_START:] = values + [NUM_CARDS] * (
+        width - len(values)
+    )
 
 
 def prefix_tokens(
@@ -332,6 +358,16 @@ def build_seat_tokens(
         tokens = prefix_tokens(
             config, observer, num_players, hand_size, initial_hand, bidding_start_player
         )
+    remaining_by_event: dict[int, list[Card]] = {}
+    remaining = set(initial_hand)
+    for index, event in enumerate(round_events):
+        if event.type == EventType.PLAY and event.player == observer:
+            if event.card not in remaining:
+                raise ValueError("Observer played a card absent from its hand.")
+            remaining.remove(event.card)
+        elif event.type == EventType.TRICK_WIN:
+            remaining_by_event[index] = list(remaining)
+
     for offset, (kind, index) in enumerate(token_layout(config, round_events)):
         if prefix_len + offset < skip:
             tokens.append(None)      # comes from token_prefix; never read below
@@ -342,7 +378,14 @@ def build_seat_tokens(
                 _turn_row(config, event, observer, num_players, hand_size)
             )
             continue
-        token = event_token(config, event, observer, num_players, hand_size)
+        token = event_token(
+            config,
+            event,
+            observer,
+            num_players,
+            hand_size,
+            remaining_hand=remaining_by_event.get(index),
+        )
         if token is None:
             raise AssertionError("Layout emitted an event with no token.")
         tokens.append(token)

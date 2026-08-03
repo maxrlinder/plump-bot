@@ -79,7 +79,8 @@ def measure(args, model, device, num_players: int, hand_size: int, rate: float) 
         branch_budget=BranchBudgetConfig(branch_rate=rate),
         rollout=RolloutOptions(
             deals_per_batch=args.deals,
-            historical_arm="off",
+            opponent_mode="off",
+            opponent_fraction=0.0,
             cache_budget_gb=args.cache_budget_gb,
             max_cache_rows=args.max_cache_rows,
         ),

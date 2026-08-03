@@ -46,10 +46,20 @@ from .config import (
     SeqModelConfig,
     SeqTrainingConfig,
 )
-from .model import SeqPlumpModel
+from .model import (
+    SEQ_MODEL_FORMAT_VERSION,
+    STRUCTURED_CARD_OUTPUT_KEYS,
+    SeqPlumpModel,
+    load_seq_model_state_dict,
+)
 from .policy import SeqLeague, best_seq_device
 from .rollout import SeqRolloutCollector, SeqTree
-from .tokens import IGNORE_LABEL, build_replay_arrays, build_seat_tokens
+from .tokens import (
+    IGNORE_LABEL,
+    TOKEN_WIDTH,
+    build_replay_arrays,
+    build_seat_tokens,
+)
 
 _AUXILIARY_HEAD_PREFIXES = (
     "value_head.",
@@ -147,6 +157,9 @@ class SeqUpdateStats:
 @dataclass
 class SeqRolloutSummary:
     trees: int = 0
+    trees_self: int = 0
+    trees_heuristic: int = 0
+    trees_historical: int = 0
     leaves: int = 0
     decisions: int = 0
     # Legacy pooled accuracy across every seat, retained for old metrics and
@@ -159,6 +172,7 @@ class SeqRolloutSummary:
     reward_focal: float = 0.0
     reward_non_focal: float = 0.0
     reward_self: float = 0.0
+    reward_heuristic: float = 0.0
     reward_historical: float = 0.0
     spine_entropy: float = 0.0
     collect_sec: float = 0.0
@@ -168,6 +182,9 @@ class SeqRolloutSummary:
 def summarize_trees(trees: list[SeqTree], collector_stats) -> SeqRolloutSummary:
     summary = SeqRolloutSummary(
         trees=len(trees),
+        trees_self=sum(tree.arm == "self" for tree in trees),
+        trees_heuristic=sum(tree.arm == "heuristic" for tree in trees),
+        trees_historical=sum(tree.arm == "historical" for tree in trees),
         leaves=sum(tree.leaf_total for tree in trees),
         decisions=sum(tree.decision_total for tree in trees),
         collect_sec=collector_stats.collect_sec,
@@ -218,6 +235,9 @@ def summarize_trees(trees: list[SeqTree], collector_stats) -> SeqRolloutSummary:
         float(np.mean(non_focal_rewards)) if non_focal_rewards else 0.0
     )
     summary.reward_self = float(np.mean(rewards["self"])) if rewards["self"] else 0.0
+    summary.reward_heuristic = (
+        float(np.mean(rewards["heuristic"])) if rewards["heuristic"] else 0.0
+    )
     summary.reward_historical = (
         float(np.mean(rewards["historical"])) if rewards["historical"] else 0.0
     )
@@ -453,7 +473,7 @@ def build_training_groups(
     for (num_players, hand_size), entries in sorted(by_shape.items()):
         length = model_config.seq_len(num_players, hand_size)
         batch = len(entries)
-        tokens = np.zeros((batch, length, 12), dtype=np.int64)
+        tokens = np.zeros((batch, length, TOKEN_WIDTH), dtype=np.int64)
         owned = np.zeros((batch, length), dtype=bool)
         value_targets = np.zeros((batch, length), dtype=np.float32)
         value_weight = np.zeros((batch, length), dtype=np.float32)
@@ -654,6 +674,8 @@ class SeqTrainer:
             train_config.league_max_snapshots, train_config.league_min_iteration
         )
         self.iteration = 0
+        self.opponent_phase = train_config.rollout.initial_opponent
+        self.heuristic_eval_win_streak = 0
         # Optimizer steps actually kept (rolled-back steps do not count), for
         # the LR warmup ramp. Persisted in checkpoints.
         self.optimizer_steps = 0
@@ -668,8 +690,39 @@ class SeqTrainer:
 
     def collect(self) -> tuple[list[SeqTree], SeqRolloutSummary]:
         self.model.eval()
-        trees = self.collector.collect(self.league, self.rng, iteration=self.iteration)
+        trees = self.collector.collect(
+            self.league,
+            self.rng,
+            iteration=self.iteration,
+            opponent_phase=self.opponent_phase,
+        )
         return trees, summarize_trees(trees, self.collector.stats)
+
+    def record_heuristic_evaluation(
+        self,
+        reward: float,
+        *,
+        threshold: float,
+        consecutive: int,
+    ) -> bool:
+        """Advance the persisted heuristic-to-history curriculum gate.
+
+        Returns True exactly once, when this evaluation switches subsequent
+        anchor rollouts to historical league opponents.
+        """
+
+        if (
+            self.train.rollout.opponent_mode != "heuristic_then_historical"
+            or self.opponent_phase != "heuristic"
+        ):
+            return False
+        self.heuristic_eval_win_streak = (
+            self.heuristic_eval_win_streak + 1 if reward > threshold else 0
+        )
+        if self.heuristic_eval_win_streak < consecutive:
+            return False
+        self.opponent_phase = "historical"
+        return True
 
     # -------------------------------------------------------------- #
     # Update                                                          #
@@ -722,6 +775,7 @@ class SeqTrainer:
             for attempt in range(attempts):
                 if attempt:
                     self.model.load_state_dict(snapshot[0])
+                    self.model.clear_card_output_cache()
                     self.optimizer.load_state_dict(snapshot[1])
                 scale = self.train.kl_backtrack_factor**attempt
                 for group, nominal_lr in zip(self.optimizer.param_groups, nominal_lrs):
@@ -773,6 +827,7 @@ class SeqTrainer:
                 group["lr"] = nominal_lr
             if not accepted:
                 self.model.load_state_dict(snapshot[0])
+                self.model.clear_card_output_cache()
                 self.optimizer.load_state_dict(snapshot[1])
                 stats.rolled_back = True
                 stats.step_scale = 0.0
@@ -1315,6 +1370,7 @@ class SeqTrainer:
         payload = {
             "checkpoint_format_version": 1,
             "schema_version": SEQ_SCHEMA_VERSION,
+            "model_format_version": SEQ_MODEL_FORMAT_VERSION,
             "iteration": self.iteration,
             "optimizer_steps": self.optimizer_steps,
             "model_state_dict": self.model.state_dict(),
@@ -1329,6 +1385,10 @@ class SeqTrainer:
             "numpy_rng_state": np.random.get_state(),
             "torch_rng_state": torch.get_rng_state(),
             "collector_state": collector_state,
+            "opponent_curriculum_state": {
+                "phase": self.opponent_phase,
+                "heuristic_eval_win_streak": self.heuristic_eval_win_streak,
+            },
         }
         if torch.cuda.is_available():
             payload["cuda_rng_state"] = torch.cuda.get_rng_state_all()
@@ -1372,6 +1432,12 @@ class SeqTrainer:
             raise ValueError("Checkpoint format mismatch.")
         if payload.get("schema_version") != SEQ_SCHEMA_VERSION:
             raise ValueError("Checkpoint schema mismatch.")
+        model_format = int(payload.get("model_format_version", 1))
+        if model_format > SEQ_MODEL_FORMAT_VERSION:
+            raise ValueError(
+                "Checkpoint model format is newer than this code: "
+                f"{model_format} > {SEQ_MODEL_FORMAT_VERSION}."
+            )
         if payload.get("rules_fingerprint") != rules_fingerprint():
             raise ValueError("Checkpoint rules fingerprint mismatch.")
         if payload.get("model_config") != asdict(self.model.config):
@@ -1392,15 +1458,28 @@ class SeqTrainer:
             if allow_training_config_mismatch
             else checkpoint_config
         )
-        self.model.load_state_dict(payload["model_state_dict"])
-        optimizer_state = payload["optimizer_state_dict"]
-        if len(optimizer_state["param_groups"]) == 1 and len(
-            self.optimizer.param_groups
-        ) == 2:
-            optimizer_state = self._split_legacy_optimizer_group(optimizer_state)
+        structured_output_migrated = load_seq_model_state_dict(
+            self.model,
+            payload["model_state_dict"],
+        )
+        optimizer_state = self._migrate_optimizer_state(
+            payload["optimizer_state_dict"],
+            structured_output_migrated=structured_output_migrated,
+        )
         self.optimizer.load_state_dict(optimizer_state)
         self.iteration = int(payload.get("iteration", 0))
         self.optimizer_steps = int(payload.get("optimizer_steps", 0))
+        curriculum = payload.get("opponent_curriculum_state", {})
+        if self.train.rollout.opponent_mode == "heuristic_then_historical":
+            phase = curriculum.get("phase")
+            if phase in ("heuristic", "historical"):
+                self.opponent_phase = phase
+                self.heuristic_eval_win_streak = int(
+                    curriculum.get("heuristic_eval_win_streak", 0)
+                )
+        else:
+            self.opponent_phase = self.train.rollout.initial_opponent
+            self.heuristic_eval_win_streak = 0
         self.league.snapshots.clear()
         self.league._policies.clear()
         for snapshot_id, snap_path, iteration in payload.get("league", []):
@@ -1435,33 +1514,97 @@ class SeqTrainer:
         self.collector._rows_per_deal = dict(collector_state.get("rows_per_deal", {}))
         self.collector._seat_cursor = dict(collector_state.get("seat_cursor", {}))
 
-    def _split_legacy_optimizer_group(self, state: dict) -> dict:
-        """Migrate the former flat Adam group without changing its tensors.
+    def _migrate_optimizer_state(
+        self,
+        state: dict,
+        *,
+        structured_output_migrated: bool,
+    ) -> dict:
+        """Map old Adam parameter IDs onto the current two-group optimizer.
 
-        The model registers all policy-sensitive parameters before the four
-        auxiliary heads. Splitting that original ordered parameter list at the
-        current group boundary therefore preserves every serialized Adam state
-        identifier exactly.
+        Format-1 models lack the final two core parameters: the rank and suit
+        card-output embeddings. Their exact-card and auxiliary Adam moments
+        must retain their identities while the new rows start with empty Adam
+        state. This also retains support for the former single flat group.
+        No other parameter-count mismatch is accepted.
         """
 
         migrated = copy.deepcopy(state)
-        old_group = migrated["param_groups"][0]
-        old_parameters = list(old_group["params"])
-        templates = self.optimizer.state_dict()["param_groups"]
-        expected = sum(len(group["params"]) for group in templates)
-        if len(old_parameters) != expected:
+        source_groups = migrated.get("param_groups", [])
+        if len(source_groups) not in (1, 2):
             raise ValueError(
-                "Legacy optimizer parameter count does not match the model."
+                "Checkpoint optimizer must contain one or two parameter groups."
             )
-        offset = 0
+
+        templates = self.optimizer.state_dict()["param_groups"]
+        current_core = len(templates[0]["params"])
+        current_auxiliary = len(templates[1]["params"])
+        missing_count = (
+            len(STRUCTURED_CARD_OUTPUT_KEYS)
+            if structured_output_migrated
+            else 0
+        )
+        source_core = current_core - missing_count
+        if source_core < 0:
+            raise ValueError("Checkpoint optimizer parameter count is invalid.")
+
+        if len(source_groups) == 1:
+            flat = list(source_groups[0]["params"])
+            if len(flat) != source_core + current_auxiliary:
+                raise ValueError(
+                    "Checkpoint optimizer parameter count does not match the model."
+                )
+            source_parameter_groups = (
+                flat[:source_core],
+                flat[source_core:],
+            )
+            metadata_groups = (source_groups[0], source_groups[0])
+        else:
+            source_parameter_groups = tuple(
+                list(group["params"]) for group in source_groups
+            )
+            if [len(parameters) for parameters in source_parameter_groups] != [
+                source_core,
+                current_auxiliary,
+            ]:
+                raise ValueError(
+                    "Checkpoint optimizer group sizes do not match the model."
+                )
+            metadata_groups = tuple(source_groups)
+
+        target_parameter_groups = (
+            list(templates[0]["params"][:source_core]),
+            list(templates[1]["params"]),
+        )
+        identifier_map: dict[int, int] = {}
+        for source_parameters, target_parameters in zip(
+            source_parameter_groups,
+            target_parameter_groups,
+        ):
+            identifier_map.update(zip(source_parameters, target_parameters))
+
+        unknown_state = set(migrated.get("state", {})) - set(identifier_map)
+        if unknown_state:
+            raise ValueError(
+                "Checkpoint optimizer contains state for unknown parameters."
+            )
+        migrated["state"] = {
+            identifier_map[source]: value
+            for source, value in migrated.get("state", {}).items()
+        }
+
         groups = []
-        for template in templates:
-            count = len(template["params"])
-            group = copy.deepcopy(old_group)
-            group["params"] = old_parameters[offset : offset + count]
+        for metadata, template in zip(
+            metadata_groups,
+            templates,
+        ):
+            group = copy.deepcopy(metadata)
+            # Include every current parameter in the serialized group. The
+            # two new output embeddings simply have no entry in ``state`` and
+            # Adam will initialize their moments on the first kept update.
+            group["params"] = list(template["params"])
             group["kl_sensitive"] = template["kl_sensitive"]
             groups.append(group)
-            offset += count
         migrated["param_groups"] = groups
         return migrated
 

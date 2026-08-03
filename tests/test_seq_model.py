@@ -11,8 +11,19 @@ import torch
 from plump.env import PlumpEnv
 from plump.rounds import RoundSpec, round_game_config
 from plump.seq import tokens as seq_tokens
-from plump.seq.config import SeqModelConfig, seq_len
-from plump.seq.model import SeqPlumpModel
+from plump.seq.config import (
+    SLOT_REMAINING_HAND_START,
+    SLOT_TYPE,
+    TOKEN_TRICK_WIN,
+    TOKEN_WIDTH,
+    SeqModelConfig,
+    seq_len,
+)
+from plump.seq.model import (
+    STRUCTURED_CARD_OUTPUT_KEYS,
+    SeqPlumpModel,
+    load_seq_model_state_dict,
+)
 
 ATOL = 1e-4
 
@@ -51,6 +62,83 @@ def token_batch(num_players, hand_size, seeds) -> torch.Tensor:
         for seed in seeds
     ]
     return torch.from_numpy(np.stack(rows))
+
+
+def test_structured_card_output_starts_as_the_exact_former_head():
+    torch.manual_seed(0)
+    model = SeqPlumpModel(small_config())
+    tokens = token_batch(4, 3, seeds=[0, 1])
+
+    assert torch.count_nonzero(model.card_rank_output_embedding.weight) == 0
+    assert torch.count_nonzero(model.card_suit_output_embedding.weight) == 0
+    output = model.forward_full(tokens, aux_heads=False)
+    former_logits = torch.nn.functional.linear(
+        output.hidden,
+        model.card_head.weight,
+        model.card_head.bias,
+    )
+    torch.testing.assert_close(output.card_logits, former_logits)
+
+
+def test_effective_card_output_adds_exact_rank_and_suit_rows():
+    torch.manual_seed(0)
+    model = SeqPlumpModel(small_config())
+    card = 2 * 13 + 3
+    with torch.no_grad():
+        model.card_rank_output_embedding.weight[3].fill_(0.25)
+        model.card_suit_output_embedding.weight[2].fill_(-0.10)
+
+    effective = model.effective_card_output_weight()
+    torch.testing.assert_close(
+        effective[card],
+        model.card_head.weight[card] + 0.15,
+    )
+    torch.testing.assert_close(
+        effective[card + 1],
+        model.card_head.weight[card + 1] - 0.10,
+    )
+    torch.testing.assert_close(
+        effective[card - 13],
+        model.card_head.weight[card - 13] + 0.25,
+    )
+
+
+def test_trick_win_embedding_adds_each_remaining_card_input_direction():
+    torch.manual_seed(0)
+    model = SeqPlumpModel(small_config())
+    empty = torch.zeros((1, 1, TOKEN_WIDTH), dtype=torch.long)
+    empty[..., SLOT_TYPE] = TOKEN_TRICK_WIN
+    empty[..., SLOT_REMAINING_HAND_START:] = model.config.card_na_id
+    with_cards = empty.clone()
+    with_cards[0, 0, SLOT_REMAINING_HAND_START : SLOT_REMAINING_HAND_START + 2] = (
+        torch.tensor([0, 27])
+    )
+
+    baseline = model.embed(empty)
+    actual = model.embed(with_cards)
+    expected = (
+        baseline
+        + model.effective_card_input_weight()[[0, 27]].sum(dim=0)
+    )
+    torch.testing.assert_close(actual, expected)
+
+
+def test_pre_structured_model_state_loads_with_zero_shared_output_rows():
+    torch.manual_seed(0)
+    original = SeqPlumpModel(small_config())
+    old_state = {
+        key: value
+        for key, value in original.state_dict().items()
+        if key not in STRUCTURED_CARD_OUTPUT_KEYS
+    }
+
+    torch.manual_seed(99)
+    loaded = SeqPlumpModel(small_config())
+    assert load_seq_model_state_dict(loaded, old_state)
+    assert torch.count_nonzero(loaded.card_rank_output_embedding.weight) == 0
+    assert torch.count_nonzero(loaded.card_suit_output_embedding.weight) == 0
+    for key, expected in old_state.items():
+        torch.testing.assert_close(loaded.state_dict()[key], expected)
 
 
 @pytest.mark.parametrize("kv_heads", [None, 2])

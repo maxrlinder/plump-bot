@@ -20,7 +20,11 @@ from .config import (
     SEQ_SCHEMA_VERSION,
     SeqModelConfig,
 )
-from .model import SeqPlumpModel
+from .model import (
+    SEQ_MODEL_FORMAT_VERSION,
+    SeqPlumpModel,
+    load_seq_model_state_dict,
+)
 from .tokens import TOKEN_WIDTH, build_seat_tokens, card_from_id, card_id
 
 
@@ -86,9 +90,15 @@ class SeqModelPolicy:
             raise ValueError(
                 f"Expected schema {SEQ_SCHEMA_VERSION} checkpoint, got {schema}."
             )
+        model_format = int(payload.get("model_format_version", 1))
+        if model_format > SEQ_MODEL_FORMAT_VERSION:
+            raise ValueError(
+                "Checkpoint model format is newer than this code: "
+                f"{model_format} > {SEQ_MODEL_FORMAT_VERSION}."
+            )
         config = SeqModelConfig(**payload["model_config"])
         model = SeqPlumpModel(config)
-        model.load_state_dict(payload["model_state_dict"])
+        load_seq_model_state_dict(model, payload["model_state_dict"])
         return cls(
             model,
             device=device,
@@ -284,6 +294,12 @@ class SeqLeague:
         if len(self.snapshots) > self.max_snapshots:
             dropped = self.snapshots.pop(0)
             self._policies.pop(dropped.snapshot_id, None)
+
+    def clear(self) -> None:
+        """Forget snapshot references and any materialized opponent models."""
+
+        self.snapshots.clear()
+        self._policies.clear()
 
     def eligible_snapshots(
         self, iteration: int | None = None

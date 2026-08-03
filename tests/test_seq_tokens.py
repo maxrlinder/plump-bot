@@ -22,6 +22,7 @@ from plump.seq.config import (
     SLOT_NUM_PLAYERS,
     SLOT_HAND_SIZE,
     SLOT_REL_PLAYER,
+    SLOT_REMAINING_HAND_START,
     SLOT_TYPE,
     TOKEN_BID,
     TOKEN_GAME,
@@ -156,6 +157,43 @@ def test_sequence_structure(num_players, hand_size, seed):
             trick_rows = tokens[base : base + num_players + 1]
             assert (trick_rows[:num_players, SLOT_TYPE] == TOKEN_PLAY).all()
             assert trick_rows[num_players, SLOT_TYPE] == TOKEN_TRICK_WIN
+
+
+@pytest.mark.parametrize("num_players,hand_size,seed", CASES)
+def test_trick_win_rows_carry_exactly_the_observers_remaining_hand(
+    num_players, hand_size, seed
+):
+    env, _, start = play_random_round(num_players, hand_size, seed, observer=0)
+    round_state = env.state.current_round
+    for observer in range(num_players):
+        tokens = replay_arrays_for(env, observer, start).tokens
+        rows = tokens[tokens[:, SLOT_TYPE] == TOKEN_TRICK_WIN]
+        assert len(rows) == hand_size
+
+        initial = set(round_state.initial_hands[observer])
+        observer_plays = [
+            event
+            for event in env.state.event_log
+            if event.type == EventType.PLAY and event.player == observer
+        ]
+        for trick_index, row in enumerate(rows):
+            played = {
+                event.card
+                for event in observer_plays
+                if event.trick_index <= trick_index
+            }
+            expected = sorted(
+                seq_tokens.card_id(card) for card in initial - played
+            )
+            encoded = row[SLOT_REMAINING_HAND_START:]
+            actual = sorted(int(card) for card in encoded if card < 52)
+            assert actual == expected
+            assert (encoded[len(expected) :] == CONFIG.card_na_id).all()
+
+        non_winners = tokens[tokens[:, SLOT_TYPE] != TOKEN_TRICK_WIN]
+        assert (
+            non_winners[:, SLOT_REMAINING_HAND_START:] == CONFIG.card_na_id
+        ).all()
 
 
 @pytest.mark.parametrize("num_players,hand_size,seed", CASES)

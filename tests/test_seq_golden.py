@@ -21,15 +21,15 @@ from plump.seq.config import (
 from plump.seq.model import SeqPlumpModel
 from plump.seq.trainer import SeqTrainer, build_training_groups
 
-# Regenerated for decision-aligned expected-value training and separately
-# clipped optimizer groups. This golden still exercises stochastic
-# stratification at the bid and exhaustive-within-budget play expansion.
+# Frozen after adding observer-remaining-card composition at TRICK_WIN and
+# shared rank/suit card-output directions. This covers both the causal token
+# feature in collection and the two new output parameter gradients in update.
 EXPECTED = {
-    "groups": "a54f006bb08fb1a031096665267ab68ba2f5bd7b2c9477891596f9a1bc615900",
-    "summary": "5dcdb89befa1747a1cacb8387b0d17c8fb640dac48498318f45507d8b32e15ed",
-    "trees": "fb6fdaa6b002e015c4da805826fc80e08c30f0435ce65169b2b0d8554e96d168",
-    "update": "871bbcf76d1d20b604533e8c8e94c510df2f65166cfc451c302c8d89c8f7eb2e",
-    "weights": "1715e292645c0afff516457aa3631d787d7f236417e37453d089f44990db359e",
+    "groups": "e275ab81758ec9a354e84c8d924378bb16c206e1f6b3c18f44ff7549e46e204a",
+    "summary": "74d6ed47c429ef53256124b7bfa7d0738c1c3fab999fd2019618ce4cbe89643a",
+    "trees": "ae55ae3cdcbf0406b21bc4dd9da25a102b97db24ce266f1d4849ec8245e536aa",
+    "update": "257ce6cc805c5489c6c1ea553abd137ec31eea4adb6113e2c8202779ffcdb374",
+    "weights": "35829165699674254f845f65243f69184d032bc6f8edc1d304059f621219d665",
 }
 
 
@@ -178,7 +178,8 @@ def test_schema_v6_collection_and_update_match_corrected_golden_hashes():
         rollout=RolloutOptions(
             deals_per_batch=1,
             auto_deals_per_batch=False,
-            historical_arm="off",
+            opponent_mode="off",
+            opponent_fraction=0.0,
             max_cache_rows=2048,
         ),
         microbatch_positions=2048,
@@ -207,11 +208,15 @@ def test_schema_v6_collection_and_update_match_corrected_golden_hashes():
                     # through the underlying trees.
                     "bid_hit_focal",
                     "bid_hit_non_focal",
-                    "reward_focal",
-                    "reward_non_focal",
+                        "reward_focal",
+                        "reward_non_focal",
+                        "reward_heuristic",
+                        "trees_self",
+                        "trees_heuristic",
+                        "trees_historical",
+                    }
                 }
-            }
-        ),
+            ),
     }
     stats = trainer.update(trees)
     observed.update(

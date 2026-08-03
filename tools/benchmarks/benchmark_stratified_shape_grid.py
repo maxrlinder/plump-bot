@@ -242,7 +242,8 @@ def run_one_case(args: argparse.Namespace) -> dict[str, Any]:
         auto_deals_per_batch=False,
         deals_per_batch=args.deals,
         parallel_deals_max_hand_size=None,
-        historical_arm="off",
+        opponent_mode="off",
+        opponent_fraction=0.0,
     )
     training = replace(
         resolved.training,

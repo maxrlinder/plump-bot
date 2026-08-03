@@ -22,10 +22,17 @@ Each observer receives a causal sequence:
 { [PLAY × P] [TRICK_WIN] } × N
 ```
 
-Every token contains twelve categorical slots: type, relative player, rank,
-suit, exact card, bid, trick, position in trick, hand size, player count, next
-actor, and next phase. Slot embeddings are fused into one lookup table and
-summed with an absolute position embedding.
+Every token contains twelve base categorical slots: type, relative player,
+rank, suit, exact card, bid, trick, position in trick, hand size, player count,
+next actor, and next phase. Slot embeddings are fused into one lookup table
+and summed with an absolute position embedding.
+
+The fixed-width row also has ten remaining-hand card-id positions. They are NA
+except on `TRICK_WIN`, where they contain the observer's still-held cards after
+that trick. The model adds the sum of those cards' existing exact-card + rank +
+suit input directions to the winner token. This is observer-visible state,
+does not expose opponents' hands, adds no model parameters, and gives the
+between-trick state update a direct representation of the hand that remains.
 
 Only observable information enters the sequence. Suit-presence, final bid-hit,
 trick-count, and value labels are reconstructed from the true completed deal
@@ -55,6 +62,12 @@ configuration. The active preset branches every eligible decision through
 seven cards and tapers geometrically to rate `0.5` at ten cards under a fixed
 cache-row budget.
 
+Each update contains 24 self-play deals and 24 anchor deals. The anchor starts
+as the deterministic heuristic and changes to recent historical checkpoints
+after four consecutive positive sampled-policy evaluations. Heuristic games
+share the wave scheduler with self-play but allocate model state only for the
+focal learner, so opponent actions add no transformer forwards or KV rows.
+
 Bids use five distinct policy-mass strata and plays use four. If no more than
 that many actions are legal, every action is evaluated. Otherwise actions are
 partitioned deterministically into disjoint, mass-balanced strata and one
@@ -74,12 +87,20 @@ are unbiased.
 ## Heads
 
 - Bid logits over `0..hand_size`.
-- Card logits over all 52 cards, masked to legal cards.
+- Card logits over all 52 cards, masked to legal cards. Each card's effective
+  output direction is an exact-card residual plus one rank/value embedding and
+  one suit embedding. This shares rank behavior across suits and suit behavior
+  across ranks without forcing different cards to be identical.
 - Relative value readout, supervised at focal policy decisions by default.
 - Per-opponent suit-presence logits (sigmoid, four suits).
 - Per-seat final trick-count logits (softmax over `0..hand_size`,
   feasibility-masked), the observer included.
 - Optional per-seat bid-hit logits (sigmoid), off in the current preset.
+
+The shared output rows start at zero, so introducing them into an existing
+checkpoint preserves every card logit exactly. They then learn with the core
+policy parameters. Evaluation caches the 52 composed rows, retaining one
+card-logit matrix multiplication per autoregressive step.
 
 The policy reads only the final visible position. Beliefs are supervised at
 every owned position of every branch leaf; value is supervised at the focal

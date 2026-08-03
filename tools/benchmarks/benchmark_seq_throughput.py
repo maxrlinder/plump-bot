@@ -130,7 +130,15 @@ def main() -> None:
         rollout=RolloutOptions(
             deals_per_batch=args.deals_per_batch,
             auto_deals_per_batch=args.auto_deals,
-            historical_arm=args.historical_arm,
+            opponent_mode=(
+                "off" if args.historical_arm == "off" else "historical"
+            ),
+            opponent_fraction=(0.0 if args.historical_arm == "off" else 0.5),
+            opponent_packing=(
+                "concurrent"
+                if args.historical_arm == "off"
+                else args.historical_arm
+            ),
             bid_split_groups=args.bid_split_groups,
             cache_budget_gb=args.cache_budget_gb,
             max_cache_rows=args.max_cache_rows,

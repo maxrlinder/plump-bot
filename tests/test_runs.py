@@ -55,7 +55,7 @@ def test_run_creation_records_config_and_rejects_field_changes(tmp_path):
     assert resolved.training.value_positions == "policy"
     assert resolved.training.value_reward_scale == 5.0
     assert resolved.training.core_lr == 2.5e-5
-    assert resolved.training.auxiliary_lr == 2e-4
+    assert resolved.training.auxiliary_lr == 2.5e-5
     assert resolved.training.kl_backtrack_attempts == 8
     assert resolved.training.branch_rule.bid_rule() == (
         "stratified",
@@ -65,7 +65,11 @@ def test_run_creation_records_config_and_rejects_field_changes(tmp_path):
     assert resolved.training.checkpoint_every == 50
     assert resolved.training.suit_coef == 0.05
     assert resolved.training.trick_coef == 0.05
-    assert resolved.training.rollout.historical_arm == "off"
+    assert resolved.training.rollout.opponent_mode == "heuristic_then_historical"
+    assert resolved.training.rollout.opponent_fraction == 0.5
+    assert resolved.training.rollout.opponent_packing == "concurrent"
+    assert resolved.evaluation["training_action_mode"] == "sample"
+    assert resolved.evaluation["opponent_switch_consecutive"] == 4
     run = RunDirectory("unit-run", root=tmp_path)
 
     with run.acquire_lock():

@@ -25,6 +25,15 @@ uv run plump train first-run \
 Re-running the same command safely resumes `runs/first-run`. A changed config
 is rejected with a field-level diff.
 
+For an intentional mid-run curriculum or optimizer change, use the explicit
+reconfiguration path. It archives the old config and writes a compatible
+resume checkpoint before proceeding:
+
+```bash
+uv run plump train first-run --config configs/train.toml \
+  --reconfigure --reconfigure-reason "introduce heuristic anchor"
+```
+
 ## Daily commands
 
 ```bash
@@ -57,6 +66,7 @@ plump/gui/               local browser game
 plump/analysis/          schema-v6 representation analysis
 tests/                   engine, GUI, evaluation, and sequence tests
 tools/benchmarks/        rollout and update measurement tools
+infra/modal_training.py  optional persistent Modal L40S execution sidecar
 ```
 
 The training hot path is intentionally isolated in `plump/seq`. Run
@@ -69,6 +79,7 @@ pipeline without changing its rollout or update semantics.
 - [Training](docs/training.md)
 - [Run artifacts and checkpoints](docs/runs.md)
 - [Dashboard and analysis](docs/analysis.md)
+- [Modal L40S training](docs/modal.md)
 
 ## Development
 

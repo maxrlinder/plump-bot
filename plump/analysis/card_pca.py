@@ -98,13 +98,15 @@ def exact_card_input_vectors(model) -> torch.Tensor:
 def action_head_card_vectors(model) -> torch.Tensor:
     """Return one output-side scoring direction per card.
 
-    ``card_head`` maps the shared state vector to 52 logits. Its weight rows are
-    therefore the learned output embeddings/directions for the card actions.
-    The scalar biases are intentionally omitted from this geometric view.
+    Each direction is the effective exact-card + rank + suit row used for the
+    card logits. The scalar exact-card biases are intentionally omitted from
+    this geometric view.
     """
-    weight = model.card_head.weight.detach().float().cpu()
+    weight = model.effective_card_output_weight().detach().float().cpu()
     if weight.ndim != 2 or weight.shape[0] != 52:
-        raise ValueError(f"Expected card_head.weight shape (52, d), got {weight.shape}")
+        raise ValueError(
+            f"Expected effective card output shape (52, d), got {weight.shape}"
+        )
     return weight
 
 
@@ -200,7 +202,7 @@ def save_pca(
         figure_title = "Effective PLAY-event card input PCA"
     elif source == "action-head":
         vectors = action_head_card_vectors(model)
-        figure_title = "Card action-head output embedding PCA"
+        figure_title = "Effective card action output embedding PCA"
     else:
         raise ValueError(f"Unknown card representation: {source}")
 

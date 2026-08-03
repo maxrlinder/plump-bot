@@ -83,7 +83,8 @@ def run_one_shape(args, num_players: int, hand_size: int) -> dict:
         branch_budget=BranchBudgetConfig(branch_rate=args.branch_rate),
         rollout=RolloutOptions(
             deals_per_batch=args.deals,
-            historical_arm="off",
+            opponent_mode="off",
+            opponent_fraction=0.0,
             bid_split_groups=args.bid_split_groups,
             cache_budget_gb=args.cache_budget_gb,
         ),

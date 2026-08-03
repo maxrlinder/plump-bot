@@ -38,6 +38,10 @@ def test_dashboard_renders_sparse_partial_and_resumed_rows(tmp_path):
                 "value_rmse",
                 "value_zero_rmse",
                 "value_correlation",
+                "loss_suit",
+                "loss_trick",
+                "core_grad_norm",
+                "auxiliary_grad_norm",
                 "rolled_back",
             ),
         )
@@ -59,6 +63,10 @@ def test_dashboard_renders_sparse_partial_and_resumed_rows(tmp_path):
                 "value_rmse": 4.8,
                 "value_zero_rmse": 5.0,
                 "value_correlation": 0.1,
+                "loss_suit": 0.65,
+                "loss_trick": 1.4,
+                "core_grad_norm": 80.0,
+                "auxiliary_grad_norm": 0.08,
                 "rolled_back": 0,
             }
         )
@@ -79,6 +87,10 @@ def test_dashboard_renders_sparse_partial_and_resumed_rows(tmp_path):
                 "value_rmse": 4.5,
                 "value_zero_rmse": 5.1,
                 "value_correlation": 0.2,
+                "loss_suit": 0.55,
+                "loss_trick": 1.3,
+                "core_grad_norm": 60.0,
+                "auxiliary_grad_norm": 0.06,
                 "rolled_back": 1,
             }
         )

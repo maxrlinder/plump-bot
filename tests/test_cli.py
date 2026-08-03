@@ -39,10 +39,12 @@ TINY_OVERRIDES = (
     "training.microbatch_positions=256",
     "training.suit_coef=0.0",
     "training.bid_hit_coef=0.0",
-    'rollout.historical_arm="off"',
+    'rollout.opponent_mode="off"',
+    "rollout.opponent_fraction=0.0",
     "rollout.auto_deals_per_batch=false",
     "rollout.max_cache_rows=256",
     "evaluation.every=0",
+    'evaluation.training_action_mode="argmax"',
     "evaluation.deals=1",
 )
 
@@ -76,6 +78,12 @@ def test_legacy_metrics_header_is_upgraded_for_reporting_fields(tmp_path):
         "proposed_p99_exceeded",
         "core_grad_norm",
         "auxiliary_grad_norm",
+        "trees_self",
+        "trees_heuristic",
+        "trees_historical",
+        "reward_heuristic",
+        "opponent_phase",
+        "heuristic_eval_win_streak",
     }
     legacy = tuple(column for column in METRIC_COLUMNS if column not in new_fields)
     with metrics.open("w", newline="") as handle:
@@ -161,3 +169,73 @@ def test_cli_tiny_run_resume_and_mismatch(tmp_path, monkeypatch, capsys):
     changed.extend(("--set", "training.learning_rate=0.1"))
     assert main(changed) == 2
     assert "training.learning_rate" in capsys.readouterr().err
+
+
+def test_cli_prepare_only_forks_for_unavailable_device_and_resets_league(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("PLUMP_RUNS_DIR", str(tmp_path))
+    assert main(_train_args("prepare-source")) == 0
+    source = tmp_path / "prepare-source" / "checkpoints" / "iter_000001.pt"
+
+    prepared_args = _train_args("prepared-cuda")
+    prepared_args.extend(
+        (
+            "--set",
+            "run.iterations=3",
+            "--set",
+            'run.device="cuda"',
+            "--from-checkpoint",
+            str(source),
+            "--reset-league",
+            "--prepare-only",
+        )
+    )
+    assert main(prepared_args) == 0
+
+    run = tmp_path / "prepared-cuda"
+    metadata = json.loads((run / "metadata.json").read_text())
+    assert metadata["status"] == "prepared"
+    assert metadata["prepared_iteration"] == 1
+    assert metadata["target_device"] == "cuda"
+    assert metadata["target_iterations"] == 3
+    assert (run / "metrics.csv").read_text().count("\n") == 1
+    latest = json.loads((run / "checkpoints" / "latest.json").read_text())
+    payload = torch.load(
+        run / "checkpoints" / latest["path"],
+        map_location="cpu",
+        weights_only=False,
+    )
+    assert payload["iteration"] == 1
+    assert payload["resolved_config"]["run"]["device"] == "cuda"
+    assert payload["resolved_config"]["run"]["iterations"] == 3
+    assert payload["league"] == []
+
+
+def test_cli_reconfigure_writes_resume_checkpoint_and_config_audit(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("PLUMP_RUNS_DIR", str(tmp_path))
+    assert main(_train_args("tiny-reconfigure")) == 0
+
+    changed = _train_args("tiny-reconfigure")
+    changed.extend(
+        (
+            "--set",
+            "training.learning_rate=0.0003",
+            "--reconfigure",
+            "--reconfigure-reason",
+            "test curriculum migration",
+        )
+    )
+    assert main(changed) == 0
+
+    run = tmp_path / "tiny-reconfigure"
+    latest = json.loads((run / "checkpoints" / "latest.json").read_text())
+    assert latest["path"].startswith("resume_000001_reconfigured")
+    assert (run / "checkpoints" / latest["path"]).is_file()
+    assert list((run / "config-history").glob("iter_000001*.toml"))
+    metadata = json.loads((run / "metadata.json").read_text())
+    migration = metadata["config_migrations"][-1]
+    assert migration["reason"] == "test curriculum migration"
+    assert any("training.learning_rate" in line for line in migration["changes"])

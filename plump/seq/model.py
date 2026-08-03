@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import math
-from collections.abc import Collection
+from collections.abc import Collection, Mapping
 from dataclasses import dataclass
 from typing import Optional
 
@@ -11,12 +11,32 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from .config import NUM_CARDS, TOKEN_WIDTH, SeqModelConfig
+from .config import (
+    BASE_TOKEN_WIDTH,
+    NUM_CARDS,
+    NUM_RANKS,
+    NUM_SUITS,
+    SLOT_CARD,
+    SLOT_RANK,
+    SLOT_REMAINING_HAND_START,
+    SLOT_SUIT,
+    SLOT_TYPE,
+    TOKEN_WIDTH,
+    TOKEN_TRICK_WIN,
+    SeqModelConfig,
+)
 from .kv import KVCache
 
 # Auxiliary heads, selectable one by one in forward_full: a caller whose loss
 # weights one at zero should not pay for its forward or its backward.
 AUX_HEADS = ("trick", "suit", "bid_hit")
+SEQ_MODEL_FORMAT_VERSION = 2
+STRUCTURED_CARD_OUTPUT_KEYS = frozenset(
+    {
+        "card_rank_output_embedding.weight",
+        "card_suit_output_embedding.weight",
+    }
+)
 
 
 @dataclass
@@ -175,6 +195,8 @@ class DecoderBlock(nn.Module):
 class SeqPlumpModel(nn.Module):
     def __init__(self, config: SeqModelConfig):
         super().__init__()
+        self._card_input_weight_cache: torch.Tensor | None = None
+        self._card_output_weight_cache: torch.Tensor | None = None
         config.validate()
         self.config = config
         d = config.d_model
@@ -182,7 +204,7 @@ class SeqPlumpModel(nn.Module):
         # offsets. Twelve separate lookups plus eleven adds would be ~23
         # kernels per forward, and the rollout runs one forward per game
         # event, so that overhead dominates at small batch sizes.
-        sizes = config.slot_vocab_sizes
+        sizes = config.base_slot_vocab_sizes
         offsets = torch.tensor(
             [sum(sizes[:index]) for index in range(len(sizes))], dtype=torch.long
         )
@@ -220,8 +242,40 @@ class SeqPlumpModel(nn.Module):
         self.bid_hit_head = nn.Sequential(
             nn.Linear(d, d), nn.GELU(), nn.Linear(d, config.max_players)
         )
+        # Output-side transfer terms. Card c is scored with one effective row:
+        #
+        #   W_exact[c] + W_rank[rank(c)] + W_suit[suit(c)]
+        #
+        # The exact-card residual retains full expressivity, while rank rows
+        # share value knowledge across all four suits and suit rows share
+        # suit-level behavior across ranks. Register these after the existing
+        # heads so a pre-format-2 optimizer's original parameter order remains
+        # a prefix during checkpoint migration.
+        # Module constructors normally consume the global Torch RNG before
+        # ``self.apply`` initializes the complete model. Preserve that RNG
+        # point so adding these parameters does not silently change every
+        # pre-existing cold-start weight (and therefore the rollout stream).
+        with torch.random.fork_rng(devices=[]):
+            self.card_rank_output_embedding = nn.Embedding(NUM_RANKS, d)
+            self.card_suit_output_embedding = nn.Embedding(NUM_SUITS, d)
+        self.register_buffer(
+            "_card_output_rank_ids",
+            torch.arange(NUM_CARDS, dtype=torch.long) % NUM_RANKS,
+            persistent=False,
+        )
+        self.register_buffer(
+            "_card_output_suit_ids",
+            torch.arange(NUM_CARDS, dtype=torch.long) // NUM_RANKS,
+            persistent=False,
+        )
 
         self.apply(self._init_module)
+        # A zero additive start preserves the former head exactly—important
+        # both for cold starts and for resuming existing checkpoints. Adam gets
+        # nonzero gradients for these rows immediately, so zero is a neutral
+        # starting contribution rather than a frozen or symmetric dead path.
+        nn.init.zeros_(self.card_rank_output_embedding.weight)
+        nn.init.zeros_(self.card_suit_output_embedding.weight)
         residual_scale = 1.0 / math.sqrt(2 * config.n_layers)
         for block in self.blocks:
             block.out_proj.weight.data.mul_(residual_scale)
@@ -240,6 +294,72 @@ class SeqPlumpModel(nn.Module):
     def device(self) -> torch.device:
         return self.pos_embedding.weight.device
 
+    def clear_card_output_cache(self) -> None:
+        self._card_input_weight_cache = None
+        self._card_output_weight_cache = None
+
+    def effective_card_input_weight(self) -> torch.Tensor:
+        """Return the 52 exact + rank + suit input directions."""
+
+        if (
+            not self.training
+            and not torch.is_grad_enabled()
+            and self._card_input_weight_cache is not None
+        ):
+            return self._card_input_weight_cache
+        card_ids = torch.arange(NUM_CARDS, device=self.slot_embedding.weight.device)
+        weight = (
+            self.slot_embedding(card_ids + self.slot_offsets[SLOT_CARD])
+            + self.slot_embedding(
+                self._card_output_rank_ids + self.slot_offsets[SLOT_RANK]
+            )
+            + self.slot_embedding(
+                self._card_output_suit_ids + self.slot_offsets[SLOT_SUIT]
+            )
+        )
+        if not self.training and not torch.is_grad_enabled():
+            self._card_input_weight_cache = weight
+        return weight
+
+    def train(self, mode: bool = True):
+        # Evaluation caches the 52 effective rows so the autoregressive hot
+        # path still issues one card-logit matmul per step. Any mode transition
+        # can follow an optimizer/load mutation, so invalidate conservatively.
+        self.clear_card_output_cache()
+        return super().train(mode)
+
+    def _apply(self, fn, recurse: bool = True):
+        self.clear_card_output_cache()
+        return super()._apply(fn, recurse=recurse)
+
+    def effective_card_output_weight(self) -> torch.Tensor:
+        """Return the 52 exact + rank + suit scoring directions."""
+
+        if (
+            not self.training
+            and not torch.is_grad_enabled()
+            and self._card_output_weight_cache is not None
+        ):
+            return self._card_output_weight_cache
+        weight = (
+            self.card_head.weight
+            + self.card_rank_output_embedding(self._card_output_rank_ids)
+            + self.card_suit_output_embedding(self._card_output_suit_ids)
+        )
+        if not self.training and not torch.is_grad_enabled():
+            self._card_output_weight_cache = weight
+        return weight
+
+    def _card_logits(self, hidden: torch.Tensor) -> torch.Tensor:
+        # One matmul, including on the one-token rollout path. The effective
+        # weight is cached while evaluating and rebuilt with gradients for each
+        # training forward.
+        return F.linear(
+            hidden,
+            self.effective_card_output_weight(),
+            self.card_head.bias,
+        )
+
     def new_cache(
         self,
         capacity: int,
@@ -252,11 +372,31 @@ class SeqPlumpModel(nn.Module):
         )
 
     def embed(self, tokens: torch.Tensor, start: int = 0) -> torch.Tensor:
-        """Sum slot embeddings + absolute positions for tokens [B, T, WIDTH]."""
+        """Embed base slots, remaining-hand cards, and absolute positions."""
 
         if tokens.shape[-1] != TOKEN_WIDTH:
             raise ValueError(f"Tokens must have width {TOKEN_WIDTH}.")
-        x = self.slot_embedding(tokens + self.slot_offsets).sum(dim=-2)
+        base = tokens[..., :BASE_TOKEN_WIDTH]
+        x = self.slot_embedding(base + self.slot_offsets).sum(dim=-2)
+
+        # Only TRICK_WIN rows contain remaining-card ids. Select those rows
+        # before gathering so a normal PLAY/BID/TURN step pays no dense
+        # [rows, 10, d_model] temporary. Each card reuses exactly the same
+        # exact-card + rank + suit input direction as its HAND/PLAY token.
+        trick_win = base[..., SLOT_TYPE] == TOKEN_TRICK_WIN
+        remaining = tokens[..., SLOT_REMAINING_HAND_START:][trick_win]
+        if remaining.numel():
+            valid = remaining < NUM_CARDS
+            safe_ids = remaining.clamp_max(NUM_CARDS - 1)
+            card_vectors = F.embedding(
+                safe_ids,
+                self.effective_card_input_weight(),
+            )
+            hand_sum = (
+                card_vectors * valid.unsqueeze(-1).to(card_vectors.dtype)
+            ).sum(dim=-2)
+            x = x.clone()
+            x[trick_win] = x[trick_win] + hand_sum
         positions = torch.arange(
             start, start + tokens.shape[1], device=tokens.device
         )
@@ -266,7 +406,7 @@ class SeqPlumpModel(nn.Module):
         return SeqStepOutput(
             hidden=hidden,
             bid_logits=self.bid_head(hidden),
-            card_logits=self.card_head(hidden),
+            card_logits=self._card_logits(hidden),
             value=self.value_head(hidden).squeeze(-1),
         )
 
@@ -303,7 +443,7 @@ class SeqPlumpModel(nn.Module):
         output = SeqOutput(
             hidden=hidden,
             bid_logits=self.bid_head(hidden),
-            card_logits=self.card_head(hidden),
+            card_logits=self._card_logits(hidden),
             value=self.value_head(hidden).squeeze(-1),
         )
         batch, length, _ = hidden.shape
@@ -368,3 +508,31 @@ class SeqPlumpModel(nn.Module):
             x = block.forward_cached(x, cache, layer, slots, start=position)
         hidden = self.final_norm(x[:, -1])
         return self._step_heads(hidden)
+
+
+def load_seq_model_state_dict(
+    model: SeqPlumpModel,
+    state_dict: Mapping[str, torch.Tensor],
+) -> bool:
+    """Load current weights or migrate the pre-structured card output.
+
+    Returns whether the two additive output embeddings were absent. No other
+    missing or unexpected state is accepted, keeping this narrow migration
+    from becoming permissive legacy-checkpoint loading.
+    """
+
+    result = model.load_state_dict(state_dict, strict=False)
+    missing = frozenset(result.missing_keys)
+    unexpected = frozenset(result.unexpected_keys)
+    migrated = missing == STRUCTURED_CARD_OUTPUT_KEYS and not unexpected
+    if missing or unexpected:
+        if not migrated:
+            raise RuntimeError(
+                "Model checkpoint state mismatch: "
+                f"missing={sorted(missing)}, unexpected={sorted(unexpected)}"
+            )
+        with torch.no_grad():
+            model.card_rank_output_embedding.weight.zero_()
+            model.card_suit_output_embedding.weight.zero_()
+    model.clear_card_output_cache()
+    return migrated

@@ -59,8 +59,8 @@ remembered when interpreting or changing the tail cap.
 Backtracking scales the shared trunk and bid/card action heads because those
 parameters can move the policy. It does not scale the value, suit-presence,
 trick-count, or bid-hit readout heads: those heads only consume the shared
-representation and cannot change policy KL. The current preset starts the core
-at `2.5e-5` and retains `2e-4` for auxiliary readouts; the older
+representation and cannot change policy KL. The current preset starts both the
+core and auxiliary readouts at `2.5e-5`; the older
 `learning_rate` field remains the fallback when a group-specific value is
 omitted. Core and readout gradients are clipped independently, so an exact
 NeuRD correction with a large norm cannot rescale the readout-head sample
@@ -121,19 +121,30 @@ per-position base rate it is the weakest of the three, and unlike the others it
 needs a hidden layer, since `won == bid` is a bump rather than a threshold and
 a linear readout cannot express two decision boundaries.
 
-## Rollout packing and historical opponents
+## Rollout packing and opponent curriculum
 
-The preset deals two independent focal seats/hands per `(players, cards)`
-shape. Through five cards they share one wave loop; from six cards upward each
-deal runs in its own wave loop so a wide tree gets the full cache budget.
-`rollout.deals_per_batch` and `rollout.parallel_deals_max_hand_size` select
-these behaviors.
+The preset keeps the existing 48-deal update budget and apportions it exactly:
+24 current-policy self-play games and 24 anchor-opponent games. Each of the 24
+`(players, cards)` cells contributes one of each. Through five cards the pair
+shares one wave loop; from six cards upward each deal runs in its own wave loop
+so a wide tree gets the full cache budget. `rollout.opponent_fraction`,
+`rollout.opponent_packing`, `rollout.deals_per_batch`, and
+`rollout.parallel_deals_max_hand_size` configure these behaviors.
 
-Historical opponents are currently disabled. When enabled, their games always
-use a fresh independent deal and focal seat. `concurrent` joins those games to
-the self-play wave; `sequential` uses separate waves to reduce peak memory.
-Only checkpoints with iteration in `[ceil(current / 2), current]` are eligible
-for sampling.
+The anchor initially consists of deterministic heuristic opponents. Heuristic
+seats run through the batched wave scheduler but consume no neural forward or
+KV-cache rows; only the focal current policy is encoded. Inline evaluation uses
+reproducible policy sampling against the same heuristic. After mean relative
+reward is above `evaluation.opponent_switch_reward` for
+`evaluation.opponent_switch_consecutive` consecutive evaluations, the anchor
+switches permanently to historical league opponents. The phase and streak are
+checkpointed. Only historical checkpoints with iteration in
+`[ceil(current / 2), current]` are eligible for sampling.
+
+An existing run can adopt an explicitly changed configuration with
+`plump train RUN --config ... --reconfigure --reconfigure-reason ...`. This
+writes a config-compatible resume checkpoint and archives the previous config
+before continuing; ordinary resume still rejects accidental config drift.
 
 NeuRD follows [Neural Replicator
 Dynamics](https://arxiv.org/abs/1906.00190). The candidate correction is a
