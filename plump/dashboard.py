@@ -99,7 +99,7 @@ def render_dashboard(
         (
             ("loss_suit", "actor opponent-suit BCE"),
             ("loss_trick", "actor final-trick CE"),
-            ("loss_oracle_trick", "oracle final-trick CE"),
+            ("loss_oracle_trick", "oracle final-trick CE · epoch sum"),
         ),
         smooth=smooth,
         title="Belief auxiliary losses",
@@ -550,6 +550,14 @@ def _plot_fields(
         values = _series(rows, field)
         if not _has_signal(values, omit_zero=omit_zero):
             continue
+        if omit_zero:
+            # A zero-only prefix conventionally means that this diagnostic or
+            # loss was disabled. Do not let those placeholders dilute the
+            # rolling mean for its first real observations after reconfigure.
+            signal = np.flatnonzero(np.isfinite(values) & ~np.isclose(values, 0.0))
+            if signal.size:
+                values = values.copy()
+                values[: signal[0]] = np.nan
         rendered = _smooth(values, smooth)
         color = f"C{color_offset + index}"
         raw_valid = np.isfinite(iteration) & np.isfinite(values)

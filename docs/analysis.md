@@ -55,7 +55,9 @@ auxiliary telemetry: actor accuracies at 0/4/8 cards personally played in
 ten-card games plus the exact argmax-minus-sample reward and bid-accuracy gaps.
 Suit accuracy is per opponent/suit bit; trick accuracy is exact final-count per
 active seat. Oracle trick accuracy is shown separately over all real oracle
-prefixes and must not be compared as hidden-information inference.
+prefixes and must not be compared as hidden-information inference. The oracle
+trick loss is summed across the configured critic epochs; actor belief losses
+are summed across actor epochs (one in the current run).
 
 When an automatic background evaluation completes, the trainer refreshes
 `dashboard.png` directly, so all four evaluation observations and their mode
