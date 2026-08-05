@@ -59,8 +59,10 @@ SLOT_NEXT_PHASE = 11
 #           costs P tokens instead of P + N*P)
 #   all  -> before every bid and every card play
 TurnTokenMode = Literal["off", "bid", "all"]
-PolicyObjective = Literal["neurd", "sampled_mirror"]
+PolicyObjective = Literal["neurd", "sampled_mirror", "ppo"]
 POLICY_OBJECTIVES: frozenset[str] = frozenset(get_args(PolicyObjective))
+PPOCriticMode = Literal["independent", "privileged"]
+PPO_CRITIC_MODES: frozenset[str] = frozenset(get_args(PPOCriticMode))
 
 
 def seq_len(
@@ -820,6 +822,29 @@ class SeqTrainingConfig:
     #                  an unbiased full-information mirror step)
     policy_objective: PolicyObjective = "neurd"
 
+    # Branch-free PPO. ``ppo_trainable_policies=1`` shares one actor across
+    # every learned seat; larger values assign distinct actor weights to seats
+    # round-robin (with a rotating offset between deals). The actors share the
+    # same architecture and one optimizer step but not parameters.
+    ppo_clip_ratio: float = 0.1
+    ppo_trainable_policies: int = 1
+    ppo_self_play_seats: Literal["focal", "all"] = "all"
+    # The default critic has its own trunk and receives the complete initial
+    # deal through a side input that never enters the actor. ``independent``
+    # keeps the separate weights but omits that privileged side input.
+    ppo_critic_mode: PPOCriticMode = "privileged"
+    ppo_critic_learning_rate: float = 3e-4
+    ppo_critic_epochs: int = 4
+    ppo_advantage_normalize: bool = True
+    # Entropy is normalized by log(number of legal actions), separately for
+    # bids and plays. Forced decisions have no entropy target. In adaptive
+    # mode, a learned positive temperature tracks the configured floor.
+    ppo_entropy_mode: Literal["off", "fixed", "adaptive"] = "adaptive"
+    ppo_entropy_coef: float = 0.01
+    ppo_entropy_learning_rate: float = 1e-3
+    ppo_bid_entropy_target: float = 0.65
+    ppo_play_entropy_target: float = 0.60
+
     # NeuRD. One loss over every focal decision, with gradient on the logit of
     # action a equal to -A(a), independent of pi(a).
     #
@@ -1002,6 +1027,39 @@ class SeqTrainingConfig:
                 f"Unknown policy_objective {self.policy_objective!r}; expected "
                 f"one of {sorted(POLICY_OBJECTIVES)}."
             )
+        if not 0.0 < self.ppo_clip_ratio < 1.0:
+            raise ValueError("ppo_clip_ratio must be in (0, 1).")
+        if self.ppo_trainable_policies < 1:
+            raise ValueError("ppo_trainable_policies must be >= 1.")
+        if self.policy_objective != "ppo" and self.ppo_trainable_policies != 1:
+            raise ValueError(
+                "ppo_trainable_policies > 1 is only supported by PPO."
+            )
+        if self.ppo_self_play_seats not in ("focal", "all"):
+            raise ValueError("ppo_self_play_seats must be 'focal' or 'all'.")
+        if self.ppo_critic_mode not in PPO_CRITIC_MODES:
+            raise ValueError(
+                f"Unknown ppo_critic_mode {self.ppo_critic_mode!r}; expected "
+                f"one of {sorted(PPO_CRITIC_MODES)}."
+            )
+        if self.ppo_critic_learning_rate <= 0:
+            raise ValueError("ppo_critic_learning_rate must be > 0.")
+        if self.ppo_critic_epochs < 1:
+            raise ValueError("ppo_critic_epochs must be >= 1.")
+        if self.ppo_entropy_mode not in ("off", "fixed", "adaptive"):
+            raise ValueError(
+                "ppo_entropy_mode must be 'off', 'fixed', or 'adaptive'."
+            )
+        if self.ppo_entropy_coef < 0 or self.ppo_entropy_learning_rate <= 0:
+            raise ValueError(
+                "ppo_entropy_coef must be >= 0 and its learning rate > 0."
+            )
+        if not 0.0 <= self.ppo_bid_entropy_target <= 1.0:
+            raise ValueError("ppo_bid_entropy_target must be in [0, 1].")
+        if not 0.0 <= self.ppo_play_entropy_target <= 1.0:
+            raise ValueError("ppo_play_entropy_target must be in [0, 1].")
+        if self.precision not in ("fp32", "bf16"):
+            raise ValueError("precision must be 'fp32' or 'bf16'.")
         if self.policy_kl_cap <= 0 or self.policy_kl_p99_cap <= 0:
             raise ValueError("Policy KL caps must be > 0.")
         if self.neurd_advantage_clip < 0 or self.sampled_mirror_advantage_clip < 0:

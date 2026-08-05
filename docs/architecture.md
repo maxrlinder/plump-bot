@@ -57,6 +57,19 @@ The rollout collector advances every live branch in event waves. KV prefixes
 are copied when a focal decision branches, so siblings only decode their new
 suffixes. Opponent turns and self/historical arms are batched by model.
 
+Under `policy_objective="ppo"`, branching and bid splitting are disabled and
+each deal has one sampled leaf. Self-play can record every seat's decisions;
+the same public token positions remain rectangular across their observer
+caches. `ppo_trainable_policies` can assign those seats one shared actor or
+several independent actor weight sets.
+
+PPO uses a separate critic transformer. Its causal public sequence is the same
+length as the actor's. A critic-only fixed-size tensor encodes the complete
+initial deal by observer-relative owner plus exact-card/rank/suit features and
+is added at the GAME position. It therefore supplies centralized training
+state without adding seat-specific actor tokens or exposing hidden cards at
+inference.
+
 Branch placement and candidate selection are controlled by the training
 configuration. The active preset branches every eligible decision through
 seven cards and tapers geometrically to rate `0.5` at ten cards under a fixed

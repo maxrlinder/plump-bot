@@ -344,7 +344,7 @@ def test_sampled_mirror_update_is_finite_and_changes_weights():
 
 def test_unknown_policy_objective_is_rejected():
     with pytest.raises(ValueError, match="policy_objective"):
-        make_trainer(policy_objective="ppo")
+        make_trainer(policy_objective="not_an_objective")
 
 
 def test_kl_backtracking_accepts_a_smaller_adam_step(monkeypatch):

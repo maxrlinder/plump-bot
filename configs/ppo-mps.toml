@@ -1,0 +1,113 @@
+[run]
+iterations = 4000
+checkpoint_every = 50
+dashboard_every = 5
+device = "auto"
+
+[model]
+d_model = 384
+n_layers = 6
+n_heads = 12
+n_kv_heads = 2
+d_ff = 1152
+trick_win_token = true
+turn_token = "bid"
+
+[training]
+seed = 0
+hand_sizes = [3, 4, 5, 6, 7, 8, 9, 10]
+player_counts = [3, 4, 5]
+player_count_weights = [2.0, 3.0, 4.0]
+schedule_repeats = 1
+# 128 independent games for each of 24 shapes = 3,072 games/update.
+deals_per_shape = 128
+games_per_cell = 0
+
+# PPO ignores branch placement/candidate rules and always collects exactly one
+# sampled trajectory per game. These remain valid so changing the objective
+# back to a counterfactual method is a configuration-only operation.
+reference_rate = 0.5
+branch_rate_player_exponent = 0.0
+exhaustive_until = 7
+bid_mode = "stratified"
+bid_top_k = 5
+play_mode = "none"
+play_top_k = 1
+
+learning_rate = 0.00001
+core_learning_rate = 0.00001
+auxiliary_learning_rate = 0.00001
+lr_warmup_updates = 25
+epochs = 1
+# Independent of the 3,072-game rollout batch. On this 24 GB M5 Pro, 16,384
+# positions held the measured update peak to ~11.1 GB with no throughput loss;
+# 32,768 positions used ~16.2 GB for the same ~54.5 s total update.
+microbatch_positions = 16384
+precision = "bf16"
+policy_objective = "ppo"
+policy_coef = 1.0
+policy_kl_cap = 0.003
+policy_kl_p99_cap = 0.02
+
+ppo_clip_ratio = 0.10
+ppo_trainable_policies = 1
+ppo_self_play_seats = "all"
+ppo_critic_mode = "privileged"
+ppo_critic_learning_rate = 0.0003
+ppo_critic_epochs = 4
+ppo_advantage_normalize = true
+ppo_entropy_mode = "adaptive"
+ppo_entropy_coef = 0.01
+ppo_entropy_learning_rate = 0.001
+ppo_bid_entropy_target = 0.65
+ppo_play_entropy_target = 0.60
+
+# Legacy-objective parameters are inert under PPO but retained so this file can
+# select another policy objective without changing its schema.
+neurd_regret_coef = 1.0
+neurd_kl_coef = 1.0
+neurd_advantage_clip = 0.0
+neurd_inclusion_exponent = 1.0
+neurd_inclusion_cap = 0.0
+sampled_mirror_step_size = 1.0
+sampled_mirror_target_kl = 0.003
+sampled_mirror_uniform_mix = 0.02
+sampled_mirror_advantage_clip = 10.0
+sampled_mirror_inclusion_exponent = 1.0
+sampled_mirror_inclusion_cap = 12.0
+kl_backtrack_attempts = 4
+kl_backtrack_factor = 0.5
+branch_depth_exponent = 0.0
+
+value_objective = "mse"
+value_positions = "policy"
+value_reward_scale = 5.0
+value_coef = 0.5
+suit_coef = 0.0
+bid_hit_coef = 0.0
+trick_coef = 0.0
+entropy_coef = 0.0
+league_max_snapshots = 8
+league_min_iteration = 0
+
+[rollout]
+max_cache_rows = 8192
+cache_budget_gb = 4.0
+auto_deals_per_batch = false
+deals_per_batch = 128
+max_deals_per_batch = 128
+opponent_mode = "heuristic_then_historical"
+opponent_fraction = 0.5
+opponent_packing = "concurrent"
+kv_dtype = "fp16"
+bid_position_mode = "uniform"
+
+[evaluation]
+every = 100
+deals = 64
+seed = 1234
+action_seed = 17
+batch_size = 256
+training_action_mode = "sample"
+opponent_switch_reward = 0.0
+opponent_switch_consecutive = 4

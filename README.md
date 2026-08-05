@@ -1,9 +1,8 @@
 # Plump Bot
 
 An autoregressive self-play agent for the Swedish trick-taking game Plump.
-The current and only model pipeline is schema v6: a causal transformer,
-KV-cached counterfactual rollout collector, and selectable NeuRD or sampled
-mirror-target trainer.
+The model pipeline is schema v6: a causal transformer with KV-cached rollout
+and selectable NeuRD, sampled-mirror, or branch-free PPO training.
 
 ## Quick start
 
@@ -12,6 +11,16 @@ uv sync --all-groups
 uv run plump --help
 uv run plump train first-run
 ```
+
+The PPO MPS preset adds an independent privileged critic, adaptive masked
+entropy targets, BF16 autocast, and FP16 KV storage:
+
+```bash
+uv run plump train ppo-mps --config configs/ppo-mps.toml
+```
+
+`training.ppo_trainable_policies` selects one shared actor or multiple
+independent actor weight sets for self-play.
 
 Training uses the versioned defaults in `configs/train.toml`. Override a value
 without editing the preset:
@@ -76,6 +85,7 @@ pipeline without changing its rollout or update semantics.
 ## Documentation
 
 - [Architecture](docs/architecture.md)
+- [Algorithm and math](docs/algorithm.md)
 - [Training](docs/training.md)
 - [Run artifacts and checkpoints](docs/runs.md)
 - [Dashboard and analysis](docs/analysis.md)

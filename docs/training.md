@@ -121,6 +121,64 @@ per-position base rate it is the weakest of the three, and unlike the others it
 needs a hidden layer, since `won == bid` is a bump rather than a threshold and
 a linear readout cannot express two decision boundaries.
 
+### Branch-free PPO
+
+`training.policy_objective="ppo"` selects an independent, branch-free path;
+the NeuRD and sampled-mirror implementations remain unchanged and selectable.
+Each deal has exactly one sampled leaf. In self-play, every seat is a learned
+trajectory by default; against the heuristic or a historical policy, only the
+focal current-policy seat is learned.
+
+For game `g`, let `C_g` be its learned seats. Every learned decision has weight
+`1 / (number_of_games * C_g)`. The loss is not divided by the number of
+decisions, so longer hands contribute more decisions naturally:
+
+```text
+L = (1 / games) sum_g (1 / C_g) sum_i sum_t L[g, i, t]
+```
+
+The clipped actor objective uses the exact legally masked behavior policy:
+
+```text
+ratio = exp(log pi_new(action|observation) - log pi_old(action|observation))
+L_clip = -min(ratio * advantage,
+              clip(ratio, 1-epsilon, 1+epsilon) * advantage)
+advantage = terminal_relative_reward - V_old(global_state, seat)
+```
+
+There is no epsilon-random behavior policy. Sampling from an external mixture
+while storing `pi_old` probabilities would make ordinary PPO off-policy.
+
+PPO uses an independent critic trunk. In `ppo_critic_mode="privileged"`, its
+public causal tokens are identical to the actor's, while a fixed-size side
+tensor encodes every initial hand by observer-relative owner, exact card, rank,
+and suit. That tensor is added only to the critic's GAME representation: it
+adds no rollout tokens and cannot enter the actor. The complete initial deal
+plus the public event stream determines the full game state. The critic is
+trained against undiscounted terminal relative return; its frozen pre-update
+predictions produce the actor advantages.
+
+Entropy is calculated over legal actions and normalized by `log(legal_count)`.
+Forced moves are excluded. Bid and play temperatures are separate. Adaptive
+mode increases a positive temperature when measured normalized entropy falls
+below its configured target and decreases it above target. Full masked
+`KL(pi_old || pi_new)` mean and p99 guards still backtrack or reject an Adam
+proposal independently of PPO ratio clipping. `ppo_behavior_replay_kl` checks
+the pre-update numerical difference between FP16-KV cached collection and the
+full-sequence update replay; it should remain near zero.
+
+`ppo_trainable_policies=1` shares actor weights across learned seats. Larger
+values create genuinely independent actor parameters. Self-play seats are
+assigned those actors round-robin with a rotating deal offset; focal actors in
+anchor games rotate the same way. All actor weights, optimizer state, critic,
+entropy temperatures, and assignment cursor are checkpointed. Actor zero is
+the deployment/evaluation model and the source of historical league snapshots.
+
+The MPS preset is `configs/ppo-mps.toml`. It uses BF16 autocast with FP32 master
+parameters and Adam state, FP16 KV storage, and FP32 attention softmax, masked
+log-softmax, ratios, KL, entropy, returns, and advantages. Rollout games and
+update microbatch positions are independent memory knobs.
+
 ## Rollout packing and opponent curriculum
 
 The preset keeps the existing 48-deal update budget and apportions it exactly:
@@ -185,3 +243,11 @@ Measurement-only tools live in `tools/benchmarks/`. They cover collect/update
 throughput, KV-cache scaling, schedule calibration, per-shape cost, branch
 rate grids, rollout sweeps, and isolated solo-versus-paired shape grids.
 Generated results are explicitly scoped to a selected run or output path.
+The production PPO actor/critic path has a dedicated benchmark:
+
+```bash
+.venv/bin/python tools/benchmarks/benchmark_ppo.py \
+  --games-per-shape 128 \
+  --microbatch-positions 16384 \
+  --warmup 1 --repeats 3
+```

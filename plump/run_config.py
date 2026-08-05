@@ -144,6 +144,17 @@ def resolve_training_config(raw: dict[str, Any]) -> ResolvedTraining:
         branch_budget=BranchBudgetConfig(branch_rate_by_shape=rate_table),
         rollout=RolloutOptions(
             auto_deals_per_batch=bool(rollout_raw["auto_deals_per_batch"]),
+            auto_target_rows=(
+                None
+                if rollout_raw.get("auto_target_rows") is None
+                else int(rollout_raw["auto_target_rows"])
+            ),
+            auto_deals_headroom=float(
+                rollout_raw.get("auto_deals_headroom", 0.5)
+            ),
+            max_deals_per_batch=int(
+                rollout_raw.get("max_deals_per_batch", 64)
+            ),
             deals_per_batch=int(rollout_raw.get("deals_per_batch", 1)),
             parallel_deals_max_hand_size=(
                 None
@@ -152,6 +163,14 @@ def resolve_training_config(raw: dict[str, Any]) -> ResolvedTraining:
             ),
             cache_budget_gb=float(rollout_raw["cache_budget_gb"]),
             max_cache_rows=int(rollout_raw["max_cache_rows"]),
+            cache_initial_rows=int(rollout_raw.get("cache_initial_rows", 1024)),
+            cache_preallocate=bool(
+                rollout_raw.get("cache_preallocate", False)
+            ),
+            bid_split_groups=int(rollout_raw.get("bid_split_groups", 1)),
+            bid_split_min_hand_size=int(
+                rollout_raw.get("bid_split_min_hand_size", 0)
+            ),
             opponent_mode=opponent_mode,
             opponent_fraction=opponent_fraction,
             opponent_packing=opponent_packing,
@@ -172,6 +191,36 @@ def resolve_training_config(raw: dict[str, Any]) -> ResolvedTraining:
         epochs=int(training_raw["epochs"]),
         microbatch_positions=int(training_raw["microbatch_positions"]),
         policy_objective=str(training_raw["policy_objective"]),
+        ppo_clip_ratio=float(training_raw.get("ppo_clip_ratio", 0.1)),
+        ppo_trainable_policies=int(
+            training_raw.get("ppo_trainable_policies", 1)
+        ),
+        ppo_self_play_seats=str(
+            training_raw.get("ppo_self_play_seats", "all")
+        ),
+        ppo_critic_mode=str(
+            training_raw.get("ppo_critic_mode", "privileged")
+        ),
+        ppo_critic_learning_rate=float(
+            training_raw.get("ppo_critic_learning_rate", 3e-4)
+        ),
+        ppo_critic_epochs=int(training_raw.get("ppo_critic_epochs", 4)),
+        ppo_advantage_normalize=bool(
+            training_raw.get("ppo_advantage_normalize", True)
+        ),
+        ppo_entropy_mode=str(
+            training_raw.get("ppo_entropy_mode", "adaptive")
+        ),
+        ppo_entropy_coef=float(training_raw.get("ppo_entropy_coef", 0.01)),
+        ppo_entropy_learning_rate=float(
+            training_raw.get("ppo_entropy_learning_rate", 1e-3)
+        ),
+        ppo_bid_entropy_target=float(
+            training_raw.get("ppo_bid_entropy_target", 0.65)
+        ),
+        ppo_play_entropy_target=float(
+            training_raw.get("ppo_play_entropy_target", 0.60)
+        ),
         policy_coef=float(training_raw["policy_coef"]),
         policy_kl_cap=float(training_raw["policy_kl_cap"]),
         policy_kl_p99_cap=float(training_raw["policy_kl_p99_cap"]),
@@ -203,6 +252,7 @@ def resolve_training_config(raw: dict[str, Any]) -> ResolvedTraining:
         bid_hit_coef=float(training_raw["bid_hit_coef"]),
         trick_coef=float(training_raw["trick_coef"]),
         entropy_coef=float(training_raw["entropy_coef"]),
+        precision=str(training_raw.get("precision", "fp32")),
         kv_dtype=str(rollout_raw["kv_dtype"]),
         snapshot_every=int(run_raw["checkpoint_every"]),
         league_max_snapshots=int(training_raw["league_max_snapshots"]),

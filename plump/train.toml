@@ -39,11 +39,28 @@ auxiliary_learning_rate = 0.000025
 lr_warmup_updates = 100
 epochs = 1
 microbatch_positions = 16384
+precision = "fp32"
 policy_objective = "neurd"
 policy_coef = 1.0
 policy_kl_cap = 0.01
 policy_kl_p99_cap = 0.05
+ppo_clip_ratio = 0.10
+ppo_trainable_policies = 1
+ppo_self_play_seats = "all"
+ppo_critic_mode = "privileged"
+ppo_critic_learning_rate = 0.0003
+ppo_critic_epochs = 4
+ppo_advantage_normalize = true
+ppo_entropy_mode = "adaptive"
+ppo_entropy_coef = 0.01
+ppo_entropy_learning_rate = 0.001
+ppo_bid_entropy_target = 0.65
+ppo_play_entropy_target = 0.60
 neurd_regret_coef = 1.0
+# Inert at epochs = 1. Gradients accumulate over every microbatch before the
+# single optimizer step, so the model still equals pi_old when this term is
+# differentiated and KL(pi_old || pi_theta) contributes exactly zero gradient.
+# Tuning it changes nothing until epochs > 1; the live guard is policy_kl_cap.
 neurd_kl_coef = 1.0
 neurd_advantage_clip = 0.0
 neurd_inclusion_exponent = 1.0

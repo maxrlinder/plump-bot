@@ -510,6 +510,113 @@ class SeqPlumpModel(nn.Module):
         return self._step_heads(hidden)
 
 
+class SeqPPOCritic(nn.Module):
+    """Independent PPO critic with an optional complete-deal side input.
+
+    The public/observer-relative token stream stays byte-for-byte identical to
+    the actor's. In privileged mode, the complete initial deal is encoded as a
+    fixed-size side tensor and added only to the critic's GAME position. It
+    therefore adds no actor tokens, cannot desynchronise rollout cache rows,
+    and cannot leak hidden cards into the deployed policy.
+
+    A full ``SeqPlumpModel`` is retained as the trunk so an existing actor can
+    initialize every compatible critic weight exactly. Policy and auxiliary
+    readouts are frozen and never evaluated; only the independent trunk/value
+    head and the private-deal embeddings are optimized.
+    """
+
+    def __init__(
+        self,
+        config: SeqModelConfig,
+        *,
+        privileged: bool = True,
+        initialize_from: SeqPlumpModel | None = None,
+    ) -> None:
+        super().__init__()
+        self.config = config
+        self.privileged = privileged
+        self.backbone = SeqPlumpModel(config)
+        if initialize_from is not None:
+            self.backbone.load_state_dict(initialize_from.state_dict())
+
+        d = config.d_model
+        # Pair each card feature with its observer-relative owner. A plain sum
+        # of separate seat and card embeddings would lose that association.
+        self.private_card_embedding = nn.Embedding(
+            config.max_players * NUM_CARDS + 1, d,
+            padding_idx=config.max_players * NUM_CARDS,
+        )
+        self.private_rank_embedding = nn.Embedding(
+            config.max_players * NUM_RANKS + 1, d,
+            padding_idx=config.max_players * NUM_RANKS,
+        )
+        self.private_suit_embedding = nn.Embedding(
+            config.max_players * NUM_SUITS + 1, d,
+            padding_idx=config.max_players * NUM_SUITS,
+        )
+        # Zero preserves the actor's existing value predictions at migration;
+        # embedding rows receive ordinary gradients on the first critic step.
+        nn.init.zeros_(self.private_card_embedding.weight)
+        nn.init.zeros_(self.private_rank_embedding.weight)
+        nn.init.zeros_(self.private_suit_embedding.weight)
+
+        for module in (
+            self.backbone.bid_head,
+            self.backbone.card_head,
+            self.backbone.card_rank_output_embedding,
+            self.backbone.card_suit_output_embedding,
+            self.backbone.trick_count_head,
+            self.backbone.suit_presence_head,
+            self.backbone.bid_hit_head,
+        ):
+            for parameter in module.parameters():
+                parameter.requires_grad_(False)
+
+    def _private_deal(self, initial_hands: torch.Tensor) -> torch.Tensor:
+        """Encode [B, relative-seat, card-slot] padded with NUM_CARDS."""
+
+        if initial_hands.dim() != 3:
+            raise ValueError("initial_hands must be [batch, players, cards].")
+        batch, players, _ = initial_hands.shape
+        if players != self.config.max_players:
+            raise ValueError(
+                "initial_hands player axis must equal config.max_players."
+            )
+        valid = initial_hands < NUM_CARDS
+        safe = initial_hands.clamp_max(NUM_CARDS - 1)
+        relative = torch.arange(players, device=initial_hands.device).view(1, -1, 1)
+
+        exact_pad = self.config.max_players * NUM_CARDS
+        rank_pad = self.config.max_players * NUM_RANKS
+        suit_pad = self.config.max_players * NUM_SUITS
+        exact_ids = torch.where(valid, relative * NUM_CARDS + safe, exact_pad)
+        rank_ids = torch.where(
+            valid, relative * NUM_RANKS + safe.remainder(NUM_RANKS), rank_pad
+        )
+        suit_ids = torch.where(
+            valid, relative * NUM_SUITS + safe.div(NUM_RANKS, rounding_mode="floor"), suit_pad
+        )
+        vectors = (
+            self.private_card_embedding(exact_ids)
+            + self.private_rank_embedding(rank_ids)
+            + self.private_suit_embedding(suit_ids)
+        )
+        count = valid.sum(dim=(1, 2), keepdim=False).clamp_min(1).to(vectors.dtype)
+        return vectors.sum(dim=(1, 2)) / count.sqrt().unsqueeze(-1)
+
+    def forward_full(
+        self, tokens: torch.Tensor, initial_hands: torch.Tensor
+    ) -> torch.Tensor:
+        x = self.backbone.embed(tokens)
+        if self.privileged:
+            x = x.clone()
+            x[:, 0] = x[:, 0] + self._private_deal(initial_hands)
+        for block in self.backbone.blocks:
+            x = block.forward_full(x)
+        hidden = self.backbone.final_norm(x)
+        return self.backbone.value_head(hidden).squeeze(-1)
+
+
 def load_seq_model_state_dict(
     model: SeqPlumpModel,
     state_dict: Mapping[str, torch.Tensor],

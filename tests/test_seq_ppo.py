@@ -1,0 +1,153 @@
+"""Branch-free PPO estimator, weighting, actor-pool, and precision tests."""
+
+from __future__ import annotations
+
+import numpy as np
+import pytest
+import torch
+
+from plump.seq.config import (
+    BranchBudgetConfig,
+    BranchRuleConfig,
+    GameScheduleCell,
+    RolloutOptions,
+    SeqModelConfig,
+    SeqTrainingConfig,
+)
+from plump.seq.model import SeqPlumpModel
+from plump.seq.ppo import build_ppo_training_groups, ppo_clipped_terms
+from plump.seq.trainer import SeqTrainer
+
+
+MODEL = SeqModelConfig(d_model=32, n_layers=1, n_heads=2, d_ff=64)
+
+
+def ppo_config(*, cells=None, actors=1, precision="fp32"):
+    return SeqTrainingConfig(
+        schedule_cells=cells
+        or (GameScheduleCell(hand_size=3, num_players=3, games=2),),
+        branch_rule=BranchRuleConfig(bid_top_k=2, play_mode="none"),
+        branch_budget=BranchBudgetConfig(branch_rate=0.5),
+        rollout=RolloutOptions(
+            opponent_mode="off",
+            opponent_fraction=0.0,
+            deals_per_batch=2,
+            max_cache_rows=256,
+        ),
+        policy_objective="ppo",
+        ppo_trainable_policies=actors,
+        ppo_critic_epochs=1,
+        microbatch_positions=512,
+        policy_kl_cap=1.0,
+        policy_kl_p99_cap=1.0,
+        precision=precision,
+        kv_dtype="fp16",
+    )
+
+
+def test_ppo_ratio_is_one_before_update_and_gradient_follows_advantage():
+    logits = torch.tensor(
+        [[0.2, -0.4, 9.0], [0.2, -0.4, 9.0]], requires_grad=True
+    )
+    legal_logits = logits[:, :2].detach()
+    old_legal = torch.softmax(legal_logits, dim=-1)
+    old = torch.cat((old_legal, torch.zeros(2, 1)), dim=-1)
+    actions = torch.tensor([0, 1])
+    advantages = torch.tensor([1.0, -1.0])
+    terms = ppo_clipped_terms(
+        logits, old, actions, advantages, clip_ratio=0.1
+    )
+    torch.testing.assert_close(terms.ratios, torch.ones(2))
+    torch.testing.assert_close(terms.divergences, torch.zeros(2), atol=1e-7, rtol=0)
+    terms.losses.sum().backward()
+    # Gradient descent raises the positively-advantaged selected logit and
+    # lowers the negatively-advantaged selected logit.
+    assert logits.grad[0, 0] < 0
+    assert logits.grad[1, 1] > 0
+    torch.testing.assert_close(logits.grad[:, 2], torch.zeros(2))
+
+
+def test_ppo_collection_is_unbranched_and_learns_every_self_play_seat():
+    trainer = SeqTrainer(
+        SeqPlumpModel(MODEL), ppo_config(actors=2), device="cpu"
+    )
+    trees, summary = trainer.collect()
+    assert all(tree.leaf_total == 1 and len(tree.leaves) == 1 for tree in trees)
+    assert trainer.collector.stats.branch_decisions == 0
+    assert all(
+        {record.seat for record in tree.leaves[0].decisions}
+        == set(range(tree.num_players))
+        for tree in trees
+    )
+    assert {record.policy_id for tree in trees for record in tree.leaves[0].decisions} == {
+        "current",
+        "current:1",
+    }
+
+
+def test_ppo_divides_by_learned_seats_but_not_decision_count():
+    cells = (
+        GameScheduleCell(hand_size=3, num_players=3),
+        GameScheduleCell(hand_size=5, num_players=3),
+    )
+    trainer = SeqTrainer(
+        SeqPlumpModel(MODEL), ppo_config(cells=cells), device="cpu"
+    )
+    trees, _ = trainer.collect()
+    groups = build_ppo_training_groups(trees, MODEL, trainer.train)
+    weight_by_hand = {}
+    row_weight = {}
+    for group in groups:
+        weights = [
+            weight for rows in group.policy.values() for weight in rows.weight
+        ]
+        weight_by_hand[group.hand_size] = sum(weights)
+        row_weight[group.hand_size] = set(weights)
+    # Two equally weighted games and three learned seats: every decision gets
+    # 1 / (2 * 3). The forced final card is omitted, leaving N decisions/seat,
+    # so total policy weight grows linearly with hand length.
+    assert tuple(row_weight[3]) == pytest.approx((1.0 / 6.0,))
+    assert tuple(row_weight[5]) == pytest.approx((1.0 / 6.0,))
+    assert weight_by_hand[3] == pytest.approx(1.5)
+    assert weight_by_hand[5] == pytest.approx(2.5)
+
+
+def test_ppo_checkpoint_round_trips_actor_pool_critic_and_entropy(tmp_path):
+    config = ppo_config(actors=2)
+    trainer = SeqTrainer(SeqPlumpModel(MODEL), config, device="cpu")
+    trees, _ = trainer.collect()
+    trainer.update(trees)
+    assert trainer.critic is not None
+    assert trainer.critic.private_card_embedding.weight.abs().sum() > 0
+    trainer.iteration = 7
+    path = tmp_path / "ppo.pt"
+    trainer.save_checkpoint(path)
+
+    restored = SeqTrainer(SeqPlumpModel(MODEL), config, device="cpu")
+    restored.load_checkpoint(path)
+    assert restored.iteration == 7
+    assert len(restored.models) == 2
+    assert restored.critic is not None
+    assert restored._entropy_alpha("bid") == pytest.approx(
+        trainer._entropy_alpha("bid")
+    )
+    for expected, actual in zip(trainer.models, restored.models):
+        for left, right in zip(expected.parameters(), actual.parameters()):
+            assert torch.equal(left, right)
+
+
+@pytest.mark.skipif(
+    not torch.backends.mps.is_available(), reason="requires Apple MPS"
+)
+def test_mps_bf16_ppo_smoke():
+    config = ppo_config(precision="bf16")
+    trainer = SeqTrainer(SeqPlumpModel(MODEL), config, device="mps")
+    trees, _ = trainer.collect()
+    stats = trainer.update(trees)
+    torch.mps.synchronize()
+    assert np.isfinite(stats.loss_policy)
+    assert np.isfinite(stats.loss_value)
+    assert stats.ppo_behavior_replay_kl < 1e-3
+    # Autocast lowers compute, not the master weights or Adam state.
+    assert next(trainer.model.parameters()).dtype == torch.float32
+    assert trainer.collector._kv_dtype == torch.float16

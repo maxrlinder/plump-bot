@@ -240,7 +240,22 @@ def test_schema_v6_collection_and_update_match_corrected_golden_hashes():
                         "proposed_policy_kl_max",
                         "proposed_mean_exceeded",
                         "proposed_p99_exceeded",
-                    }
+                            # Diagnostic readout of the logit direction the policy
+                            # is invariant to. Cannot affect the update it reports.
+                            "policy_logit_shift",
+                            # PPO-only reporting fields are identically zero
+                            # under this frozen NeuRD golden update.
+                            "entropy_bid_normalized",
+                            "entropy_play_normalized",
+                            "entropy_alpha_bid",
+                            "entropy_alpha_play",
+                            "ppo_ratio_clip_fraction",
+                            "ppo_behavior_replay_kl",
+                            "advantage_mean",
+                            "advantage_std",
+                            "critic_grad_norm",
+                            "peak_update_device_bytes",
+                        }
                 }
             ),
             "weights": _sha256(trainer.model.state_dict()),

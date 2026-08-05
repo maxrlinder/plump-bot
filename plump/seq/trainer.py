@@ -50,9 +50,18 @@ from .model import (
     SEQ_MODEL_FORMAT_VERSION,
     STRUCTURED_CARD_OUTPUT_KEYS,
     SeqPlumpModel,
+    SeqPPOCritic,
     load_seq_model_state_dict,
 )
 from .policy import SeqLeague, best_seq_device
+from .precision import autocast_context
+from .ppo import (
+    PPOTrainingGroup,
+    build_ppo_training_groups,
+    normalize_ppo_advantages,
+    ppo_clipped_terms,
+    ppo_rows_by_chunk,
+)
 from .rollout import SeqRolloutCollector, SeqTree
 from .tokens import (
     IGNORE_LABEL,
@@ -125,6 +134,18 @@ class SeqUpdateStats:
     loss_trick: float = 0.0
     loss_bid_hit: float = 0.0
     entropy: float = 0.0
+    entropy_bid_normalized: float = 0.0
+    entropy_play_normalized: float = 0.0
+    entropy_alpha_bid: float = 0.0
+    entropy_alpha_play: float = 0.0
+    ppo_ratio_clip_fraction: float = 0.0
+    ppo_behavior_replay_kl: float = 0.0
+    advantage_mean: float = 0.0
+    advantage_std: float = 0.0
+    # Weighted mean legal logit. The policy is invariant to shifting every
+    # legal logit by a constant, so the KL guard cannot bound this direction;
+    # NeuRD's gradient along it is nonzero. Watch for a monotone trend.
+    policy_logit_shift: float = 0.0
     policy_kl: float = 0.0
     policy_kl_p95: float = 0.0
     policy_kl_p99: float = 0.0
@@ -150,6 +171,8 @@ class SeqUpdateStats:
     positions: int = 0
     core_grad_norm: float = 0.0
     auxiliary_grad_norm: float = 0.0
+    critic_grad_norm: float = 0.0
+    peak_update_device_bytes: int = 0
     update_sec: float = 0.0
     build_sec: float = 0.0
 
@@ -635,17 +658,25 @@ class SeqTrainer:
     ) -> None:
         train_config.validate()
         self.device = torch.device(device) if device is not None else best_seq_device()
-        self.model = model.to(self.device)
         self.train = train_config
+        self.models = [model]
+        if train_config.policy_objective == "ppo":
+            self.models.extend(
+                copy.deepcopy(model)
+                for _ in range(train_config.ppo_trainable_policies - 1)
+            )
+        self.models = [candidate.to(self.device) for candidate in self.models]
+        self.model = self.models[0]
         core_parameters = []
         auxiliary_parameters = []
-        for name, parameter in self.model.named_parameters():
-            target = (
-                auxiliary_parameters
-                if name.startswith(_AUXILIARY_HEAD_PREFIXES)
-                else core_parameters
-            )
-            target.append(parameter)
+        for actor in self.models:
+            for name, parameter in actor.named_parameters():
+                target = (
+                    auxiliary_parameters
+                    if name.startswith(_AUXILIARY_HEAD_PREFIXES)
+                    else core_parameters
+                )
+                target.append(parameter)
         self._core_parameters = core_parameters
         self._auxiliary_parameters = auxiliary_parameters
         self.optimizer = torch.optim.Adam(
@@ -668,8 +699,43 @@ class SeqTrainer:
             betas=train_config.adam_betas,
         )
         self.collector = SeqRolloutCollector(
-            self.model, train_config, device=self.device
+            self.model,
+            train_config,
+            device=self.device,
+            trainable_models=self.models,
         )
+        self.critic: SeqPPOCritic | None = None
+        self.critic_optimizer: torch.optim.Optimizer | None = None
+        self.log_entropy_alpha: dict[str, torch.nn.Parameter] = {}
+        self.entropy_optimizer: torch.optim.Optimizer | None = None
+        if train_config.policy_objective == "ppo":
+            self.critic = SeqPPOCritic(
+                self.model.config,
+                privileged=train_config.ppo_critic_mode == "privileged",
+                initialize_from=self.model,
+            ).to(self.device)
+            critic_parameters = [
+                parameter
+                for parameter in self.critic.parameters()
+                if parameter.requires_grad
+            ]
+            self.critic_optimizer = torch.optim.Adam(
+                critic_parameters,
+                lr=train_config.ppo_critic_learning_rate,
+                betas=train_config.adam_betas,
+            )
+            initial_alpha = max(train_config.ppo_entropy_coef, 1e-8)
+            self.log_entropy_alpha = {
+                phase: torch.nn.Parameter(
+                    torch.tensor(math.log(initial_alpha), device=self.device)
+                )
+                for phase in ("bid", "play")
+            }
+            if train_config.ppo_entropy_mode == "adaptive":
+                self.entropy_optimizer = torch.optim.Adam(
+                    list(self.log_entropy_alpha.values()),
+                    lr=train_config.ppo_entropy_learning_rate,
+                )
         self.league = SeqLeague(
             train_config.league_max_snapshots, train_config.league_min_iteration
         )
@@ -689,7 +755,8 @@ class SeqTrainer:
     # -------------------------------------------------------------- #
 
     def collect(self) -> tuple[list[SeqTree], SeqRolloutSummary]:
-        self.model.eval()
+        for model in self.models:
+            model.eval()
         trees = self.collector.collect(
             self.league,
             self.rng,
@@ -729,6 +796,8 @@ class SeqTrainer:
     # -------------------------------------------------------------- #
 
     def update(self, trees: list[SeqTree]) -> SeqUpdateStats:
+        if self.train.policy_objective == "ppo":
+            return self._update_ppo(trees)
         started = time.perf_counter()
         # The trees are plain Python objects from here on; the rollout's KV
         # pools are the biggest allocation in the process and are pure dead
@@ -836,6 +905,438 @@ class SeqTrainer:
         stats.update_sec = time.perf_counter() - started
         return stats
 
+    # -------------------------------------------------------------- #
+    # Branch-free PPO                                                 #
+    # -------------------------------------------------------------- #
+
+    def _ppo_model(self, policy_id: str) -> SeqPlumpModel:
+        try:
+            return self.collector._trainable_model_map[policy_id]
+        except KeyError as error:
+            raise ValueError(f"Unknown trainable PPO policy {policy_id!r}.") from error
+
+    def _device_allocated_bytes(self) -> int:
+        if self.device.type == "mps":
+            return int(torch.mps.driver_allocated_memory())
+        if self.device.type == "cuda":
+            return int(torch.cuda.memory_allocated(self.device))
+        return 0
+
+    def _update_ppo(self, trees: list[SeqTree]) -> SeqUpdateStats:
+        started = time.perf_counter()
+        if self.critic is None or self.critic_optimizer is None:
+            raise RuntimeError("PPO requires an initialized independent critic.")
+        self.collector.release_caches()
+        self._release_device_memory()
+        groups = build_ppo_training_groups(trees, self.model.config, self.train)
+        stats = SeqUpdateStats()
+        stats.build_sec = time.perf_counter() - started
+        stats.policy_rows = sum(
+            len(rows.weight) for group in groups for rows in group.policy.values()
+        )
+        stats.unbranched_rows = stats.policy_rows
+        stats.value_rows = stats.policy_rows
+        stats.positions = int(
+            sum(group.tokens.shape[0] * group.tokens.shape[1] for group in groups)
+        )
+
+        advantage_mean, advantage_std = self._prepare_ppo_advantages(groups, stats)
+        stats.advantage_mean = advantage_mean
+        stats.advantage_std = advantage_std
+        if self.train.ppo_advantage_normalize:
+            normalize_ppo_advantages(groups)
+        stats.peak_update_device_bytes = max(
+            stats.peak_update_device_bytes, self._device_allocated_bytes()
+        )
+
+        for actor_epoch in range(self.train.epochs):
+            actor_snapshot = (
+                [copy.deepcopy(model.state_dict()) for model in self.models],
+                copy.deepcopy(self.optimizer.state_dict()),
+            )
+            for model in self.models:
+                model.train()
+            self.optimizer.zero_grad(set_to_none=True)
+            epoch = self._ppo_actor_backward(groups)
+            stats.loss_policy += epoch["policy_loss"]
+            stats.entropy = epoch["entropy"]
+            stats.entropy_bid_normalized = epoch["bid_entropy"]
+            stats.entropy_play_normalized = epoch["play_entropy"]
+            stats.ppo_ratio_clip_fraction = epoch["clip_fraction"]
+            if actor_epoch == 0:
+                # Cached rollout uses FP16 K/V while the update replays full
+                # sequences. This should remain numerical noise, not silently
+                # turn the first PPO epoch into an off-policy update.
+                stats.ppo_behavior_replay_kl = epoch["behavior_kl"]
+            stats.policy_logit_shift = epoch["logit_shift"]
+            stats.core_grad_norm = float(
+                torch.nn.utils.clip_grad_norm_(
+                    self._core_parameters, self.train.max_grad_norm
+                )
+            )
+            stats.auxiliary_grad_norm = float(
+                torch.nn.utils.clip_grad_norm_(
+                    self._auxiliary_parameters, self.train.max_grad_norm
+                )
+            )
+            self._apply_warmup_lr()
+            nominal_lrs = [float(group["lr"]) for group in self.optimizer.param_groups]
+            accepted = False
+            attempts = self.train.kl_backtrack_attempts + 1
+            for attempt in range(attempts):
+                if attempt:
+                    for model, state in zip(self.models, actor_snapshot[0]):
+                        model.load_state_dict(state)
+                        model.clear_card_output_cache()
+                    self.optimizer.load_state_dict(actor_snapshot[1])
+                scale = self.train.kl_backtrack_factor**attempt
+                for group, nominal_lr in zip(self.optimizer.param_groups, nominal_lrs):
+                    group["lr"] = (
+                        nominal_lr * scale
+                        if group.get("kl_sensitive", True)
+                        else nominal_lr
+                    )
+                self.optimizer.step()
+                policy_kl, kl_p95, kl_p99, kl_max = self._evaluate_ppo_kl(groups)
+                if attempt == 0:
+                    stats.proposed_policy_kl = policy_kl
+                    stats.proposed_policy_kl_p95 = kl_p95
+                    stats.proposed_policy_kl_p99 = kl_p99
+                    stats.proposed_policy_kl_max = kl_max
+                    stats.proposed_mean_exceeded = policy_kl > self.train.policy_kl_cap
+                    stats.proposed_p99_exceeded = (
+                        kl_p99 > self.train.policy_kl_p99_cap
+                    )
+                stats.policy_kl = policy_kl
+                stats.policy_kl_p95 = kl_p95
+                stats.policy_kl_p99 = kl_p99
+                stats.policy_kl_max = kl_max
+                if policy_kl <= self.train.policy_kl_cap and kl_p99 <= self.train.policy_kl_p99_cap:
+                    stats.backtracks += attempt
+                    stats.step_scale = min(stats.step_scale, scale)
+                    self.optimizer_steps += 1
+                    accepted = True
+                    break
+            for group, nominal_lr in zip(self.optimizer.param_groups, nominal_lrs):
+                group["lr"] = nominal_lr
+            if not accepted:
+                for model, state in zip(self.models, actor_snapshot[0]):
+                    model.load_state_dict(state)
+                    model.clear_card_output_cache()
+                self.optimizer.load_state_dict(actor_snapshot[1])
+                stats.rolled_back = True
+                stats.step_scale = 0.0
+                break
+            self._update_entropy_temperature(epoch)
+
+        self._train_ppo_critic(groups, stats)
+        stats.entropy_alpha_bid = self._entropy_alpha("bid")
+        stats.entropy_alpha_play = self._entropy_alpha("play")
+        stats.peak_update_device_bytes = max(
+            stats.peak_update_device_bytes, self._device_allocated_bytes()
+        )
+        self._release_device_memory()
+        stats.update_sec = time.perf_counter() - started
+        return stats
+
+    def _prepare_ppo_advantages(
+        self, groups: list[PPOTrainingGroup], stats: SeqUpdateStats
+    ) -> tuple[float, float]:
+        assert self.critic is not None
+        self.critic.eval()
+        predictions: list[float] = []
+        targets: list[float] = []
+        weights: list[float] = []
+        with torch.inference_mode():
+            for group in groups:
+                chunks = list(self._microbatches(group))
+                for (start, stop), rows_by_phase in zip(
+                    chunks, ppo_rows_by_chunk(group, chunks)
+                ):
+                    tokens = torch.from_numpy(group.tokens[start:stop]).to(self.device)
+                    hands = torch.from_numpy(group.initial_hands[start:stop]).to(
+                        self.device
+                    )
+                    with autocast_context(self.device, self.train.precision):
+                        values = self.critic.forward_full(tokens, hands)
+                    for phase, rows in rows_by_phase.items():
+                        if not rows["weight"]:
+                            continue
+                        seq = torch.tensor(
+                            rows["seq_index"], device=self.device, dtype=torch.long
+                        )
+                        pos = torch.tensor(
+                            rows["position"], device=self.device, dtype=torch.long
+                        )
+                        selected = values[seq, pos].float().cpu().numpy()
+                        phase_rows = group.policy[phase]
+                        for local, original in enumerate(rows["row_index"]):
+                            target = float(rows["returns"][local])
+                            prediction = float(selected[local])
+                            phase_rows.advantages[original] = target - prediction
+                            predictions.append(prediction)
+                            targets.append(target)
+                            weights.append(float(rows["weight"][local]))
+
+        prediction = np.asarray(predictions, dtype=np.float64)
+        target = np.asarray(targets, dtype=np.float64)
+        weight = np.asarray(weights, dtype=np.float64)
+        total = float(weight.sum())
+        if total <= 0:
+            return 0.0, 1.0
+        error = prediction - target
+        stats.value_rmse = float(np.sqrt(np.dot(weight, error * error) / total))
+        stats.value_zero_rmse = float(np.sqrt(np.dot(weight, target * target) / total))
+        prediction_mean = float(np.dot(weight, prediction) / total)
+        target_mean = float(np.dot(weight, target) / total)
+        prediction_centered = prediction - prediction_mean
+        target_centered = target - target_mean
+        prediction_var = float(np.dot(weight, prediction_centered**2) / total)
+        target_var = float(np.dot(weight, target_centered**2) / total)
+        covariance = float(
+            np.dot(weight, prediction_centered * target_centered) / total
+        )
+        stats.value_prediction_std = math.sqrt(max(prediction_var, 0.0))
+        denominator = math.sqrt(max(prediction_var * target_var, 0.0))
+        stats.value_correlation = covariance / denominator if denominator else 0.0
+        advantages = target - prediction
+        mean = float(np.dot(weight, advantages) / total)
+        variance = float(np.dot(weight, (advantages - mean) ** 2) / total)
+        return mean, math.sqrt(max(variance, 1e-12))
+
+    def _entropy_alpha(self, phase: str) -> float:
+        if self.train.ppo_entropy_mode == "off":
+            return 0.0
+        if self.train.ppo_entropy_mode == "fixed":
+            return self.train.ppo_entropy_coef
+        return float(self.log_entropy_alpha[phase].detach().exp().clamp(max=10.0))
+
+    def _ppo_actor_backward(self, groups: list[PPOTrainingGroup]) -> dict[str, float]:
+        totals: dict[str, list[torch.Tensor]] = defaultdict(list)
+        for group in groups:
+            model = self._ppo_model(group.policy_id)
+            chunks = list(self._microbatches(group))
+            for (start, stop), rows_by_phase in zip(
+                chunks, ppo_rows_by_chunk(group, chunks)
+            ):
+                tokens = torch.from_numpy(group.tokens[start:stop]).to(self.device)
+                with autocast_context(self.device, self.train.precision):
+                    output = model.forward_full(tokens, aux_heads=False)
+                loss = torch.zeros((), device=self.device, dtype=torch.float32)
+                for phase, rows in rows_by_phase.items():
+                    if not rows["weight"]:
+                        continue
+                    logits_all = (
+                        output.bid_logits if phase == "bid" else output.card_logits
+                    )
+                    seq = torch.tensor(
+                        rows["seq_index"], device=self.device, dtype=torch.long
+                    )
+                    pos = torch.tensor(
+                        rows["position"], device=self.device, dtype=torch.long
+                    )
+                    logits = logits_all[seq, pos].float()
+                    old_probs = torch.from_numpy(
+                        np.stack(rows["old_probs_full"])
+                    ).to(self.device)
+                    actions = torch.tensor(
+                        rows["action"], device=self.device, dtype=torch.long
+                    )
+                    advantages = torch.tensor(
+                        rows["advantages"], device=self.device, dtype=torch.float32
+                    )
+                    weight = torch.tensor(
+                        rows["weight"], device=self.device, dtype=torch.float32
+                    )
+                    terms = ppo_clipped_terms(
+                        logits,
+                        old_probs,
+                        actions,
+                        advantages,
+                        clip_ratio=self.train.ppo_clip_ratio,
+                    )
+                    policy_loss = (weight * terms.losses).sum()
+                    loss = loss + self.train.policy_coef * policy_loss
+                    eligible_weight = weight * terms.entropy_eligible.float()
+                    entropy_term = (
+                        eligible_weight * terms.normalized_entropy
+                    ).sum()
+                    alpha = self._entropy_alpha(phase)
+                    if alpha:
+                        loss = loss - alpha * entropy_term
+                    totals["policy_loss"].append(policy_loss.detach())
+                    totals["entropy_raw"].append((weight * terms.entropy).sum().detach())
+                    totals["row_weight"].append(weight.sum().detach())
+                    totals[f"{phase}_entropy"].append(entropy_term.detach())
+                    totals[f"{phase}_entropy_weight"].append(
+                        eligible_weight.sum().detach()
+                    )
+                    totals["clip"].append(
+                        (weight * terms.clipped.float()).sum().detach()
+                    )
+                    totals["behavior_kl"].append(
+                        (weight * terms.divergences).sum().detach()
+                    )
+                    legal = old_probs > 0
+                    logit_shift = (
+                        (logits * legal.float()).sum(dim=-1)
+                        / legal.sum(dim=-1).clamp_min(1)
+                    )
+                    totals["logit_shift"].append(
+                        (weight * logit_shift).sum().detach()
+                    )
+                if loss.requires_grad:
+                    loss.backward()
+
+        reduced = {
+            key: math.fsum(float(value) for value in values)
+            for key, values in totals.items()
+        }
+        row_weight = max(reduced.get("row_weight", 0.0), 1e-12)
+        result = {
+            "policy_loss": reduced.get("policy_loss", 0.0),
+            "entropy": reduced.get("entropy_raw", 0.0) / row_weight,
+            "clip_fraction": reduced.get("clip", 0.0) / row_weight,
+            "behavior_kl": reduced.get("behavior_kl", 0.0) / row_weight,
+            "logit_shift": reduced.get("logit_shift", 0.0) / row_weight,
+        }
+        for phase in ("bid", "play"):
+            entropy_weight = reduced.get(f"{phase}_entropy_weight", 0.0)
+            result[f"{phase}_entropy"] = (
+                reduced.get(f"{phase}_entropy", 0.0) / entropy_weight
+                if entropy_weight > 0
+                else 0.0
+            )
+        return result
+
+    def _update_entropy_temperature(self, epoch: dict[str, float]) -> None:
+        if self.entropy_optimizer is None:
+            return
+        self.entropy_optimizer.zero_grad(set_to_none=True)
+        loss = torch.zeros((), device=self.device)
+        targets = {
+            "bid": self.train.ppo_bid_entropy_target,
+            "play": self.train.ppo_play_entropy_target,
+        }
+        for phase, target in targets.items():
+            observed = torch.tensor(epoch[f"{phase}_entropy"], device=self.device)
+            loss = loss + self.log_entropy_alpha[phase] * (observed - target)
+        loss.backward()
+        self.entropy_optimizer.step()
+        with torch.no_grad():
+            for parameter in self.log_entropy_alpha.values():
+                parameter.clamp_(math.log(1e-6), math.log(10.0))
+
+    def _evaluate_ppo_kl(
+        self, groups: list[PPOTrainingGroup]
+    ) -> tuple[float, float, float, float]:
+        divergences: list[np.ndarray] = []
+        weights: list[np.ndarray] = []
+        for model in self.models:
+            model.eval()
+        with torch.inference_mode():
+            for group in groups:
+                model = self._ppo_model(group.policy_id)
+                chunks = list(self._microbatches(group))
+                for (start, stop), rows_by_phase in zip(
+                    chunks, ppo_rows_by_chunk(group, chunks)
+                ):
+                    tokens = torch.from_numpy(group.tokens[start:stop]).to(self.device)
+                    with autocast_context(self.device, self.train.precision):
+                        output = model.forward_full(tokens, aux_heads=False)
+                    for phase, rows in rows_by_phase.items():
+                        if not rows["weight"]:
+                            continue
+                        logits_all = (
+                            output.bid_logits
+                            if phase == "bid"
+                            else output.card_logits
+                        )
+                        seq = torch.tensor(
+                            rows["seq_index"], device=self.device, dtype=torch.long
+                        )
+                        pos = torch.tensor(
+                            rows["position"], device=self.device, dtype=torch.long
+                        )
+                        old_probs = torch.from_numpy(
+                            np.stack(rows["old_probs_full"])
+                        ).to(self.device)
+                        actions = torch.tensor(
+                            rows["action"], device=self.device, dtype=torch.long
+                        )
+                        advantages = torch.tensor(
+                            rows["advantages"], device=self.device
+                        )
+                        terms = ppo_clipped_terms(
+                            logits_all[seq, pos],
+                            old_probs,
+                            actions,
+                            advantages,
+                            clip_ratio=self.train.ppo_clip_ratio,
+                        )
+                        divergences.append(terms.divergences.cpu().numpy())
+                        weights.append(np.asarray(rows["weight"], dtype=np.float32))
+        if not divergences:
+            return 0.0, 0.0, 0.0, 0.0
+        return _weighted_kl_summary(
+            np.concatenate(divergences), np.concatenate(weights)
+        )
+
+    def _train_ppo_critic(
+        self, groups: list[PPOTrainingGroup], stats: SeqUpdateStats
+    ) -> None:
+        assert self.critic is not None and self.critic_optimizer is not None
+        total_loss = 0.0
+        for _ in range(self.train.ppo_critic_epochs):
+            self.critic.train()
+            self.critic_optimizer.zero_grad(set_to_none=True)
+            pending: list[torch.Tensor] = []
+            for group in groups:
+                chunks = list(self._microbatches(group))
+                for (start, stop), rows_by_phase in zip(
+                    chunks, ppo_rows_by_chunk(group, chunks)
+                ):
+                    tokens = torch.from_numpy(group.tokens[start:stop]).to(self.device)
+                    hands = torch.from_numpy(group.initial_hands[start:stop]).to(
+                        self.device
+                    )
+                    with autocast_context(self.device, self.train.precision):
+                        values = self.critic.forward_full(tokens, hands)
+                    loss = torch.zeros((), device=self.device, dtype=torch.float32)
+                    for rows in rows_by_phase.values():
+                        if not rows["weight"]:
+                            continue
+                        seq = torch.tensor(
+                            rows["seq_index"], device=self.device, dtype=torch.long
+                        )
+                        pos = torch.tensor(
+                            rows["position"], device=self.device, dtype=torch.long
+                        )
+                        targets = torch.tensor(
+                            rows["returns"], device=self.device, dtype=torch.float32
+                        )
+                        weight = torch.tensor(
+                            rows["weight"], device=self.device, dtype=torch.float32
+                        )
+                        error = (values[seq, pos].float() - targets) / self.train.value_reward_scale
+                        loss = loss + (0.5 * weight * error.square()).sum()
+                    if loss.requires_grad:
+                        loss.backward()
+                        pending.append(loss.detach())
+            stats.critic_grad_norm = float(
+                torch.nn.utils.clip_grad_norm_(
+                    [
+                        parameter
+                        for parameter in self.critic.parameters()
+                        if parameter.requires_grad
+                    ],
+                    self.train.max_grad_norm,
+                )
+            )
+            self.critic_optimizer.step()
+            total_loss += math.fsum(float(value) for value in pending)
+        stats.loss_value = total_loss
+
     def _apply_warmup_lr(self) -> None:
         """Linear LR ramp over the first ``lr_warmup_updates`` kept steps.
 
@@ -927,6 +1428,12 @@ class SeqTrainer:
         stats.loss_trick = totals["trick"]
         stats.loss_bid_hit = totals["bid_hit"]
         stats.entropy = totals["entropy"]
+        policy_row_weight = totals["policy_row_weight"]
+        stats.policy_logit_shift = (
+            totals["policy_logit_shift"] / policy_row_weight
+            if policy_row_weight > 0
+            else 0.0
+        )
 
     def _chunk_loss(
         self, group, start, stop, policy_rows, *, defer_terms: bool = False
@@ -945,7 +1452,8 @@ class SeqTrainer:
             if coef > 0
         )
         tokens = torch.from_numpy(group.tokens[start:stop]).to(device)
-        output = self.model.forward_full(tokens, aux_heads=aux)
+        with autocast_context(self.device, self.train.precision):
+            output = self.model.forward_full(tokens, aux_heads=aux)
         owned = torch.from_numpy(group.owned[start:stop]).to(device)
         position_weight = (
             torch.from_numpy(group.position_weight[start:stop]).to(device)
@@ -1082,7 +1590,9 @@ class SeqTrainer:
         for phase_key, rows in policy_rows.items():
             if not rows["weight"]:
                 continue
-            losses, _, entropies, weight = self._policy_terms(output, rows, phase_key)
+            losses, _, entropies, weight, logit_shift = self._policy_terms(
+                output, rows, phase_key
+            )
             policy_loss = (weight * losses).sum()
             loss = loss + train.policy_coef * policy_loss
             term_parts["policy"].append(policy_loss.detach())
@@ -1094,6 +1604,10 @@ class SeqTrainer:
                 term_parts["entropy"].append(
                     (weight * entropies).sum().detach()
                 )
+            term_parts["policy_logit_shift"].append(
+                (weight * logit_shift).sum().detach()
+            )
+            term_parts["policy_row_weight"].append(weight.sum().detach())
 
         if defer_terms:
             terms = dict(term_parts)
@@ -1188,6 +1702,17 @@ class SeqTrainer:
         probs_new = safe.exp() * legal.float()
         entropies = -(probs_new * safe).sum(dim=-1)
 
+        # Common-mode logit drift. The NeuRD loss -sum_a A_hat(a) z(a) has
+        # gradient -sum_a A_hat(a) along the all-ones logit direction, and that
+        # sum is not zero in general -- only the pi_old-weighted one is. Adding
+        # a constant to every legal logit leaves the policy identical, so the
+        # post-step KL guard cannot see this direction and nothing else bounds
+        # it. Reported so a slow drift into saturation is visible rather than
+        # inferred after the fact.
+        logit_shift = (logits * legal.float()).sum(dim=-1) / legal.sum(
+            dim=-1
+        ).clamp_min(1)
+
         if train.policy_objective == "neurd":
             # Full-support sampled NeuRD. The control-variate estimator is
             # centered over the old policy before this direct logit update, so
@@ -1211,7 +1736,7 @@ class SeqTrainer:
             # KL(target || current). The target is stopped by construction;
             # the gradient on each logit is pi_current - target.
             losses = (target * (log_target - safe) * legal.float()).sum(dim=-1)
-        return losses, divergences, entropies, weight
+        return losses, divergences, entropies, weight, logit_shift
 
     def _policy_divergences(self, output, rows, phase_key):
         """KL-only policy readout for the post-step trust-region guard.
@@ -1308,7 +1833,8 @@ class SeqTrainer:
                     if not any(rows["weight"] for rows in policy_rows.values()):
                         continue
                     tokens = torch.from_numpy(group.tokens[start:stop]).to(self.device)
-                    output = self.model.forward_full(tokens, aux_heads=False)
+                    with autocast_context(self.device, self.train.precision):
+                        output = self.model.forward_full(tokens, aux_heads=False)
                     for phase_key, rows in policy_rows.items():
                         if not rows["weight"]:
                             continue
@@ -1366,6 +1892,7 @@ class SeqTrainer:
             "peak_rows": self.collector._peak_rows,
             "rows_per_deal": self.collector._rows_per_deal,
             "seat_cursor": self.collector._seat_cursor,
+            "policy_cursor": self.collector._policy_cursor,
         }
         payload = {
             "checkpoint_format_version": 1,
@@ -1390,6 +1917,23 @@ class SeqTrainer:
                 "heuristic_eval_win_streak": self.heuristic_eval_win_streak,
             },
         }
+        if self.train.policy_objective == "ppo" or len(self.models) > 1:
+            payload["actor_state_dicts"] = [
+                model.state_dict() for model in self.models
+            ]
+        if self.critic is not None and self.critic_optimizer is not None:
+            payload["critic_state_dict"] = self.critic.state_dict()
+            payload["critic_optimizer_state_dict"] = (
+                self.critic_optimizer.state_dict()
+            )
+            payload["entropy_log_alpha"] = {
+                phase: parameter.detach().cpu()
+                for phase, parameter in self.log_entropy_alpha.items()
+            }
+            if self.entropy_optimizer is not None:
+                payload["entropy_optimizer_state_dict"] = (
+                    self.entropy_optimizer.state_dict()
+                )
         if torch.cuda.is_available():
             payload["cuda_rng_state"] = torch.cuda.get_rng_state_all()
         if hasattr(torch, "mps") and hasattr(torch.mps, "get_rng_state"):
@@ -1458,15 +2002,56 @@ class SeqTrainer:
             if allow_training_config_mismatch
             else checkpoint_config
         )
-        structured_output_migrated = load_seq_model_state_dict(
-            self.model,
-            payload["model_state_dict"],
+        actor_states = payload.get("actor_state_dicts")
+        exact_actor_pool = (
+            isinstance(actor_states, list) and len(actor_states) == len(self.models)
         )
-        optimizer_state = self._migrate_optimizer_state(
-            payload["optimizer_state_dict"],
-            structured_output_migrated=structured_output_migrated,
-        )
-        self.optimizer.load_state_dict(optimizer_state)
+        if exact_actor_pool:
+            for model, state in zip(self.models, actor_states):
+                load_seq_model_state_dict(model, state)
+            self.optimizer.load_state_dict(payload["optimizer_state_dict"])
+        else:
+            primary_state = payload["model_state_dict"]
+            structured_output_migrated = load_seq_model_state_dict(
+                self.model, primary_state
+            )
+            for model in self.models[1:]:
+                load_seq_model_state_dict(model, self.model.state_dict())
+            # A one-actor legacy optimizer has the same parameter topology and
+            # can retain its moments. Changing the number of actors changes the
+            # parameter set, so the new pool intentionally starts fresh Adam
+            # state rather than fabricating moments for copied policies.
+            source_actor_count = len(actor_states) if isinstance(actor_states, list) else 1
+            if len(self.models) == 1 and source_actor_count == 1:
+                optimizer_state = self._migrate_optimizer_state(
+                    payload["optimizer_state_dict"],
+                    structured_output_migrated=structured_output_migrated,
+                )
+                self.optimizer.load_state_dict(optimizer_state)
+
+        if self.critic is not None and self.critic_optimizer is not None:
+            if "critic_state_dict" in payload:
+                self.critic.load_state_dict(payload["critic_state_dict"])
+                if "critic_optimizer_state_dict" in payload:
+                    self.critic_optimizer.load_state_dict(
+                        payload["critic_optimizer_state_dict"]
+                    )
+            else:
+                # Migrating a legacy actor-only checkpoint: begin with its
+                # learned trunk/value head and a neutral zero private-deal path.
+                self.critic.backbone.load_state_dict(self.model.state_dict())
+            for phase, value in payload.get("entropy_log_alpha", {}).items():
+                if phase in self.log_entropy_alpha:
+                    self.log_entropy_alpha[phase].data.copy_(
+                        torch.as_tensor(value, device=self.device)
+                    )
+            if (
+                self.entropy_optimizer is not None
+                and "entropy_optimizer_state_dict" in payload
+            ):
+                self.entropy_optimizer.load_state_dict(
+                    payload["entropy_optimizer_state_dict"]
+                )
         self.iteration = int(payload.get("iteration", 0))
         self.optimizer_steps = int(payload.get("optimizer_steps", 0))
         curriculum = payload.get("opponent_curriculum_state", {})
@@ -1513,6 +2098,9 @@ class SeqTrainer:
         self.collector._peak_rows = dict(collector_state.get("peak_rows", {}))
         self.collector._rows_per_deal = dict(collector_state.get("rows_per_deal", {}))
         self.collector._seat_cursor = dict(collector_state.get("seat_cursor", {}))
+        self.collector._policy_cursor = int(
+            collector_state.get("policy_cursor", 0)
+        )
 
     def _migrate_optimizer_state(
         self,

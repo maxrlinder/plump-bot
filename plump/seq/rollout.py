@@ -42,6 +42,7 @@ from .config import (
 from .kv import KVCache
 from .model import SeqPlumpModel
 from .policy import SeqLeague, masked_probabilities
+from .precision import autocast_context
 from .tokens import (
     TOKEN_WIDTH,
     card_from_id,
@@ -134,6 +135,8 @@ class SeqDecisionRecord:
 
     position: int
     phase: int  # NEXT_BID or NEXT_PLAY
+    seat: int
+    policy_id: str
     action_index: int
     old_probs: np.ndarray  # masked policy over 11 bids or 52 cards
     old_value: float
@@ -152,6 +155,7 @@ class _Pending:
     """Policy readout captured when the last token reached the acting seat."""
 
     seat: int
+    policy_id: str
     bid_logits: np.ndarray
     card_logits: np.ndarray
     value: float
@@ -179,6 +183,7 @@ class SeqLeaf:
     )
     pending: Optional[_Pending] = None
     terminal_value: Optional[float] = None
+    terminal_rewards: Optional[dict[int, float]] = None
     covered_until: int = 0
     # Cache-free mode only: [num_players, max_len, TOKEN_WIDTH] token history
     # re-encoded from scratch at every decision.
@@ -222,6 +227,10 @@ class SeqTree:
     bidding_start_player: int
     initial_hands: dict[int, list]
     opponent_id: Optional[str] = None
+    # Absolute seat -> trainable actor id for current-policy seats. Historical
+    # and heuristic seats are omitted. With one trainable policy every value is
+    # simply ``current``; larger PPO pools use ``current:1``, etc.
+    seat_policy_ids: dict[int, str] = field(default_factory=dict)
     leaves: list[SeqLeaf] = field(default_factory=list)
     leaf_total: int = 0
     # How the tree divides across the focal's root-bid candidates.
@@ -304,11 +313,20 @@ class SeqRolloutCollector:
         train_config: SeqTrainingConfig,
         *,
         device: str | torch.device | None = None,
+        trainable_models: list[SeqPlumpModel] | None = None,
     ) -> None:
         self.model_config: SeqModelConfig = model.config
         self.train = train_config
         self.device = torch.device(device) if device is not None else model.device
-        self.model = model.to(self.device)
+        supplied = trainable_models or [model]
+        if supplied[0] is not model:
+            raise ValueError("The primary trainable model must be the first model.")
+        self.trainable_models = [candidate.to(self.device) for candidate in supplied]
+        self.model = self.trainable_models[0]
+        self._trainable_model_map = {
+            self._current_policy_id(index): candidate
+            for index, candidate in enumerate(self.trainable_models)
+        }
         self._caches: dict[str, KVCache] = {}
         self._kv_dtype = (
             torch.float16 if train_config.kv_dtype == "fp16" else torch.float32
@@ -327,11 +345,16 @@ class SeqRolloutCollector:
         # Player count -> next bidding position to assign. Persists across
         # collect() calls so the walk continues rather than restarting.
         self._seat_cursor: dict[int, int] = {}
+        self._policy_cursor = 0
         self._loop_row_cap = self._row_cap()
         self._split_plan: Optional[tuple[int, int]] = None
         self._split_done: set[int] = set()
         self.profile_sync = False
         self.stats = SeqCollectionStats()
+
+    @staticmethod
+    def _current_policy_id(index: int) -> str:
+        return CURRENT if index == 0 else f"{CURRENT}:{index}"
 
     def _sync(self) -> None:
         if not self.profile_sync:
@@ -545,7 +568,7 @@ class SeqRolloutCollector:
         options = self.train.rollout
         hand_size = cell.hand_size
 
-        models: dict[str, SeqPlumpModel] = {CURRENT: self.model}
+        models: dict[str, SeqPlumpModel] = dict(self._trainable_model_map)
         opponent_id: Optional[str] = None
         if (
             "historical" in arms
@@ -568,6 +591,16 @@ class SeqRolloutCollector:
         trees: list[SeqTree] = []
 
         def make_tree(arm: str, env: PlumpEnv, start: int, focal: int) -> SeqTree:
+            policy_count = len(self.trainable_models)
+            offset = self._policy_cursor % policy_count
+            self._policy_cursor += 1
+            if arm == "self":
+                seat_policy_ids = {
+                    seat: self._current_policy_id((offset + seat) % policy_count)
+                    for seat in range(num_players)
+                }
+            else:
+                seat_policy_ids = {focal: self._current_policy_id(offset)}
             tree = SeqTree(
                 arm=arm,
                 focal=focal,
@@ -579,6 +612,7 @@ class SeqRolloutCollector:
                     for player, hand in env.state.current_round.initial_hands.items()
                 },
                 opponent_id=opponent_id if arm == "historical" else None,
+                seat_policy_ids=seat_policy_ids,
             )
             trees.append(tree)
             return tree
@@ -593,7 +627,23 @@ class SeqRolloutCollector:
             else:
                 concurrent_unit.append(entry)
 
-        splits = options.splits_for(hand_size)
+        used_policy_ids = {
+            policy_id
+            for tree in trees
+            for policy_id in tree.seat_policy_ids.values()
+        }
+        if any(tree.arm == "historical" for tree in trees):
+            used_policy_ids.add(OPPONENT)
+        models = {
+            policy_id: candidate
+            for policy_id, candidate in models.items()
+            if policy_id in used_policy_ids
+        }
+
+        # PPO is deliberately one sampled trajectory per deal. Branch rules
+        # remain in the configuration for non-destructive switching back to a
+        # counterfactual objective, but are inert while PPO is selected.
+        splits = 1 if self.train.policy_objective == "ppo" else options.splits_for(hand_size)
         for unit in (concurrent_unit, *sequential_units):
             if not unit:
                 continue
@@ -628,7 +678,7 @@ class SeqRolloutCollector:
         self._split_plan = (split_group, split_total) if split_total > 1 else None
         self._split_done = set()
 
-        policy_count = 2 if OPPONENT in models else 1
+        policy_count = len(models)
         self._loop_row_cap = self._policy_row_cap(policy_count)
         arm_signature = tuple(
             (arm, sum(tree.arm == arm for tree in trees))
@@ -637,9 +687,7 @@ class SeqRolloutCollector:
         )
         shape = (num_players, hand_size, len(unit), split_total, arm_signature)
         if self.use_cache:
-            for policy_id in (CURRENT, OPPONENT):
-                if policy_id != CURRENT and policy_id not in models:
-                    continue
+            for policy_id in models:
                 self._ensure_cache(
                     policy_id,
                     self._cache_capacity(policy_id, shape, policy_count),
@@ -648,13 +696,13 @@ class SeqRolloutCollector:
                 )
 
         leaves: list[SeqLeaf] = []
-        row_counters: dict[str, int] = {CURRENT: 0, OPPONENT: 0}
+        row_counters: dict[str, int] = {policy_id: 0 for policy_id in models}
         for tree, deal_env, crn_state in unit:
             # matched arms share the random tape
             leaf_rng = _rng_from_state(crn_state)
             slots = {}
             for seat in range(num_players):
-                policy_id = self._policy_for_seat(tree.arm, tree.focal, seat)
+                policy_id = self._policy_for_seat(tree, seat)
                 if policy_id is None:
                     continue
                 slots[seat] = (policy_id, row_counters[policy_id])
@@ -823,16 +871,14 @@ class SeqRolloutCollector:
         bid_index = (tree.focal - tree.bidding_start_player) % tree.num_players
         return self.model_config.bid_token_position(tree.hand_size, bid_index)
 
-    def _policy_for_seat(
-        self, arm: str, focal: int, seat: int
-    ) -> str | None:
-        if seat == focal or arm == "self":
-            return CURRENT
-        if arm == "historical":
+    def _policy_for_seat(self, tree: SeqTree, seat: int) -> str | None:
+        if seat in tree.seat_policy_ids:
+            return tree.seat_policy_ids[seat]
+        if tree.arm == "historical":
             return OPPONENT
-        if arm == HEURISTIC:
+        if tree.arm == HEURISTIC:
             return None
-        raise ValueError(f"Unknown rollout arm {arm!r}.")
+        raise ValueError(f"Unknown rollout arm {tree.arm!r}.")
 
     def _ensure_cache(
         self, policy_id: str, capacity: int, max_len: int, max_capacity: int
@@ -994,7 +1040,14 @@ class SeqRolloutCollector:
         env = leaf.env
         actor = env.current_player()
 
-        if actor != leaf.tree.focal:
+        learn_actor = actor == leaf.tree.focal
+        if (
+            self.train.policy_objective == "ppo"
+            and leaf.tree.arm == "self"
+            and self.train.ppo_self_play_seats == "all"
+        ):
+            learn_actor = True
+        if not learn_actor:
             self._advance_leaf(
                 leaf, self._action_for(actor, phase, sampled), appends, alive_next
             )
@@ -1022,6 +1075,8 @@ class SeqRolloutCollector:
         record = SeqDecisionRecord(
             position=readout_position,
             phase=NEXT_BID if phase == Phase.BIDDING else NEXT_PLAY,
+            seat=actor,
+            policy_id=leaf.pending.policy_id,
             action_index=sampled,
             old_probs=probs,
             old_value=leaf.pending.value,
@@ -1031,6 +1086,12 @@ class SeqRolloutCollector:
         leaf.decisions.append(record)
         leaf.tree.decision_total += 1
         self.stats.decisions += 1
+
+        if self.train.policy_objective == "ppo":
+            self._advance_leaf(
+                leaf, self._action_for(actor, phase, sampled), appends, alive_next
+            )
+            return
 
         candidates, backup_weights, deterministic_count, inclusion = (
             self._branch_candidates(leaf, phase, legal, probs, sampled)
@@ -1213,7 +1274,6 @@ class SeqRolloutCollector:
                         sampled,
                         legal,
                         position,
-                        True,
                         appends,
                         alive_next,
                         row_counters,
@@ -1251,6 +1311,8 @@ class SeqRolloutCollector:
             decision = SeqDecisionRecord(
                 position=position - 1,
                 phase=NEXT_BID,
+                seat=actor,
+                policy_id=leaf.pending.policy_id,
                 action_index=sampled,
                 old_probs=probs,
                 old_value=leaf.pending.value,
@@ -1283,6 +1345,11 @@ class SeqRolloutCollector:
             return
         groups_of = {candidate: all_candidates.index(candidate) for candidate in group}
         reach_by_candidate = dict(zip(record.candidate_indices, record.prior_probs))
+        # Reach is a product along the path, exactly as in the unsplit path.
+        # The focal's bid is its first decision, so this is 1.0 today and the
+        # factor is a no-op -- carried explicitly so the invariant is enforced
+        # by the arithmetic rather than by that ordering happening to hold.
+        parent_reach = leaf.reach_weight
         for candidate in group:
             tree.leaves_by_bid_group[groups_of[candidate]] = 1
 
@@ -1314,7 +1381,7 @@ class SeqRolloutCollector:
                 owned_from=position,
                 on_policy_spine=(candidate == record.sampled_index),
                 upstream=(record, candidate),
-                reach_weight=reach_by_candidate[candidate],
+                reach_weight=parent_reach * reach_by_candidate[candidate],
                 bid_group=groups_of[candidate],
                 covered_until=position,
                 parent=leaf,
@@ -1328,7 +1395,7 @@ class SeqRolloutCollector:
         leaf.owned_from = min(leaf.owned_from, position) if first_pass else position
         leaf.on_policy_spine = group[0] == record.sampled_index
         leaf.upstream = (record, group[0])
-        leaf.reach_weight = reach_by_candidate[group[0]]
+        leaf.reach_weight = parent_reach * reach_by_candidate[group[0]]
         leaf.bid_group = groups_of[group[0]]
         self._advance_leaf(
             leaf,
@@ -1559,7 +1626,9 @@ class SeqRolloutCollector:
 
     def _finalize_leaf(self, leaf: SeqLeaf) -> None:
         scores = leaf.env.state.current_round.round_scores
-        leaf.terminal_value = compute_relative_rewards(scores)[leaf.tree.focal]
+        rewards = compute_relative_rewards(scores)
+        leaf.terminal_rewards = dict(rewards)
+        leaf.terminal_value = rewards[leaf.tree.focal]
         # Positions past the last appended token (forced run-out tail, or a
         # child terminating right after its branch action) still belong to
         # this leaf's terminal segment.
@@ -1618,12 +1687,13 @@ class SeqRolloutCollector:
                 np.stack([tokens for _, _, tokens in entries])
             ).to(self.device)
             # Root rows were assigned densely in this same iteration order.
-            if self.use_cache:
-                output = models[policy_id].forward_prefill(
-                    tokens, self._caches[policy_id], None
-                )
-            else:
-                output = models[policy_id].forward_prefix(tokens)
+            with autocast_context(self.device, self.train.precision):
+                if self.use_cache:
+                    output = models[policy_id].forward_prefill(
+                        tokens, self._caches[policy_id], None
+                    )
+                else:
+                    output = models[policy_id].forward_prefix(tokens)
             self.stats.forward_rows += len(entries) * prefix_len
             bid_logits = output.bid_logits.float().cpu().numpy()
             card_logits = output.card_logits.float().cpu().numpy()
@@ -1632,6 +1702,7 @@ class SeqRolloutCollector:
                 if leaf.env.state.current_player == seat:
                     leaf.pending = _Pending(
                         seat=seat,
+                        policy_id=policy_id,
                         bid_logits=bid_logits[row],
                         card_logits=card_logits[row],
                         value=float(values[row]),
@@ -1774,15 +1845,16 @@ class SeqRolloutCollector:
             for policy_id, block_array in batches.items():
                 row_count = block_array.shape[0]
                 tokens = torch.from_numpy(block_array).to(self.device)
-                if self.use_cache:
-                    output = models[policy_id].forward_step(
-                        tokens,
-                        position + run_start,
-                        self._caches[policy_id],
-                        None,
-                    )
-                else:
-                    output = models[policy_id].forward_prefix(tokens)
+                with autocast_context(self.device, self.train.precision):
+                    if self.use_cache:
+                        output = models[policy_id].forward_step(
+                            tokens,
+                            position + run_start,
+                            self._caches[policy_id],
+                            None,
+                        )
+                    else:
+                        output = models[policy_id].forward_prefix(tokens)
                 self._sync()
                 self.stats.forward_rows += row_count * (
                     run_len if self.use_cache else position + run_start + 1
@@ -1805,6 +1877,7 @@ class SeqRolloutCollector:
                     for i, (_, seat, leaf) in enumerate(capture_list):
                         leaf.pending = _Pending(
                             seat=seat,
+                            policy_id=policy_id,
                             bid_logits=bid_logits[i],
                             card_logits=card_logits[i],
                             value=float(values[i]),
