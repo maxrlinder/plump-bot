@@ -60,7 +60,10 @@ contains model and optimizer state, model/training configs, iteration and kept
 optimizer steps, trainer/framework RNG states, collector adaptive batching and
 seat cursors, rule fingerprint, and relocatable league references.
 New runs also save iteration zero so the untrained baseline can be evaluated
-and a run interrupted before its first interval can resume exactly.
+and a run interrupted before its first interval can resume exactly. If
+evaluation is enabled, training evaluates this checkpoint before update one,
+caches the result below `evaluations/iter_000000/`, and records it as the
+initial best model without counting it toward an opponent-curriculum gate.
 
 PPO checkpoints additionally retain every actor in the actor pool, the oracle
 or observer critic and its optimizer, adaptive bid/play entropy temperatures

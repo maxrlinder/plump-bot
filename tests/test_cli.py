@@ -217,6 +217,39 @@ def test_cli_prepare_only_forks_for_unavailable_device_and_resets_league(
     assert payload["league"] == []
 
 
+def test_fresh_run_evaluates_iteration_zero_before_training(
+    tmp_path, monkeypatch, capsys
+):
+    monkeypatch.setenv("PLUMP_RUNS_DIR", str(tmp_path))
+    args = _train_args("initial-eval")
+    args.extend(
+        (
+            "--set",
+            "evaluation.every=1",
+            "--set",
+            'evaluation.training_action_mode="sample"',
+        )
+    )
+
+    assert main(args) == 0
+
+    run = tmp_path / "initial-eval"
+    baseline = (
+        run
+        / "evaluations"
+        / "iter_000000"
+        / "heuristic_sample.json"
+    )
+    payload = json.loads(baseline.read_text())
+    assert payload["iteration"] == 0
+    assert payload["protocol"]["greedy"] is False
+    assert payload["report"]["rounds"] == 9
+    best = json.loads((run / "checkpoints" / "best.json").read_text())
+    assert best["iteration"] in (0, 1)
+    output = capsys.readouterr().out
+    assert "Initial iter 0 [sample] evaluated against heuristic" in output
+
+
 def test_cli_reconfigure_writes_resume_checkpoint_and_config_audit(
     tmp_path, monkeypatch
 ):

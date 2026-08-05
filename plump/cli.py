@@ -450,6 +450,55 @@ def train_command(args: argparse.Namespace) -> int:
         checkpoint_every = int(resolved.run["checkpoint_every"])
         dashboard_every = int(resolved.run["dashboard_every"])
 
+        # A random initialization is a meaningful evaluation baseline. Record
+        # it before update 1 whenever training begins at iteration zero. The
+        # checkpoint-scoped artifact is protocol-cached, so resuming an
+        # interrupted iteration-zero run does not repeat completed work. This
+        # observation deliberately does not advance the heuristic gate streak:
+        # no trained policy has won yet.
+        if trainer.iteration == 0 and int(evaluation["every"]) > 0:
+            initial_checkpoint = run.interval_checkpoint(0)
+            initial_protocol = EvaluationProtocol(
+                opponent="heuristic",
+                player_counts=resolved.training.player_counts,
+                hand_sizes=tuple(
+                    sorted(
+                        {
+                            cell.hand_size
+                            for cell in resolved.training.schedule_cells
+                        }
+                    )
+                ),
+                deals_per_configuration=int(evaluation["deals"]),
+                deal_seed=int(evaluation["seed"]),
+                action_seed=int(evaluation.get("action_seed", 17)),
+                bootstrap_samples=2000,
+                batch_size=int(evaluation["batch_size"]),
+                greedy=training_action_mode == "argmax",
+            )
+            payload, created = evaluate_checkpoint(
+                run,
+                initial_checkpoint,
+                protocol=initial_protocol,
+                deal_bank=eval_bank,
+                device=device,
+            )
+            initial_report = payload["report"]
+            initial_reward = float(initial_report["macro_relative_reward"])
+            initial_bid_hit = float(initial_report["macro_bid_hit_rate"])
+            best = run.best_metric()
+            if best is None or initial_reward > best:
+                best_path = run.checkpoints / "best.pt"
+                trainer.save_checkpoint(best_path)
+                run.record_best(best_path, 0, initial_reward)
+            status = "evaluated" if created else "cached"
+            _emit(
+                run,
+                f"Initial iter 0 [{training_action_mode}] {status} against "
+                f"heuristic | reward={initial_reward:.4f} "
+                f"bid_hit={initial_bid_hit:.4f}.",
+            )
+
         for iteration in range(trainer.iteration + 1, target + 1):
             trainer.iteration = iteration
             started = time.perf_counter()

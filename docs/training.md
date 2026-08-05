@@ -262,7 +262,13 @@ uv run plump train ppo-oracle-mps-768-v2 --config configs/ppo-mps.toml \
 ```
 
 Omitting `--from-checkpoint` creates and records `iter_000000.pt` before the
-first update. The resolved overrides are copied into the run's `config.toml`.
+first update. When evaluation is enabled, that checkpoint is immediately
+evaluated against the heuristic using the configured deal bank and action
+mode. The checkpoint-scoped result supplies the random-policy point on the
+dashboard and initializes `best`, but deliberately does not advance the
+heuristic-switch win streak. A matching cached result is reused if an
+iteration-zero run is resumed. The resolved overrides are copied into the
+run's `config.toml`.
 
 An existing run can adopt an explicitly changed configuration with
 `plump train RUN --config ... --reconfigure --reconfigure-reason ...`. This
