@@ -49,7 +49,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--hand-size-tilt", type=float, default=1.0)
     parser.add_argument("--auto-deals", action="store_true")
     parser.add_argument("--microbatch-positions", type=int, default=16384)
-    parser.add_argument("--kv-dtype", choices=["fp32", "fp16"], default="fp32")
+    parser.add_argument(
+        "--kv-dtype", choices=["fp32", "fp16", "bf16"], default="fp32"
+    )
     parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--players", type=int, default=None)
     parser.add_argument("--play-mode", default="all_legal")

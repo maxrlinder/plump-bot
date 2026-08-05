@@ -925,7 +925,8 @@ distinct. Actor zero remains the evaluated/deployed policy and league snapshot
 source.
 
 On MPS, BF16 autocast lowers eligible transformer operations while parameters
-and Adam state stay FP32. Cached K/V is independently FP16. Attention softmax,
+and Adam state stay FP32. The current MPS preset stores cached K/V in FP16,
+which is faster than BF16 cached attention on the M5 Pro. Attention softmax,
 masked policy log-softmax, likelihood ratios, KL, entropy, returns, advantages,
 and loss accumulation are explicitly FP32.
 

@@ -33,7 +33,13 @@ MODEL = SeqModelConfig(d_model=32, n_layers=1, n_heads=2, d_ff=64)
 
 
 def ppo_config(
-    *, cells=None, actors=1, precision="fp32", critic_epochs=1, bucket_width=0
+    *,
+    cells=None,
+    actors=1,
+    precision="fp32",
+    kv_dtype="fp16",
+    critic_epochs=1,
+    bucket_width=0,
 ):
     return SeqTrainingConfig(
         schedule_cells=cells
@@ -54,7 +60,7 @@ def ppo_config(
         policy_kl_cap=1.0,
         policy_kl_p99_cap=1.0,
         precision=precision,
-        kv_dtype="fp16",
+        kv_dtype=kv_dtype,
     )
 
 
@@ -257,7 +263,7 @@ def test_ppo_length_bucketing_merges_shapes_and_preserves_causal_readouts():
     not torch.backends.mps.is_available(), reason="requires Apple MPS"
 )
 def test_mps_bf16_ppo_smoke():
-    config = ppo_config(precision="bf16")
+    config = ppo_config(precision="bf16", kv_dtype="bf16")
     trainer = SeqTrainer(SeqPlumpModel(MODEL), config, device="mps")
     trees, _ = trainer.collect()
     stats = trainer.update(trees)
@@ -266,5 +272,21 @@ def test_mps_bf16_ppo_smoke():
     assert np.isfinite(stats.loss_value)
     assert stats.ppo_behavior_replay_kl < 1e-3
     # Autocast lowers compute, not the master weights or Adam state.
+    assert next(trainer.model.parameters()).dtype == torch.float32
+    assert trainer.collector._kv_dtype == torch.bfloat16
+
+
+@pytest.mark.skipif(
+    not torch.backends.mps.is_available(), reason="requires Apple MPS"
+)
+def test_mps_fp16_ppo_smoke():
+    config = ppo_config(precision="fp16", kv_dtype="fp16")
+    trainer = SeqTrainer(SeqPlumpModel(MODEL), config, device="mps")
+    trees, _ = trainer.collect()
+    stats = trainer.update(trees)
+    torch.mps.synchronize()
+    assert np.isfinite(stats.loss_policy)
+    assert np.isfinite(stats.loss_value)
+    assert stats.ppo_behavior_replay_kl < 1e-3
     assert next(trainer.model.parameters()).dtype == torch.float32
     assert trainer.collector._kv_dtype == torch.float16

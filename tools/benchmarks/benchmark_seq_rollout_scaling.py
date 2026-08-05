@@ -47,7 +47,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--n-layers", type=int, default=6)
     parser.add_argument("--n-heads", type=int, default=8)
     parser.add_argument("--d-ff", type=int, default=768)
-    parser.add_argument("--kv-dtype", choices=["fp32", "fp16"], default="fp16")
+    parser.add_argument(
+        "--kv-dtype", choices=["fp32", "fp16", "bf16"], default="fp16"
+    )
     # Per-stage timings need syncs, which serialize CPU against GPU and so
     # understate the real overlap. --no-profile-sync reports honest wall time
     # with a meaningless breakdown.

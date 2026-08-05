@@ -17,11 +17,11 @@ def autocast_context(device: torch.device, precision: str):
 
     if precision == "fp32":
         return nullcontext()
-    if precision != "bf16":
+    if precision not in ("fp16", "bf16"):
         raise ValueError(f"Unknown precision {precision!r}.")
     if device.type not in ("cpu", "cuda", "mps"):
         raise ValueError(
-            f"BF16 autocast is not configured for device type {device.type!r}."
+            f"Autocast is not configured for device type {device.type!r}."
         )
-    return torch.autocast(device_type=device.type, dtype=torch.bfloat16)
-
+    dtype = torch.float16 if precision == "fp16" else torch.bfloat16
+    return torch.autocast(device_type=device.type, dtype=dtype)

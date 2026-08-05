@@ -100,6 +100,8 @@ max_deals_per_batch = 128
 opponent_mode = "heuristic_then_historical"
 opponent_fraction = 0.5
 opponent_packing = "concurrent"
+# On M5 Pro, BF16 transformer compute plus FP16 cached attention is the fastest
+# measured pair. BF16 cache was 17% slower and full FP16 compute 26% slower.
 kv_dtype = "fp16"
 bid_position_mode = "uniform"
 

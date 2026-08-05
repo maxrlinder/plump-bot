@@ -347,6 +347,11 @@ def test_unknown_policy_objective_is_rejected():
         make_trainer(policy_objective="not_an_objective")
 
 
+def test_unknown_kv_dtype_is_rejected():
+    with pytest.raises(ValueError, match="kv_dtype"):
+        make_trainer(kv_dtype="not_a_dtype")
+
+
 def test_kl_backtracking_accepts_a_smaller_adam_step(monkeypatch):
     trainer = make_trainer(
         policy_objective="sampled_mirror",

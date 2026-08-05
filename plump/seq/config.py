@@ -1003,8 +1003,8 @@ class SeqTrainingConfig:
     eval_every: int = 100
     checkpoint_every: int = 200
     device: Optional[str] = None
-    precision: Literal["fp32", "bf16"] = "fp32"
-    kv_dtype: Literal["fp32", "fp16"] = "fp32"
+    precision: Literal["fp32", "fp16", "bf16"] = "fp32"
+    kv_dtype: Literal["fp32", "fp16", "bf16"] = "fp32"
     # False re-encodes each leaf's full prefix every decision (no cache).
     # Kept as a knob so the cache's FLOPs-vs-memory-traffic tradeoff stays
     # measurable at any batch size.
@@ -1077,8 +1077,10 @@ class SeqTrainingConfig:
             raise ValueError("ppo_bid_entropy_target must be in [0, 1].")
         if not 0.0 <= self.ppo_play_entropy_target <= 1.0:
             raise ValueError("ppo_play_entropy_target must be in [0, 1].")
-        if self.precision not in ("fp32", "bf16"):
-            raise ValueError("precision must be 'fp32' or 'bf16'.")
+        if self.precision not in ("fp32", "fp16", "bf16"):
+            raise ValueError("precision must be 'fp32', 'fp16', or 'bf16'.")
+        if self.kv_dtype not in ("fp32", "fp16", "bf16"):
+            raise ValueError("kv_dtype must be 'fp32', 'fp16', or 'bf16'.")
         if self.policy_kl_cap <= 0 or self.policy_kl_p99_cap <= 0:
             raise ValueError("Policy KL caps must be > 0.")
         if self.neurd_advantage_clip < 0 or self.sampled_mirror_advantage_clip < 0:

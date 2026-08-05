@@ -183,8 +183,8 @@ mode increases a positive temperature when measured normalized entropy falls
 below its configured target and decreases it above target. Full masked
 `KL(pi_old || pi_new)` mean and p99 guards still backtrack or reject an Adam
 proposal independently of PPO ratio clipping. `ppo_behavior_replay_kl` checks
-the pre-update numerical difference between FP16-KV cached collection and the
-full-sequence update replay; it should remain near zero.
+the pre-update numerical difference between reduced-precision cached
+collection and full-sequence update replay; it should remain near zero.
 
 `ppo_trainable_policies=1` shares actor weights across learned seats. Larger
 values create genuinely independent actor parameters. Self-play seats are
@@ -193,10 +193,12 @@ anchor games rotate the same way. All actor weights, optimizer state, critic,
 entropy temperatures, and assignment cursor are checkpointed. Actor zero is
 the deployment/evaluation model and the source of historical league snapshots.
 
-The MPS preset is `configs/ppo-mps.toml`. It uses BF16 autocast with FP32 master
-parameters and Adam state, FP16 KV storage, and FP32 attention softmax, masked
-log-softmax, ratios, KL, entropy, returns, and advantages. Rollout games and
-update microbatch positions are independent memory knobs.
+The MPS preset is `configs/ppo-mps.toml`. It uses BF16 autocast and FP16 KV
+storage with FP32 master parameters and Adam state. Attention softmax, masked
+log-softmax, ratios, KL, entropy, returns, and advantages remain FP32. On the
+M5 Pro, this mixed pair measured 99.7 rollout games/s, versus 82.8 for full
+BF16, 73.3 for full FP16, and 56.9 for full FP32. Rollout games and update
+microbatch positions are independent memory knobs.
 
 PPO update groups can be coalesced with `ppo_sequence_bucket_width`. Each
 actor/oracle sequence is tail-padded to the next bucket boundary (capped at its

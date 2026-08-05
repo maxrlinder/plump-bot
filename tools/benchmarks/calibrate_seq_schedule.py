@@ -86,7 +86,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--turn-token", choices=["off", "bid", "all"], default="off"
     )
-    parser.add_argument("--kv-dtype", choices=["fp32", "fp16"], default="fp16")
+    parser.add_argument(
+        "--kv-dtype", choices=["fp32", "fp16", "bf16"], default="fp16"
+    )
     parser.add_argument("--cache-budget-gb", type=float, default=10.0)
     parser.add_argument("--auto-target-rows", type=int, default=None)
     parser.add_argument("--auto-headroom", type=float, default=0.5)

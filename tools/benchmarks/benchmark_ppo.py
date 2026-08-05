@@ -7,7 +7,7 @@ Example (small MPS smoke):
         --games-per-shape 2 --warmup 1 --repeats 2
 
 The benchmark uses the production collector, PPO actor loss, oracle critic,
-BF16 autocast, and FP16 KV cache. It never creates a run or checkpoint.
+and the configured compute/cache dtypes. It never creates a run or checkpoint.
 """
 
 from __future__ import annotations
@@ -32,7 +32,8 @@ def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser()
     result.add_argument("--config", type=Path, default=Path("configs/ppo-mps.toml"))
     result.add_argument("--device", default="auto")
-    result.add_argument("--precision", choices=("fp32", "bf16"))
+    result.add_argument("--precision", choices=("fp32", "fp16", "bf16"))
+    result.add_argument("--kv-dtype", choices=("fp32", "fp16", "bf16"))
     result.add_argument("--games-per-shape", type=int, default=2)
     result.add_argument("--microbatch-positions", type=int)
     result.add_argument("--bucket-width", type=int)
@@ -63,6 +64,8 @@ def main() -> int:
     overrides = [f"training.deals_per_shape={args.games_per_shape}"]
     if args.precision:
         overrides.append(f'training.precision="{args.precision}"')
+    if args.kv_dtype:
+        overrides.append(f'rollout.kv_dtype="{args.kv_dtype}"')
     if args.microbatch_positions:
         overrides.append(
             f"training.microbatch_positions={args.microbatch_positions}"
@@ -121,6 +124,7 @@ def main() -> int:
             "update_peak_gb": stats.peak_update_device_bytes / 1e9,
             "baseline_gb": baseline / 1e9,
             "policy_kl": stats.policy_kl,
+            "behavior_replay_kl": stats.ppo_behavior_replay_kl,
         }
         samples.append(sample)
         print(json.dumps({"iteration": index - args.warmup + 1, **sample}))

@@ -59,7 +59,9 @@ def parse_args() -> argparse.Namespace:
         help="GQA: KV heads per layer (must divide n_heads). Default = n_heads.",
     )
     parser.add_argument("--d-ff", type=int, default=768)
-    parser.add_argument("--kv-dtype", default="fp16")
+    parser.add_argument(
+        "--kv-dtype", choices=["fp32", "fp16", "bf16"], default="fp16"
+    )
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument("--deals-per-batch", type=int, default=1)
     parser.add_argument(

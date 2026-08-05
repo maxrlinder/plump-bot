@@ -328,9 +328,11 @@ class SeqRolloutCollector:
             for index, candidate in enumerate(self.trainable_models)
         }
         self._caches: dict[str, KVCache] = {}
-        self._kv_dtype = (
-            torch.float16 if train_config.kv_dtype == "fp16" else torch.float32
-        )
+        self._kv_dtype = {
+            "fp32": torch.float32,
+            "fp16": torch.float16,
+            "bf16": torch.bfloat16,
+        }[train_config.kv_dtype]
         self.use_cache = train_config.use_kv_cache
         self.heuristic = HeuristicPolicy()
         self._total_leaves = 0
@@ -913,7 +915,7 @@ class SeqRolloutCollector:
 
     def _bytes_per_row(self) -> int:
         config = self.model_config
-        element = 2 if self._kv_dtype == torch.float16 else 4
+        element = 2 if self._kv_dtype in (torch.float16, torch.bfloat16) else 4
         return (
             config.n_layers
             * config.kv_heads

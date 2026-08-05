@@ -55,7 +55,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--n-heads", type=int, default=10)
     parser.add_argument("--n-kv-heads", type=int, default=2)
     parser.add_argument("--d-ff", type=int, default=960)
-    parser.add_argument("--kv-dtype", choices=["fp32", "fp16"], default="fp16")
+    parser.add_argument(
+        "--kv-dtype", choices=["fp32", "fp16", "bf16"], default="fp16"
+    )
     parser.add_argument("--cache-budget-gb", type=float, default=12.0)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--device", default=None)

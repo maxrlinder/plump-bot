@@ -118,7 +118,7 @@ class DecoderBlock(nn.Module):
         slower still -- which would make grouped KV a memory saving paid for in
         wall time. Grouping the *query* heads instead keeps K/V at
         ``kv_heads``, so GQA wins on both axes. Softmax runs in fp32 (as SDPA
-        does) so an fp16 cache does not cost accuracy.
+        does), limiting sensitivity to reduced-precision cache storage.
 
         With ``T > 1`` the new queries sit at the end of the cached prefix, so
         query ``i`` may see keys up to ``len(k) - T + i``: a rectangular causal
@@ -170,7 +170,8 @@ class DecoderBlock(nn.Module):
         """Causal attention against the cached prefix; writes new K/V.
 
         ``slots=None`` uses the dense rows 0..B-1 fast path (zero-copy reads).
-        Attention runs in the cache dtype so fp16 caches avoid a cast copy.
+        Attention runs in the cache dtype. Matching it to the autocast dtype
+        avoids a query cast while retaining two-byte cache storage.
         """
 
         length = x.shape[1]

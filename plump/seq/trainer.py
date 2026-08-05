@@ -984,9 +984,9 @@ class SeqTrainer:
             stats.entropy_play_normalized = epoch["play_entropy"]
             stats.ppo_ratio_clip_fraction = epoch["clip_fraction"]
             if actor_epoch == 0:
-                # Cached rollout uses FP16 K/V while the update replays full
-                # sequences. This should remain numerical noise, not silently
-                # turn the first PPO epoch into an off-policy update.
+                # Cached rollout may use reduced-precision K/V while the update
+                # replays full sequences. This should remain numerical noise,
+                # not silently turn the first PPO epoch off-policy.
                 stats.ppo_behavior_replay_kl = epoch["behavior_kl"]
             stats.policy_logit_shift = epoch["logit_shift"]
             stats.core_grad_norm = float(
