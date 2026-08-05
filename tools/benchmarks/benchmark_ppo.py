@@ -6,7 +6,7 @@ Example (small MPS smoke):
     .venv/bin/python tools/benchmarks/benchmark_ppo.py \
         --games-per-shape 2 --warmup 1 --repeats 2
 
-The benchmark uses the production collector, PPO actor loss, privileged critic,
+The benchmark uses the production collector, PPO actor loss, oracle critic,
 BF16 autocast, and FP16 KV cache. It never creates a run or checkpoint.
 """
 
@@ -143,4 +143,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

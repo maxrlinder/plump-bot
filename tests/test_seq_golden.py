@@ -254,6 +254,11 @@ def test_schema_v6_collection_and_update_match_corrected_golden_hashes():
                             "advantage_mean",
                             "advantage_std",
                             "critic_grad_norm",
+                            "critic_all_player_rmse",
+                            "critic_all_player_correlation",
+                            "critic_loss_first_epoch",
+                            "critic_loss_last_epoch",
+                            "critic_loss_reduction",
                             "peak_update_device_bytes",
                         }
                 }

@@ -42,6 +42,10 @@ def test_dashboard_renders_sparse_partial_and_resumed_rows(tmp_path):
                 "loss_trick",
                 "core_grad_norm",
                 "auxiliary_grad_norm",
+                "critic_grad_norm",
+                "critic_all_player_rmse",
+                "critic_all_player_correlation",
+                "critic_loss_reduction",
                 "rolled_back",
             ),
         )
@@ -67,6 +71,10 @@ def test_dashboard_renders_sparse_partial_and_resumed_rows(tmp_path):
                 "loss_trick": 1.4,
                 "core_grad_norm": 80.0,
                 "auxiliary_grad_norm": 0.08,
+                "critic_grad_norm": 1.8,
+                "critic_all_player_rmse": 4.7,
+                "critic_all_player_correlation": 0.12,
+                "critic_loss_reduction": 0.08,
                 "rolled_back": 0,
             }
         )
@@ -91,6 +99,10 @@ def test_dashboard_renders_sparse_partial_and_resumed_rows(tmp_path):
                 "loss_trick": 1.3,
                 "core_grad_norm": 60.0,
                 "auxiliary_grad_norm": 0.06,
+                "critic_grad_norm": 1.4,
+                "critic_all_player_rmse": 4.3,
+                "critic_all_player_correlation": 0.24,
+                "critic_loss_reduction": 0.17,
                 "rolled_back": 1,
             }
         )

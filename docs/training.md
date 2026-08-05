@@ -149,14 +149,32 @@ advantage = terminal_relative_reward - V_old(global_state, seat)
 There is no epsilon-random behavior policy. Sampling from an external mixture
 while storing `pi_old` probabilities would make ordinary PPO off-policy.
 
-PPO uses an independent critic trunk. In `ppo_critic_mode="privileged"`, its
-public causal tokens are identical to the actor's, while a fixed-size side
-tensor encodes every initial hand by observer-relative owner, exact card, rank,
-and suit. That tensor is added only to the critic's GAME representation: it
-adds no rollout tokens and cannot enter the actor. The complete initial deal
-plus the public event stream determines the full game state. The critic is
-trained against undiscounted terminal relative return; its frozen pre-update
-predictions produce the actor advantages.
+PPO uses an independent critic trunk. In the default
+`ppo_critic_mode="oracle"`, update batching builds one canonical sequence per
+environment game rather than one sequence per learned observer. Its prefix has
+one distinct HAND token for every dealt card, ordered by absolute owner seat;
+each token contains owner, exact-card, rank, and suit fields. The public suffix
+also uses absolute seat ids. The value head emits `max_players` columns, and
+column `s` is always the value for the same seat `s` named by card-owner and
+event-actor fields. An assertion checks this tie for every PPO decision while
+building the update batch.
+
+At each learned pre-action state the critic is trained against all active
+players' undiscounted terminal relative returns. Its loss averages the player
+axis, so adding output columns does not multiply the weight of larger tables.
+For the actor advantage only the acting player's column is selected. The
+critic runs after rollout collection, uses full causal forwards grouped by
+player/hand shape, and never changes actor tokens or exposes hidden cards at
+deployment. The older `privileged` pooled-deal observer critic and the
+non-privileged `independent` critic remain available as ablations.
+
+For oracle PPO runs, the dashboard's value panel becomes **Oracle critic
+dynamics**. It compares acting-seat RMSE, all-seat RMSE, and the zero-baseline
+RMSE; plots acting/all-seat return correlation and fractional critic-loss
+reduction from the first to last epoch within each update; and includes the
+separately clipped critic gradient norm in the gradient panel. The raw first
+and last epoch losses are retained in `metrics.csv` as
+`critic_loss_first_epoch` and `critic_loss_last_epoch`.
 
 Entropy is calculated over legal actions and normalized by `log(legal_count)`.
 Forced moves are excluded. Bid and play temperatures are separate. Adaptive

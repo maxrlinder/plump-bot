@@ -9,9 +9,16 @@ from dataclasses import dataclass, field
 import numpy as np
 import torch
 
-from .config import NEXT_BID, NUM_CARDS, SeqModelConfig, SeqTrainingConfig
+from .config import (
+    NEXT_BID,
+    NUM_CARDS,
+    SLOT_NEXT_ACTOR,
+    SLOT_NEXT_PHASE,
+    SeqModelConfig,
+    SeqTrainingConfig,
+)
 from .rollout import SeqTree
-from .tokens import TOKEN_WIDTH, build_seat_tokens, card_id
+from .tokens import TOKEN_WIDTH, build_oracle_tokens, build_seat_tokens, card_id
 
 
 @dataclass
@@ -23,6 +30,11 @@ class PPOPolicyRows:
     returns: list[float] = field(default_factory=list)
     advantages: list[float] = field(default_factory=list)
     weight: list[float] = field(default_factory=list)
+    # Address of this same pre-action state in the canonical oracle sequence.
+    critic_group: list[int] = field(default_factory=list)
+    critic_seq_index: list[int] = field(default_factory=list)
+    critic_position: list[int] = field(default_factory=list)
+    critic_seat: list[int] = field(default_factory=list)
 
 
 @dataclass
@@ -31,10 +43,35 @@ class PPOTrainingGroup:
     num_players: int
     hand_size: int
     tokens: np.ndarray  # [B, L, TOKEN_WIDTH], one observer trajectory per row
-    # [B, max_players, max_hand_size], indexed by observer-relative owner and
-    # padded with NUM_CARDS. This side input is consumed by the critic only.
+    # Legacy observer-critic side input: [B, max_players, max_hand_size],
+    # indexed by observer-relative owner and padded with NUM_CARDS. The oracle
+    # critic instead consumes PPOCriticGroup.tokens.
     initial_hands: np.ndarray
     policy: dict[str, PPOPolicyRows]
+
+
+@dataclass
+class PPOCriticRows:
+    seq_index: list[int] = field(default_factory=list)
+    position: list[int] = field(default_factory=list)
+    acting_seat: list[int] = field(default_factory=list)
+    returns: list[np.ndarray] = field(default_factory=list)
+    weight: list[float] = field(default_factory=list)
+
+
+@dataclass
+class PPOCriticGroup:
+    num_players: int
+    hand_size: int
+    # [games, oracle_length, TOKEN_WIDTH], exactly one row per environment game.
+    tokens: np.ndarray
+    rows: PPOCriticRows
+
+
+@dataclass
+class PPOTrainingBatch:
+    policy_groups: list[PPOTrainingGroup]
+    critic_groups: list[PPOCriticGroup]
 
 
 @dataclass
@@ -69,11 +106,11 @@ def _relative_initial_hands(
     return hands
 
 
-def build_ppo_training_groups(
+def build_ppo_training_batch(
     trees: list[SeqTree],
     model_config: SeqModelConfig,
     train_config: SeqTrainingConfig,
-) -> list[PPOTrainingGroup]:
+) -> PPOTrainingBatch:
     """Build one actor-observation row per learned seat of each sampled game.
 
     A game's policy weight is divided by its number of learned seats C_g, but
@@ -98,6 +135,7 @@ def build_ppo_training_groups(
     if importance_total <= 0:
         raise ValueError("PPO game importance must have positive total mass.")
 
+    games: list[tuple[SeqTree, object, tuple[int, ...], float]] = []
     entries: dict[
         tuple[str, int, int], list[tuple[SeqTree, object, int, float]]
     ] = defaultdict(list)
@@ -108,6 +146,7 @@ def build_ppo_training_groups(
         leaf = spines[0]
         seats = _learning_seats(tree, train_config)
         seat_weight = game_importance[id(tree)] / importance_total / len(seats)
+        games.append((tree, leaf, seats, seat_weight))
         for observer in seats:
             policy_id = tree.seat_policy_ids.get(observer)
             if policy_id is None:
@@ -115,6 +154,74 @@ def build_ppo_training_groups(
             entries[(policy_id, tree.num_players, tree.hand_size)].append(
                 (tree, leaf, observer, seat_weight)
             )
+
+    # Build the oracle half first so every actor row can store a checked,
+    # integer address into its game's single canonical critic sequence.
+    games_by_shape: dict[
+        tuple[int, int], list[tuple[SeqTree, object, tuple[int, ...], float]]
+    ] = defaultdict(list)
+    for game in games:
+        tree = game[0]
+        games_by_shape[(tree.num_players, tree.hand_size)].append(game)
+
+    critic_groups: list[PPOCriticGroup] = []
+    critic_location: dict[int, tuple[int, int, int, int]] = {}
+    for (players, hand_size), shape_games in sorted(games_by_shape.items()):
+        length = model_config.oracle_seq_len(players, hand_size)
+        tokens = np.empty(
+            (len(shape_games), length, TOKEN_WIDTH), dtype=np.int64
+        )
+        critic_rows = PPOCriticRows()
+        group_index = len(critic_groups)
+        position_shift = (players - 1) * hand_size
+        for seq_index, (tree, leaf, seats, seat_weight) in enumerate(shape_games):
+            tokens[seq_index] = build_oracle_tokens(
+                model_config,
+                leaf.env.state.event_log,
+                players,
+                hand_size,
+                tree.initial_hands,
+                tree.bidding_start_player,
+            )
+            if leaf.terminal_rewards is None:
+                raise ValueError("PPO leaf is missing terminal rewards.")
+            returns = np.zeros(model_config.max_players, dtype=np.float32)
+            returns[:players] = [
+                float(leaf.terminal_rewards[seat]) for seat in range(players)
+            ]
+            for record in leaf.decisions:
+                if record.seat not in seats:
+                    continue
+                position = record.position + position_shift
+                token = tokens[seq_index, position]
+                if (
+                    int(token[SLOT_NEXT_ACTOR]) != record.seat
+                    or int(token[SLOT_NEXT_PHASE]) != record.phase
+                ):
+                    raise AssertionError(
+                        "Oracle value address is not tied to the acting seat/phase."
+                    )
+                if id(record) in critic_location:
+                    raise AssertionError("A PPO decision was added to the critic twice.")
+                critic_location[id(record)] = (
+                    group_index,
+                    seq_index,
+                    position,
+                    record.seat,
+                )
+                critic_rows.seq_index.append(seq_index)
+                critic_rows.position.append(position)
+                critic_rows.acting_seat.append(record.seat)
+                critic_rows.returns.append(returns.copy())
+                critic_rows.weight.append(seat_weight)
+        critic_groups.append(
+            PPOCriticGroup(
+                num_players=players,
+                hand_size=hand_size,
+                tokens=tokens,
+                rows=critic_rows,
+            )
+        )
 
     groups: list[PPOTrainingGroup] = []
     for (policy_id, players, hand_size), rows in sorted(entries.items()):
@@ -154,6 +261,18 @@ def build_ppo_training_groups(
                 target.returns.append(terminal_return)
                 target.advantages.append(0.0)
                 target.weight.append(seat_weight)
+                try:
+                    critic_group, critic_seq, critic_position, critic_seat = (
+                        critic_location[id(record)]
+                    )
+                except KeyError as error:
+                    raise AssertionError(
+                        "Actor decision is absent from the oracle critic batch."
+                    ) from error
+                target.critic_group.append(critic_group)
+                target.critic_seq_index.append(critic_seq)
+                target.critic_position.append(critic_position)
+                target.critic_seat.append(critic_seat)
         groups.append(
             PPOTrainingGroup(
                 policy_id=policy_id,
@@ -164,7 +283,17 @@ def build_ppo_training_groups(
                 policy=policy,
             )
         )
-    return groups
+    return PPOTrainingBatch(policy_groups=groups, critic_groups=critic_groups)
+
+
+def build_ppo_training_groups(
+    trees: list[SeqTree],
+    model_config: SeqModelConfig,
+    train_config: SeqTrainingConfig,
+) -> list[PPOTrainingGroup]:
+    """Compatibility wrapper returning only the actor-observation groups."""
+
+    return build_ppo_training_batch(trees, model_config, train_config).policy_groups
 
 
 def ppo_clipped_terms(
@@ -267,4 +396,29 @@ def ppo_rows_by_chunk(group: PPOTrainingGroup, chunks) -> list[dict[str, dict]]:
                         selected[name].append(getattr(rows, name)[index])
             chunk[phase] = selected
         out.append(chunk)
+    return out
+
+
+def ppo_critic_rows_by_chunk(
+    group: PPOCriticGroup, chunks
+) -> list[dict[str, list]]:
+    """Select oracle value rows for each contiguous game microbatch."""
+
+    out: list[dict[str, list]] = []
+    for start, stop in list(chunks):
+        selected: dict[str, list] = {
+            "seq_index": [],
+            "position": [],
+            "acting_seat": [],
+            "returns": [],
+            "weight": [],
+        }
+        for index, seq_index in enumerate(group.rows.seq_index):
+            if start <= seq_index < stop:
+                selected["seq_index"].append(seq_index - start)
+                selected["position"].append(group.rows.position[index])
+                selected["acting_seat"].append(group.rows.acting_seat[index])
+                selected["returns"].append(group.rows.returns[index])
+                selected["weight"].append(group.rows.weight[index])
+        out.append(selected)
     return out

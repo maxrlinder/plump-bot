@@ -617,6 +617,108 @@ class SeqPPOCritic(nn.Module):
         return self.backbone.value_head(hidden).squeeze(-1)
 
 
+class SeqPPOOracleCritic(nn.Module):
+    """One perfect-information sequence and one value vector per game.
+
+    The prefix contains ``P * N`` separate HAND tokens, ordered first by the
+    environment's absolute seat and then by card. Their player field identifies
+    the owner. The public suffix uses observer 0, so its player fields use that
+    same absolute-seat convention. Output column ``s`` is consequently tied to
+    input owner/actor id ``s`` without any observer-relative remapping.
+
+    This critic runs only during the update. Its longer positional table does
+    not alter the actor architecture, rollout sequence, or KV cache.
+    """
+
+    def __init__(
+        self,
+        config: SeqModelConfig,
+        *,
+        initialize_from: SeqPlumpModel | None = None,
+    ) -> None:
+        super().__init__()
+        self.config = config
+        self.backbone = SeqPlumpModel(config)
+
+        # The oracle adds (P - 1) * N card tokens. Preserve the actor's learned
+        # positional rows and initialize only the critic-only tail.
+        actor_positions = self.backbone.pos_embedding
+        oracle_positions = nn.Embedding(config.oracle_max_seq_len, config.d_model)
+        SeqPlumpModel._init_module(oracle_positions)
+        with torch.no_grad():
+            oracle_positions.weight[: actor_positions.num_embeddings].copy_(
+                actor_positions.weight
+            )
+        self.backbone.pos_embedding = oracle_positions
+
+        d = config.d_model
+        self.player_value_head = nn.Sequential(
+            nn.Linear(d, d),
+            nn.GELU(),
+            nn.Linear(d, config.max_players),
+        )
+        self.player_value_head.apply(SeqPlumpModel._init_module)
+        if initialize_from is not None:
+            self.initialize_from_actor(initialize_from)
+
+        # These actor readouts are retained only so the actor trunk can be
+        # copied exactly. The oracle evaluates only player_value_head.
+        for module in (
+            self.backbone.bid_head,
+            self.backbone.card_head,
+            self.backbone.value_head,
+            self.backbone.card_rank_output_embedding,
+            self.backbone.card_suit_output_embedding,
+            self.backbone.trick_count_head,
+            self.backbone.suit_presence_head,
+            self.backbone.bid_hit_head,
+        ):
+            for parameter in module.parameters():
+                parameter.requires_grad_(False)
+
+    def initialize_from_actor(self, actor: SeqPlumpModel) -> None:
+        """Copy every compatible actor trunk row and broadcast its value head."""
+
+        source = actor.state_dict()
+        target = self.backbone.state_dict()
+        with torch.no_grad():
+            for name, value in source.items():
+                destination = target[name]
+                if name == "pos_embedding.weight":
+                    destination[: value.shape[0]].copy_(value)
+                elif destination.shape == value.shape:
+                    destination.copy_(value)
+                else:
+                    raise ValueError(
+                        f"Cannot initialize oracle critic parameter {name}: "
+                        f"{tuple(value.shape)} -> {tuple(destination.shape)}."
+                    )
+
+            actor_first = actor.value_head[0]
+            actor_last = actor.value_head[2]
+            oracle_first = self.player_value_head[0]
+            oracle_last = self.player_value_head[2]
+            oracle_first.weight.copy_(actor_first.weight)
+            oracle_first.bias.copy_(actor_first.bias)
+            oracle_last.weight.copy_(
+                actor_last.weight.expand(self.config.max_players, -1)
+            )
+            oracle_last.bias.copy_(
+                actor_last.bias.expand(self.config.max_players)
+            )
+
+    def forward_full(self, tokens: torch.Tensor) -> torch.Tensor:
+        """Return ``[batch, position, absolute_player]`` oracle values."""
+
+        if tokens.shape[1] > self.config.oracle_max_seq_len:
+            raise ValueError("Oracle token sequence exceeds its position table.")
+        x = self.backbone.embed(tokens)
+        for block in self.backbone.blocks:
+            x = block.forward_full(x)
+        hidden = self.backbone.final_norm(x)
+        return self.player_value_head(hidden)
+
+
 def load_seq_model_state_dict(
     model: SeqPlumpModel,
     state_dict: Mapping[str, torch.Tensor],

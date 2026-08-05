@@ -12,8 +12,9 @@ uv run plump --help
 uv run plump train first-run
 ```
 
-The PPO MPS preset adds an independent privileged critic, adaptive masked
-entropy targets, BF16 autocast, and FP16 KV storage:
+The PPO MPS preset adds an independent oracle critic with one distinct,
+owner-tagged token per dealt card and player-indexed value outputs, adaptive
+masked entropy targets, BF16 autocast, and FP16 KV storage:
 
 ```bash
 uv run plump train ppo-mps --config configs/ppo-mps.toml

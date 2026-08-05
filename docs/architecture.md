@@ -63,12 +63,15 @@ the same public token positions remain rectangular across their observer
 caches. `ppo_trainable_policies` can assign those seats one shared actor or
 several independent actor weight sets.
 
-PPO uses a separate critic transformer. Its causal public sequence is the same
-length as the actor's. A critic-only fixed-size tensor encodes the complete
-initial deal by observer-relative owner plus exact-card/rank/suit features and
-is added at the GAME position. It therefore supplies centralized training
-state without adding seat-specific actor tokens or exposing hidden cards at
-inference.
+PPO uses a separate oracle critic transformer. After collection, each
+environment game becomes one canonical critic sequence: GAME, every player's
+HAND cards ordered by absolute seat, and the public event stream. Every card is
+a separate token carrying owner, exact-card, rank, and suit fields; the deal is
+not pooled. The critic sequence is longer than an actor sequence by
+`(players - 1) * hand_size`, but it runs only in the update and never changes
+actor rollout tokens or KV caches. Its value head emits one column per absolute
+seat. Input owner/actor id `s` and value column `s` therefore name the same
+player throughout a game. Hidden cards never enter the deployed actor.
 
 Branch placement and candidate selection are controlled by the training
 configuration. The active preset branches every eligible decision through

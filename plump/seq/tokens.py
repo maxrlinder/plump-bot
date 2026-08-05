@@ -135,6 +135,22 @@ def hand_token(
     return token
 
 
+def oracle_hand_token(
+    config: SeqModelConfig,
+    num_players: int,
+    hand_size: int,
+    owner: int,
+    card: Card,
+) -> list[int]:
+    """A critic-only HAND token whose player field is the absolute owner."""
+
+    if owner < 0 or owner >= num_players:
+        raise ValueError("Oracle card owner must be an active absolute seat.")
+    token = hand_token(config, num_players, hand_size, card)
+    token[SLOT_REL_PLAYER] = owner
+    return token
+
+
 def turn_token(
     config: SeqModelConfig,
     num_players: int,
@@ -444,6 +460,70 @@ def build_seat_tokens(
         # refuses to broadcast into (0, TOKEN_WIDTH).
         array[skip:] = tokens[skip:]
     return array
+
+
+def build_oracle_tokens(
+    config: SeqModelConfig,
+    events: list[GameEvent],
+    num_players: int,
+    hand_size: int,
+    initial_hands: dict[int, list[Card]],
+    bidding_start_player: int,
+) -> np.ndarray:
+    """One canonical, perfect-information critic sequence for a whole game.
+
+    Seat ids are absolute within the environment: input owner/actor id ``s``
+    and value output column ``s`` therefore refer to exactly the same player.
+    Every dealt card remains a separate prefix token; no hand or deal pooling
+    occurs. The public suffix is the ordinary seat-0 stream, whose relative
+    player ids equal these canonical absolute ids.
+    """
+
+    if set(initial_hands) != set(range(num_players)):
+        raise ValueError("initial_hands must cover every active oracle seat.")
+    for owner, cards in initial_hands.items():
+        if len(cards) != hand_size:
+            raise ValueError(f"Player {owner} hand does not match hand size.")
+
+    canonical = build_seat_tokens(
+        config,
+        events,
+        observer=0,
+        num_players=num_players,
+        hand_size=hand_size,
+        initial_hand=initial_hands[0],
+        bidding_start_player=bidding_start_player,
+    )
+    cards = [
+        oracle_hand_token(config, num_players, hand_size, owner, card)
+        for owner in range(num_players)
+        for card in sort_cards(initial_hands[owner])
+    ]
+    # Drop seat 0's ordinary N-card prefix and insert the complete P*N prefix.
+    oracle = np.concatenate(
+        (
+            canonical[:1],
+            np.asarray(cards, dtype=np.int64),
+            canonical[1 + hand_size :],
+        ),
+        axis=0,
+    )
+    # The actor's TRICK_WIN row repeats its observer's remaining hand. That is
+    # redundant in a full-information stream and would privilege canonical
+    # seat 0, so the oracle derives current hands from initial cards + plays.
+    oracle[:, SLOT_REMAINING_HAND_START:] = NUM_CARDS
+    if config.turn_token == "off":
+        # In the actor stream this annotation lived on seat 0's last HAND row,
+        # which was replaced above. Restore it on the final oracle card token.
+        oracle[num_players * hand_size, SLOT_NEXT_ACTOR] = bidding_start_player
+        oracle[num_players * hand_size, SLOT_NEXT_PHASE] = NEXT_BID
+    expected = config.oracle_seq_len(num_players, hand_size)
+    if oracle.shape != (expected, TOKEN_WIDTH):
+        raise AssertionError(
+            f"Oracle sequence has shape {oracle.shape}, expected "
+            f"{(expected, TOKEN_WIDTH)}."
+        )
+    return oracle
 
 
 @dataclass

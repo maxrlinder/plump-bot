@@ -61,7 +61,7 @@ SLOT_NEXT_PHASE = 11
 TurnTokenMode = Literal["off", "bid", "all"]
 PolicyObjective = Literal["neurd", "sampled_mirror", "ppo"]
 POLICY_OBJECTIVES: frozenset[str] = frozenset(get_args(PolicyObjective))
-PPOCriticMode = Literal["independent", "privileged"]
+PPOCriticMode = Literal["independent", "privileged", "oracle"]
 PPO_CRITIC_MODES: frozenset[str] = frozenset(get_args(PPOCriticMode))
 
 
@@ -138,6 +138,13 @@ class SeqModelConfig:
             turn_token=self.turn_token,
         )
 
+    def oracle_seq_len(self, num_players: int, hand_size: int) -> int:
+        """Critic length when every player's cards are distinct prefix tokens."""
+
+        return self.seq_len(num_players, hand_size) + (
+            num_players - 1
+        ) * hand_size
+
     def prefix_len(self, hand_size: int) -> int:
         """[GAME] [HAND x N] plus the TURN token for the opening bid."""
 
@@ -152,6 +159,10 @@ class SeqModelConfig:
     @property
     def max_seq_len(self) -> int:
         return self.seq_len(self.max_players, self.max_hand_size)
+
+    @property
+    def oracle_max_seq_len(self) -> int:
+        return self.oracle_seq_len(self.max_players, self.max_hand_size)
 
     @property
     def bid_count(self) -> int:
@@ -829,10 +840,12 @@ class SeqTrainingConfig:
     ppo_clip_ratio: float = 0.1
     ppo_trainable_policies: int = 1
     ppo_self_play_seats: Literal["focal", "all"] = "all"
-    # The default critic has its own trunk and receives the complete initial
-    # deal through a side input that never enters the actor. ``independent``
-    # keeps the separate weights but omits that privileged side input.
-    ppo_critic_mode: PPOCriticMode = "privileged"
+    # The default oracle critic has its own trunk and receives one distinct,
+    # owner-tagged token for every dealt card. It processes one canonical
+    # sequence per environmental game and emits one value per absolute seat.
+    # ``privileged`` retains the older pooled-deal observer critic for
+    # ablations; ``independent`` omits hidden cards entirely.
+    ppo_critic_mode: PPOCriticMode = "oracle"
     ppo_critic_learning_rate: float = 3e-4
     ppo_critic_epochs: int = 4
     ppo_advantage_normalize: bool = True

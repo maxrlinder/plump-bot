@@ -86,21 +86,11 @@ def render_dashboard(
         smooth=smooth,
         include_learning_rate=include_learning_rate,
     )
-    _dual_lines(
+    _value_and_critic_learning(
         axes[1, 0],
         iteration,
         rows,
-        left=(("value_rmse", "value RMSE"),),
-        right=(
-            ("value_correlation", "value correlation"),
-            ("loss_suit", "suit-presence loss"),
-            ("loss_trick", "trick-count loss"),
-        ),
         smooth=smooth,
-        title="Value and belief learning",
-        left_label="value RMSE (reward points)",
-        right_label="correlation / belief loss",
-        omit_zero=True,
     )
     _lines(
         axes[1, 1],
@@ -605,6 +595,7 @@ def _gradient_norms(
         (
             ("core_grad_norm", "core/shared pre-clip"),
             ("auxiliary_grad_norm", "value/belief heads pre-clip"),
+            ("critic_grad_norm", "PPO critic pre-clip"),
         ),
         smooth=smooth,
         omit_zero=True,
@@ -624,6 +615,62 @@ def _gradient_norms(
         ax.legend(handles=[*handles, ax.lines[-1]], fontsize=8, loc="best")
     else:
         _no_data(ax)
+
+
+def _value_and_critic_learning(
+    ax,
+    iteration: np.ndarray,
+    rows: list[dict[str, str]],
+    *,
+    smooth: int,
+) -> None:
+    """Use the value panel for oracle dynamics when PPO telemetry exists."""
+
+    oracle_signal = _has_signal(
+        _series(rows, "critic_all_player_rmse"), omit_zero=True
+    )
+    if oracle_signal:
+        _dual_lines(
+            ax,
+            iteration,
+            rows,
+            left=(
+                ("value_rmse", "acting-seat RMSE"),
+                ("critic_all_player_rmse", "all-seat RMSE"),
+                ("value_zero_rmse", "zero-baseline RMSE"),
+            ),
+            right=(
+                ("value_correlation", "acting-seat correlation"),
+                (
+                    "critic_all_player_correlation",
+                    "all-seat correlation",
+                ),
+                ("critic_loss_reduction", "within-update loss reduction"),
+            ),
+            smooth=smooth,
+            title="Oracle critic dynamics",
+            left_label="RMSE (reward points)",
+            right_label="correlation / fractional reduction",
+            omit_zero=True,
+        )
+        return
+
+    _dual_lines(
+        ax,
+        iteration,
+        rows,
+        left=(("value_rmse", "value RMSE"),),
+        right=(
+            ("value_correlation", "value correlation"),
+            ("loss_suit", "suit-presence loss"),
+            ("loss_trick", "trick-count loss"),
+        ),
+        smooth=smooth,
+        title="Value and belief learning",
+        left_label="value RMSE (reward points)",
+        right_label="correlation / belief loss",
+        omit_zero=True,
+    )
 
 
 def _current_kl_caps(metrics_path: Path) -> tuple[float, float] | None:

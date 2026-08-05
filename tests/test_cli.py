@@ -84,6 +84,11 @@ def test_legacy_metrics_header_is_upgraded_for_reporting_fields(tmp_path):
         "reward_heuristic",
         "opponent_phase",
         "heuristic_eval_win_streak",
+        "critic_all_player_rmse",
+        "critic_all_player_correlation",
+        "critic_loss_first_epoch",
+        "critic_loss_last_epoch",
+        "critic_loss_reduction",
     }
     legacy = tuple(column for column in METRIC_COLUMNS if column not in new_fields)
     with metrics.open("w", newline="") as handle:

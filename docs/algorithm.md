@@ -820,18 +820,41 @@ deal. There are no cloned states and no candidate inclusion correction. At a
 learned decision, collection stores the sampled action, the complete legally
 masked old distribution, and ultimately that seat's terminal relative reward.
 
-The critic has separate weights. It sees the actor's observable causal history
-plus the complete initial deal through a critic-only side input. Let its frozen
-prediction before the update be $V_{\phi_{old}}(s_t,i)$. With no discounting or
-bootstrapping, the advantage sample is
+The critic has separate weights. The default oracle critic receives one
+canonical sequence per environmental game:
+
+$$
+[\mathrm{GAME}],
+[\mathrm{HAND}(0,c)]_{c\in H_0},\ldots,
+[\mathrm{HAND}(P-1,c)]_{c\in H_{P-1}},
+[\text{public events}].
+$$
+
+Every card remains a separate token with its absolute owner, exact-card, rank,
+and suit fields. The deal is not reduced to one pooled vector. At every causal
+state the critic emits
+
+$$
+V_\phi(s_t)=(V_\phi(s_t,0),\ldots,V_\phi(s_t,P-1)).
+$$
+
+Input player id $i$ and output column $i$ always refer to the same absolute
+seat. For an action sampled by seat $i$, let the frozen pre-update prediction
+be $V_{\phi_{old}}(s_t,i)$. With no discounting or bootstrapping, the advantage
+sample is
 
 $$
 A_t = R_i - V_{\phi_{old}}(s_t,i).
 $$
 
-The critic changes variance, not the expected policy gradient. It is a valid
-baseline because it does not depend on which current action is sampled. It is
-then trained by Monte Carlo MSE against $R_i$.
+The critic changes variance, not the expected policy gradient. Although it sees
+hidden cards unavailable to the actor, it is a valid baseline because those
+cards are part of the pre-action environment state and the critic does not see
+which current action will be sampled. Conditional on that state,
+$\mathbb E_{a\sim\pi}[\nabla\log\pi(a) V_\phi(s,i)]=0$. At every learned
+pre-action state, all active output columns are trained by Monte Carlo MSE
+against $(R_0,\ldots,R_{P-1})$; the player axis is averaged so it does not
+reweight games by player count.
 
 For the actor, define
 
@@ -902,7 +925,7 @@ and Adam state stay FP32. Cached K/V is independently FP16. Attention softmax,
 masked policy log-softmax, likelihood ratios, KL, entropy, returns, advantages,
 and loss accumulation are explicitly FP32.
 
-The PPO implementation is in `plump/seq/ppo.py`; the critic is
-`SeqPPOCritic` in `plump/seq/model.py`; dispatch, optimization, entropy duals,
-and checkpoint migration are in `plump/seq/trainer.py`. Its focused invariants
-are in `tests/test_seq_ppo.py`.
+The PPO implementation is in `plump/seq/ppo.py`; the default critic is
+`SeqPPOOracleCritic` in `plump/seq/model.py`; dispatch, optimization, entropy
+duals, and checkpoint migration are in `plump/seq/trainer.py`. Its focused
+invariants are in `tests/test_seq_ppo.py`.

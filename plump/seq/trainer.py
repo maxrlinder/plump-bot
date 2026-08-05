@@ -51,15 +51,18 @@ from .model import (
     STRUCTURED_CARD_OUTPUT_KEYS,
     SeqPlumpModel,
     SeqPPOCritic,
+    SeqPPOOracleCritic,
     load_seq_model_state_dict,
 )
 from .policy import SeqLeague, best_seq_device
 from .precision import autocast_context
 from .ppo import (
+    PPOCriticGroup,
     PPOTrainingGroup,
-    build_ppo_training_groups,
+    build_ppo_training_batch,
     normalize_ppo_advantages,
     ppo_clipped_terms,
+    ppo_critic_rows_by_chunk,
     ppo_rows_by_chunk,
 )
 from .rollout import SeqRolloutCollector, SeqTree
@@ -172,6 +175,14 @@ class SeqUpdateStats:
     core_grad_norm: float = 0.0
     auxiliary_grad_norm: float = 0.0
     critic_grad_norm: float = 0.0
+    # Oracle-critic telemetry. Acting-seat metrics above are the baseline PPO
+    # consumes; these cover every active output head and optimization progress
+    # across the repeated critic epochs.
+    critic_all_player_rmse: float = 0.0
+    critic_all_player_correlation: float = 0.0
+    critic_loss_first_epoch: float = 0.0
+    critic_loss_last_epoch: float = 0.0
+    critic_loss_reduction: float = 0.0
     peak_update_device_bytes: int = 0
     update_sec: float = 0.0
     build_sec: float = 0.0
@@ -704,16 +715,22 @@ class SeqTrainer:
             device=self.device,
             trainable_models=self.models,
         )
-        self.critic: SeqPPOCritic | None = None
+        self.critic: SeqPPOCritic | SeqPPOOracleCritic | None = None
         self.critic_optimizer: torch.optim.Optimizer | None = None
         self.log_entropy_alpha: dict[str, torch.nn.Parameter] = {}
         self.entropy_optimizer: torch.optim.Optimizer | None = None
         if train_config.policy_objective == "ppo":
-            self.critic = SeqPPOCritic(
-                self.model.config,
-                privileged=train_config.ppo_critic_mode == "privileged",
-                initialize_from=self.model,
-            ).to(self.device)
+            if train_config.ppo_critic_mode == "oracle":
+                self.critic = SeqPPOOracleCritic(
+                    self.model.config,
+                    initialize_from=self.model,
+                ).to(self.device)
+            else:
+                self.critic = SeqPPOCritic(
+                    self.model.config,
+                    privileged=train_config.ppo_critic_mode == "privileged",
+                    initialize_from=self.model,
+                ).to(self.device)
             critic_parameters = [
                 parameter
                 for parameter in self.critic.parameters()
@@ -928,7 +945,8 @@ class SeqTrainer:
             raise RuntimeError("PPO requires an initialized independent critic.")
         self.collector.release_caches()
         self._release_device_memory()
-        groups = build_ppo_training_groups(trees, self.model.config, self.train)
+        batch = build_ppo_training_batch(trees, self.model.config, self.train)
+        groups = batch.policy_groups
         stats = SeqUpdateStats()
         stats.build_sec = time.perf_counter() - started
         stats.policy_rows = sum(
@@ -940,7 +958,9 @@ class SeqTrainer:
             sum(group.tokens.shape[0] * group.tokens.shape[1] for group in groups)
         )
 
-        advantage_mean, advantage_std = self._prepare_ppo_advantages(groups, stats)
+        advantage_mean, advantage_std = self._prepare_ppo_advantages(
+            groups, batch.critic_groups, stats
+        )
         stats.advantage_mean = advantage_mean
         stats.advantage_std = advantage_std
         if self.train.ppo_advantage_normalize:
@@ -1029,7 +1049,7 @@ class SeqTrainer:
                 break
             self._update_entropy_temperature(epoch)
 
-        self._train_ppo_critic(groups, stats)
+        self._train_ppo_critic(groups, batch.critic_groups, stats)
         stats.entropy_alpha_bid = self._entropy_alpha("bid")
         stats.entropy_alpha_play = self._entropy_alpha("play")
         stats.peak_update_device_bytes = max(
@@ -1040,9 +1060,16 @@ class SeqTrainer:
         return stats
 
     def _prepare_ppo_advantages(
-        self, groups: list[PPOTrainingGroup], stats: SeqUpdateStats
+        self,
+        groups: list[PPOTrainingGroup],
+        critic_groups: list[PPOCriticGroup],
+        stats: SeqUpdateStats,
     ) -> tuple[float, float]:
         assert self.critic is not None
+        if self.train.ppo_critic_mode == "oracle":
+            return self._prepare_oracle_ppo_advantages(
+                groups, critic_groups, stats
+            )
         self.critic.eval()
         predictions: list[float] = []
         targets: list[float] = []
@@ -1077,6 +1104,139 @@ class SeqTrainer:
                             predictions.append(prediction)
                             targets.append(target)
                             weights.append(float(rows["weight"][local]))
+
+        return self._ppo_value_statistics(predictions, targets, weights, stats)
+
+    def _prepare_oracle_ppo_advantages(
+        self,
+        groups: list[PPOTrainingGroup],
+        critic_groups: list[PPOCriticGroup],
+        stats: SeqUpdateStats,
+    ) -> tuple[float, float]:
+        """Evaluate each game once and address values by absolute actor seat."""
+
+        assert isinstance(self.critic, SeqPPOOracleCritic)
+        self.critic.eval()
+        prediction_by_address: dict[tuple[int, int, int, int], float] = {}
+        all_player_predictions: list[np.ndarray] = []
+        all_player_targets: list[np.ndarray] = []
+        all_player_weights: list[np.ndarray] = []
+        with torch.inference_mode():
+            for group_index, group in enumerate(critic_groups):
+                chunks = list(self._microbatches(group))
+                for (start, stop), rows in zip(
+                    chunks, ppo_critic_rows_by_chunk(group, chunks)
+                ):
+                    if not rows["weight"]:
+                        continue
+                    tokens = torch.from_numpy(group.tokens[start:stop]).to(
+                        self.device
+                    )
+                    with autocast_context(self.device, self.train.precision):
+                        values = self.critic.forward_full(tokens)
+                    seq = torch.tensor(
+                        rows["seq_index"], device=self.device, dtype=torch.long
+                    )
+                    pos = torch.tensor(
+                        rows["position"], device=self.device, dtype=torch.long
+                    )
+                    selected_all = (
+                        values[seq, pos, : group.num_players]
+                        .float()
+                        .cpu()
+                        .numpy()
+                    )
+                    acting_seat = np.asarray(rows["acting_seat"], dtype=np.int64)
+                    selected = selected_all[
+                        np.arange(selected_all.shape[0]), acting_seat
+                    ]
+                    target_all = np.stack(rows["returns"])[
+                        :, : group.num_players
+                    ]
+                    row_weight = np.asarray(rows["weight"], dtype=np.float64)
+                    all_player_predictions.append(selected_all.reshape(-1))
+                    all_player_targets.append(target_all.reshape(-1))
+                    all_player_weights.append(
+                        np.repeat(
+                            row_weight / group.num_players,
+                            group.num_players,
+                        )
+                    )
+                    for local, prediction in enumerate(selected):
+                        address = (
+                            group_index,
+                            rows["seq_index"][local] + start,
+                            rows["position"][local],
+                            rows["acting_seat"][local],
+                        )
+                        if address in prediction_by_address:
+                            raise AssertionError(
+                                "Oracle critic address appeared more than once."
+                            )
+                        prediction_by_address[address] = float(prediction)
+
+        if all_player_predictions:
+            prediction = np.concatenate(all_player_predictions).astype(
+                np.float64, copy=False
+            )
+            target = np.concatenate(all_player_targets).astype(
+                np.float64, copy=False
+            )
+            weight = np.concatenate(all_player_weights)
+            total = float(weight.sum())
+            error = prediction - target
+            stats.critic_all_player_rmse = float(
+                np.sqrt(np.dot(weight, error * error) / max(total, 1e-12))
+            )
+            prediction_mean = float(np.dot(weight, prediction) / total)
+            target_mean = float(np.dot(weight, target) / total)
+            prediction_centered = prediction - prediction_mean
+            target_centered = target - target_mean
+            prediction_var = float(
+                np.dot(weight, prediction_centered**2) / total
+            )
+            target_var = float(np.dot(weight, target_centered**2) / total)
+            covariance = float(
+                np.dot(weight, prediction_centered * target_centered) / total
+            )
+            denominator = math.sqrt(max(prediction_var * target_var, 0.0))
+            stats.critic_all_player_correlation = (
+                covariance / denominator if denominator else 0.0
+            )
+
+        predictions: list[float] = []
+        targets: list[float] = []
+        weights: list[float] = []
+        for group in groups:
+            for rows in group.policy.values():
+                for index, target in enumerate(rows.returns):
+                    address = (
+                        rows.critic_group[index],
+                        rows.critic_seq_index[index],
+                        rows.critic_position[index],
+                        rows.critic_seat[index],
+                    )
+                    try:
+                        prediction = prediction_by_address[address]
+                    except KeyError as error:
+                        raise AssertionError(
+                            "Actor row has no oracle value prediction."
+                        ) from error
+                    rows.advantages[index] = target - prediction
+                    predictions.append(prediction)
+                    targets.append(float(target))
+                    weights.append(float(rows.weight[index]))
+
+        return self._ppo_value_statistics(predictions, targets, weights, stats)
+
+    @staticmethod
+    def _ppo_value_statistics(
+        predictions: list[float],
+        targets: list[float],
+        weights: list[float],
+        stats: SeqUpdateStats,
+    ) -> tuple[float, float]:
+        """Report baseline quality on the acting-player rows PPO consumes."""
 
         prediction = np.asarray(predictions, dtype=np.float64)
         target = np.asarray(targets, dtype=np.float64)
@@ -1283,10 +1443,17 @@ class SeqTrainer:
         )
 
     def _train_ppo_critic(
-        self, groups: list[PPOTrainingGroup], stats: SeqUpdateStats
+        self,
+        groups: list[PPOTrainingGroup],
+        critic_groups: list[PPOCriticGroup],
+        stats: SeqUpdateStats,
     ) -> None:
         assert self.critic is not None and self.critic_optimizer is not None
+        if self.train.ppo_critic_mode == "oracle":
+            self._train_oracle_ppo_critic(critic_groups, stats)
+            return
         total_loss = 0.0
+        epoch_losses: list[float] = []
         for _ in range(self.train.ppo_critic_epochs):
             self.critic.train()
             self.critic_optimizer.zero_grad(set_to_none=True)
@@ -1334,8 +1501,92 @@ class SeqTrainer:
                 )
             )
             self.critic_optimizer.step()
-            total_loss += math.fsum(float(value) for value in pending)
+            epoch_loss = math.fsum(float(value) for value in pending)
+            epoch_losses.append(epoch_loss)
+            total_loss += epoch_loss
         stats.loss_value = total_loss
+        self._record_critic_loss_dynamics(stats, epoch_losses)
+
+    def _train_oracle_ppo_critic(
+        self,
+        groups: list[PPOCriticGroup],
+        stats: SeqUpdateStats,
+    ) -> None:
+        """Fit every active player's return from each learned decision state."""
+
+        assert isinstance(self.critic, SeqPPOOracleCritic)
+        assert self.critic_optimizer is not None
+        total_loss = 0.0
+        epoch_losses: list[float] = []
+        for _ in range(self.train.ppo_critic_epochs):
+            self.critic.train()
+            self.critic_optimizer.zero_grad(set_to_none=True)
+            pending: list[torch.Tensor] = []
+            for group in groups:
+                chunks = list(self._microbatches(group))
+                for (start, stop), rows in zip(
+                    chunks, ppo_critic_rows_by_chunk(group, chunks)
+                ):
+                    if not rows["weight"]:
+                        continue
+                    tokens = torch.from_numpy(group.tokens[start:stop]).to(
+                        self.device
+                    )
+                    with autocast_context(self.device, self.train.precision):
+                        values = self.critic.forward_full(tokens)
+                    seq = torch.tensor(
+                        rows["seq_index"], device=self.device, dtype=torch.long
+                    )
+                    pos = torch.tensor(
+                        rows["position"], device=self.device, dtype=torch.long
+                    )
+                    targets = torch.from_numpy(np.stack(rows["returns"])).to(
+                        self.device
+                    )[:, : group.num_players]
+                    weight = torch.tensor(
+                        rows["weight"], device=self.device, dtype=torch.float32
+                    )
+                    predictions = values[seq, pos, : group.num_players].float()
+                    error = (
+                        predictions - targets.float()
+                    ) / self.train.value_reward_scale
+                    # Each state retains its actor-objective weight. Averaging
+                    # the output-seat axis supplies all-player supervision
+                    # without multiplying larger-player games' critic weight.
+                    loss = (
+                        0.5 * weight * error.square().mean(dim=-1)
+                    ).sum()
+                    loss.backward()
+                    pending.append(loss.detach())
+            stats.critic_grad_norm = float(
+                torch.nn.utils.clip_grad_norm_(
+                    [
+                        parameter
+                        for parameter in self.critic.parameters()
+                        if parameter.requires_grad
+                    ],
+                    self.train.max_grad_norm,
+                )
+            )
+            self.critic_optimizer.step()
+            epoch_loss = math.fsum(float(value) for value in pending)
+            epoch_losses.append(epoch_loss)
+            total_loss += epoch_loss
+        stats.loss_value = total_loss
+        self._record_critic_loss_dynamics(stats, epoch_losses)
+
+    @staticmethod
+    def _record_critic_loss_dynamics(
+        stats: SeqUpdateStats, epoch_losses: list[float]
+    ) -> None:
+        if not epoch_losses:
+            return
+        first = epoch_losses[0]
+        last = epoch_losses[-1]
+        stats.critic_loss_first_epoch = first
+        stats.critic_loss_last_epoch = last
+        if first > 0:
+            stats.critic_loss_reduction = (first - last) / first
 
     def _apply_warmup_lr(self) -> None:
         """Linear LR ramp over the first ``lr_warmup_updates`` kept steps.
@@ -2030,16 +2281,27 @@ class SeqTrainer:
                 self.optimizer.load_state_dict(optimizer_state)
 
         if self.critic is not None and self.critic_optimizer is not None:
-            if "critic_state_dict" in payload:
+            source_training = payload.get("training_config", {})
+            source_critic_mode = (
+                source_training.get("ppo_critic_mode")
+                if isinstance(source_training, dict)
+                else None
+            )
+            compatible_critic = source_critic_mode == self.train.ppo_critic_mode
+            if "critic_state_dict" in payload and compatible_critic:
                 self.critic.load_state_dict(payload["critic_state_dict"])
                 if "critic_optimizer_state_dict" in payload:
                     self.critic_optimizer.load_state_dict(
                         payload["critic_optimizer_state_dict"]
                     )
             else:
-                # Migrating a legacy actor-only checkpoint: begin with its
-                # learned trunk/value head and a neutral zero private-deal path.
-                self.critic.backbone.load_state_dict(self.model.state_dict())
+                # An actor-only checkpoint, or a checkpoint from a different
+                # critic topology, begins from the loaded actor without
+                # fabricating incompatible critic Adam moments.
+                if isinstance(self.critic, SeqPPOOracleCritic):
+                    self.critic.initialize_from_actor(self.model)
+                else:
+                    self.critic.backbone.load_state_dict(self.model.state_dict())
             for phase, value in payload.get("entropy_log_alpha", {}).items():
                 if phase in self.log_entropy_alpha:
                     self.log_entropy_alpha[phase].data.copy_(
