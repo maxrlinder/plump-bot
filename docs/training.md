@@ -200,6 +200,14 @@ M5 Pro, this mixed pair measured 99.7 rollout games/s, versus 82.8 for full
 BF16, 73.3 for full FP16, and 56.9 for full FP32. Rollout games and update
 microbatch positions are independent memory knobs.
 
+Independent spawned rollout producers do not improve MPS throughput. For the
+same 768-game workload, four BF16-compute/FP16-cache producers reached 88.5
+games/s versus 99.7 for one and used 4.55 GB rather than 1.15 GB after warmup.
+They contend for the same Metal execution path instead of creating independent
+GPU compute lanes. The production collector therefore remains single-process;
+future rollout work should coalesce ready environments across shapes into
+larger forwards inside that process rather than replicate the model.
+
 PPO update groups can be coalesced with `ppo_sequence_bucket_width`. Each
 actor/oracle sequence is tail-padded to the next bucket boundary (capped at its
 model's positional capacity), then shapes with the same padded length are
@@ -247,7 +255,7 @@ checkpointing both occur every 100 updates. The measured update cycle is about
 five updates. A fresh, random initialization with that profile is:
 
 ```bash
-uv run plump train ppo-oracle-mps-768 --config configs/ppo-mps.toml \
+uv run plump train ppo-oracle-mps-768-v2 --config configs/ppo-mps.toml \
   --set training.deals_per_shape=32 \
   --set run.checkpoint_every=100 \
   --set evaluation.every=100

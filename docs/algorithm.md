@@ -932,7 +932,7 @@ and loss accumulation are explicitly FP32.
 
 ### Current local production batch and execution
 
-The `ppo-oracle-mps-768` profile collects 32 independent games for each of the
+The `ppo-oracle-mps-768-v2` profile collects 32 independent games for each of the
 24 `(players, cards)` shapes, or 768 games per update. Half are shared-actor
 self-play and half use the heuristic or historical anchor. Thus each arm has
 384 games and each player-count bucket has 256 games. All shared-actor seats
