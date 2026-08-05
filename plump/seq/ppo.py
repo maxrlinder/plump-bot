@@ -18,7 +18,16 @@ from .config import (
     SeqTrainingConfig,
 )
 from .rollout import SeqTree
-from .tokens import TOKEN_WIDTH, build_oracle_tokens, build_seat_tokens, card_id
+from .tokens import (
+    IGNORE_LABEL,
+    TOKEN_WIDTH,
+    build_oracle_tokens,
+    build_replay_arrays,
+    build_seat_tokens,
+    card_id,
+)
+
+PPO_BELIEF_STAGES = (0, 4, 8)
 
 
 @dataclass
@@ -47,6 +56,16 @@ class PPOTrainingGroup:
     # indexed by observer-relative owner and padded with NUM_CARDS. The oracle
     # critic instead consumes PPOCriticGroup.tokens.
     initial_hands: np.ndarray
+    # Dense belief supervision is normalized independently of policy rows:
+    # each game has equal total mass, split across its learned seats and then
+    # across the genuine (pre-bucketing) positions in that observer stream.
+    position_weight: np.ndarray  # [B, L]
+    trick_targets: np.ndarray  # [B, max_players]
+    trick_masks: np.ndarray  # [B, L, max_players, bid_count]
+    suit_targets: np.ndarray  # [B, L, belief_opponents, 4]
+    # Readout positions before the observer's 1st, 5th, and 9th play. A value
+    # of -1 means this is not a ten-card trajectory or the stage is absent.
+    belief_stage_positions: np.ndarray  # [B, len(PPO_BELIEF_STAGES)]
     policy: dict[str, PPOPolicyRows]
 
 
@@ -66,6 +85,9 @@ class PPOCriticGroup:
     hand_size: int
     # [games, oracle_length, TOKEN_WIDTH], exactly one row per environment game.
     tokens: np.ndarray
+    position_weight: np.ndarray  # [games, oracle_length]
+    trick_targets: np.ndarray  # [games, max_players], absolute-seat axis
+    trick_masks: np.ndarray  # [games, oracle_length, max_players, bid_count]
     rows: PPOCriticRows
 
 
@@ -172,6 +194,21 @@ def build_ppo_training_batch(
         tokens = np.empty(
             (len(shape_games), length, TOKEN_WIDTH), dtype=np.int64
         )
+        position_weight = np.zeros((len(shape_games), length), dtype=np.float32)
+        trick_targets = np.full(
+            (len(shape_games), model_config.max_players),
+            IGNORE_LABEL,
+            dtype=np.int64,
+        )
+        trick_masks = np.zeros(
+            (
+                len(shape_games),
+                length,
+                model_config.max_players,
+                model_config.bid_count,
+            ),
+            dtype=bool,
+        )
         critic_rows = PPOCriticRows()
         group_index = len(critic_groups)
         position_shift = (players - 1) * hand_size
@@ -184,6 +221,40 @@ def build_ppo_training_batch(
                 tree.initial_hands,
                 tree.bidding_start_player,
             )
+            actor_tokens = build_seat_tokens(
+                model_config,
+                leaf.env.state.event_log,
+                0,
+                players,
+                hand_size,
+                tree.initial_hands[0],
+                tree.bidding_start_player,
+            )
+            arrays = build_replay_arrays(
+                model_config,
+                tree.initial_hands,
+                leaf.env.state.event_log,
+                0,
+                players,
+                hand_size,
+                tree.bidding_start_player,
+                tokens=actor_tokens,
+                suit_labels=False,
+                trick_labels=train_config.trick_coef > 0,
+            )
+            trick_targets[seq_index] = arrays.trick_targets
+            if train_config.trick_coef > 0:
+                actor_prefix = model_config.prefix_len(hand_size)
+                oracle_prefix = actor_prefix + position_shift
+                # The extra oracle HAND tokens all describe the unchanged
+                # post-deal state. The public suffix then follows the actor's
+                # canonical seat-0 stream at a fixed positional shift.
+                trick_masks[seq_index, :oracle_prefix] = arrays.trick_masks[0]
+                trick_masks[seq_index, oracle_prefix:] = arrays.trick_masks[
+                    actor_prefix:
+                ]
+            game_weight = seat_weight * len(seats)
+            position_weight[seq_index] = game_weight / float(length)
             if leaf.terminal_rewards is None:
                 raise ValueError("PPO leaf is missing terminal rewards.")
             returns = np.zeros(model_config.max_players, dtype=np.float32)
@@ -221,6 +292,9 @@ def build_ppo_training_batch(
                 num_players=players,
                 hand_size=hand_size,
                 tokens=tokens,
+                position_weight=position_weight,
+                trick_targets=trick_targets,
+                trick_masks=trick_masks,
                 rows=critic_rows,
             )
         )
@@ -232,6 +306,27 @@ def build_ppo_training_batch(
         initial_hands = np.empty(
             (len(rows), model_config.max_players, model_config.max_hand_size),
             dtype=np.int64,
+        )
+        position_weight = np.zeros((len(rows), length), dtype=np.float32)
+        trick_targets = np.full(
+            (len(rows), model_config.max_players), IGNORE_LABEL, dtype=np.int64
+        )
+        trick_masks = np.zeros(
+            (
+                len(rows),
+                length,
+                model_config.max_players,
+                model_config.bid_count,
+            ),
+            dtype=bool,
+        )
+        suit_targets = np.full(
+            (len(rows), length, model_config.belief_opponents, 4),
+            IGNORE_LABEL,
+            dtype=np.int64,
+        )
+        belief_stage_positions = np.full(
+            (len(rows), len(PPO_BELIEF_STAGES)), -1, dtype=np.int64
         )
         policy = {"bid": PPOPolicyRows(), "play": PPOPolicyRows()}
         for seq_index, (tree, leaf, observer, seat_weight) in enumerate(rows):
@@ -247,10 +342,37 @@ def build_ppo_training_batch(
             initial_hands[seq_index] = _relative_initial_hands(
                 tree, observer, model_config
             )
+            arrays = build_replay_arrays(
+                model_config,
+                tree.initial_hands,
+                leaf.env.state.event_log,
+                observer,
+                players,
+                hand_size,
+                tree.bidding_start_player,
+                tokens=tokens[seq_index],
+                suit_labels=train_config.suit_coef > 0,
+                trick_labels=train_config.trick_coef > 0,
+            )
+            # Auxiliary loss scale is invariant to sequence length while the
+            # requested PPO policy objective still grows with decision count.
+            position_weight[seq_index] = seat_weight / float(length)
+            trick_targets[seq_index] = arrays.trick_targets
+            trick_masks[seq_index] = arrays.trick_masks
+            suit_targets[seq_index] = arrays.suit_targets
             if leaf.terminal_rewards is None:
                 raise ValueError("PPO leaf is missing terminal rewards.")
             terminal_return = float(leaf.terminal_rewards[observer])
             decisions = [record for record in leaf.decisions if record.seat == observer]
+            if hand_size == 10:
+                play_decisions = [
+                    record for record in decisions if record.phase != NEXT_BID
+                ]
+                for stage_index, cards_played in enumerate(PPO_BELIEF_STAGES):
+                    if cards_played < len(play_decisions):
+                        belief_stage_positions[seq_index, stage_index] = (
+                            play_decisions[cards_played].position
+                        )
             for record in decisions:
                 if record.policy_id != policy_id:
                     raise ValueError("Decision policy id disagrees with seat assignment.")
@@ -282,6 +404,11 @@ def build_ppo_training_batch(
                 hand_size=hand_size,
                 tokens=tokens,
                 initial_hands=initial_hands,
+                position_weight=position_weight,
+                trick_targets=trick_targets,
+                trick_masks=trick_masks,
+                suit_targets=suit_targets,
+                belief_stage_positions=belief_stage_positions,
                 policy=policy,
             )
         )
@@ -329,12 +456,25 @@ def bucket_ppo_training_batch(
     for length, sources in sorted(critic_buckets.items()):
         total = sum(group.tokens.shape[0] for _, group in sources)
         tokens = np.zeros((total, length, TOKEN_WIDTH), dtype=np.int64)
+        position_weight = np.zeros((total, length), dtype=np.float32)
+        trick_targets = np.full(
+            (total, model_config.max_players), IGNORE_LABEL, dtype=np.int64
+        )
+        trick_masks = np.zeros(
+            (total, length, model_config.max_players, model_config.bid_count),
+            dtype=bool,
+        )
         rows = PPOCriticRows()
         offset = 0
         new_group_index = len(critic_groups)
         for old_group_index, group in sources:
             count, source_length = group.tokens.shape[:2]
             tokens[offset : offset + count, :source_length] = group.tokens
+            position_weight[offset : offset + count, :source_length] = (
+                group.position_weight
+            )
+            trick_targets[offset : offset + count] = group.trick_targets
+            trick_masks[offset : offset + count, :source_length] = group.trick_masks
             for seq_index in range(count):
                 critic_address[(old_group_index, seq_index)] = (
                     new_group_index,
@@ -352,6 +492,9 @@ def bucket_ppo_training_batch(
                 num_players=max(group.num_players for _, group in sources),
                 hand_size=max(group.hand_size for _, group in sources),
                 tokens=tokens,
+                position_weight=position_weight,
+                trick_targets=trick_targets,
+                trick_masks=trick_masks,
                 rows=rows,
             )
         )
@@ -386,12 +529,37 @@ def bucket_ppo_training_batch(
             (total, model_config.max_players, model_config.max_hand_size),
             dtype=np.int64,
         )
+        position_weight = np.zeros((total, length), dtype=np.float32)
+        trick_targets = np.full(
+            (total, model_config.max_players), IGNORE_LABEL, dtype=np.int64
+        )
+        trick_masks = np.zeros(
+            (total, length, model_config.max_players, model_config.bid_count),
+            dtype=bool,
+        )
+        suit_targets = np.full(
+            (total, length, model_config.belief_opponents, 4),
+            IGNORE_LABEL,
+            dtype=np.int64,
+        )
+        belief_stage_positions = np.full(
+            (total, len(PPO_BELIEF_STAGES)), -1, dtype=np.int64
+        )
         policy = {"bid": PPOPolicyRows(), "play": PPOPolicyRows()}
         offset = 0
         for group in sources:
             count, source_length = group.tokens.shape[:2]
             tokens[offset : offset + count, :source_length] = group.tokens
             initial_hands[offset : offset + count] = group.initial_hands
+            position_weight[offset : offset + count, :source_length] = (
+                group.position_weight
+            )
+            trick_targets[offset : offset + count] = group.trick_targets
+            trick_masks[offset : offset + count, :source_length] = group.trick_masks
+            suit_targets[offset : offset + count, :source_length] = group.suit_targets
+            belief_stage_positions[offset : offset + count] = (
+                group.belief_stage_positions
+            )
             for phase in policy:
                 source_rows = group.policy[phase]
                 target_rows = policy[phase]
@@ -411,6 +579,11 @@ def bucket_ppo_training_batch(
                 hand_size=max(group.hand_size for group in sources),
                 tokens=tokens,
                 initial_hands=initial_hands,
+                position_weight=position_weight,
+                trick_targets=trick_targets,
+                trick_masks=trick_masks,
+                suit_targets=suit_targets,
+                belief_stage_positions=belief_stage_positions,
                 policy=policy,
             )
         )

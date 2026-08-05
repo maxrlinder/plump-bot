@@ -163,6 +163,11 @@ building the update batch.
 At each learned pre-action state the critic is trained against all active
 players' undiscounted terminal relative returns. Its loss averages the player
 axis, so adding output columns does not multiply the weight of larger tables.
+The oracle also predicts every absolute seat's final trick count at every
+causal prefix, using the same feasibility-masked classes as the actor. This is
+an outcome auxiliary, not a hidden-information belief: the oracle already sees
+the full deal. Oracle suit presence is intentionally not trained because it is
+visible verbatim in the owned HAND tokens and would be a trivial identity.
 For the actor advantage only the acting player's column is selected. The
 critic runs after rollout collection, uses full causal forwards coalesced by
 padded sequence length, and never changes actor tokens or exposes hidden cards
@@ -176,6 +181,16 @@ reduction from the first to last epoch within each update; and includes the
 separately clipped critic gradient norm in the gradient panel. The raw first
 and last epoch losses are retained in `metrics.csv` as
 `critic_loss_first_epoch` and `critic_loss_last_epoch`.
+
+When `suit_coef` or `trick_coef` is nonzero, PPO actor replay also trains the
+ordinary observer-limited heads from the same full-sequence hidden states used
+by the policy loss. Each game has unit auxiliary mass, split across learned
+seats and then evenly across that observer's genuine token positions; padding
+has zero weight. This keeps auxiliary loss scale independent of sequence
+length without changing the deliberately length-weighted policy objective.
+For ten-card games, metrics report opponent-suit bit accuracy and exact
+per-seat final-trick accuracy immediately before the observer's first, fifth,
+and ninth play—after that observer has played 0, 4, and 8 cards.
 
 Entropy is calculated over legal actions and normalized by `log(legal_count)`.
 Forced moves are excluded. Bid and play temperatures are separate. Adaptive
@@ -241,15 +256,16 @@ capacity and does not change the 768-game objective batch.
 
 The anchor initially consists of deterministic heuristic opponents. Heuristic
 seats run through the batched wave scheduler but consume no neural forward or
-KV-cache rows; only the focal current policy is encoded. Inline evaluation uses
-reproducible policy sampling against the same heuristic. After mean relative
+KV-cache rows; only the focal current policy is encoded. Inline evaluation
+always runs both reproducible policy sampling and deterministic argmax against
+the same fixed deal bank. After sampled mean relative
 reward is above `evaluation.opponent_switch_reward` for
 `evaluation.opponent_switch_consecutive` consecutive evaluations, the anchor
 switches permanently to historical league opponents. The phase and streak are
 checkpointed. Only historical checkpoints with iteration in
 `[ceil(current / 2), current]` are eligible for sampling.
 
-For the active 768-game MPS run, inline sampled-policy evaluation and interval
+For the active 768-game MPS run, paired inline evaluation and interval
 checkpointing both occur every 100 updates. The measured update cycle is about
 18.7 seconds, so this is roughly 31 minutes. Dashboard rendering remains every
 five updates. A fresh, random initialization with that profile is:
@@ -263,9 +279,10 @@ uv run plump train ppo-oracle-mps-768-v2 --config configs/ppo-mps.toml \
 
 Omitting `--from-checkpoint` creates and records `iter_000000.pt` before the
 first update. When evaluation is enabled, that checkpoint is immediately
-evaluated against the heuristic using the configured deal bank and action
-mode. The checkpoint-scoped result supplies the random-policy point on the
-dashboard and initializes `best`, but deliberately does not advance the
+evaluated against the heuristic in both sample and argmax modes using the
+configured deal bank. The two rewards plus two bid accuracies supply four
+random-policy points on the dashboard. Sampled reward initializes `best`, but
+deliberately does not advance the
 heuristic-switch win streak. A matching cached result is reused if an
 iteration-zero run is resumed. The resolved overrides are copied into the
 run's `config.toml`.

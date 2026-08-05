@@ -676,15 +676,17 @@ class SeqPPOOracleCritic(nn.Module):
         if initialize_from is not None:
             self.initialize_from_actor(initialize_from)
 
-        # These actor readouts are retained only so the actor trunk can be
-        # copied exactly. The oracle evaluates only player_value_head.
+        # These actor readouts are retained so the actor trunk can be copied
+        # exactly. Trick count is deliberately trainable for the oracle: it is
+        # a useful dense outcome target even with perfect information. Suit
+        # presence remains frozen because every held card and owner is already
+        # visible in the oracle prefix, making that task a trivial identity.
         for module in (
             self.backbone.bid_head,
             self.backbone.card_head,
             self.backbone.value_head,
             self.backbone.card_rank_output_embedding,
             self.backbone.card_suit_output_embedding,
-            self.backbone.trick_count_head,
             self.backbone.suit_presence_head,
             self.backbone.bid_hit_head,
         ):
@@ -722,16 +724,33 @@ class SeqPPOOracleCritic(nn.Module):
                 actor_last.bias.expand(self.config.max_players)
             )
 
-    def forward_full(self, tokens: torch.Tensor) -> torch.Tensor:
-        """Return ``[batch, position, absolute_player]`` oracle values."""
-
+    def _forward_hidden(self, tokens: torch.Tensor) -> torch.Tensor:
         if tokens.shape[1] > self.config.oracle_max_seq_len:
             raise ValueError("Oracle token sequence exceeds its position table.")
         x = self.backbone.embed(tokens)
         for block in self.backbone.blocks:
             x = block.forward_full(x)
-        hidden = self.backbone.final_norm(x)
-        return self.player_value_head(hidden)
+        return self.backbone.final_norm(x)
+
+    def forward_value_and_trick(
+        self, tokens: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return absolute-seat value and final-trick logits from one trunk."""
+
+        hidden = self._forward_hidden(tokens)
+        batch, length, _ = hidden.shape
+        trick_logits = self.backbone.trick_count_head(hidden).view(
+            batch,
+            length,
+            self.config.max_players,
+            self.config.bid_count,
+        )
+        return self.player_value_head(hidden), trick_logits
+
+    def forward_full(self, tokens: torch.Tensor) -> torch.Tensor:
+        """Return ``[batch, position, absolute_player]`` oracle values."""
+
+        return self.player_value_head(self._forward_hidden(tokens))
 
 
 def load_seq_model_state_dict(

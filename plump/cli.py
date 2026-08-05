@@ -76,7 +76,15 @@ METRIC_COLUMNS = (
     "value_rows",
     "loss_suit",
     "loss_trick",
+    "loss_oracle_trick",
     "loss_bid_hit",
+    "suit_accuracy_10c_0",
+    "suit_accuracy_10c_4",
+    "suit_accuracy_10c_8",
+    "trick_accuracy_10c_0",
+    "trick_accuracy_10c_4",
+    "trick_accuracy_10c_8",
+    "oracle_trick_accuracy",
     "entropy",
     "entropy_bid_normalized",
     "entropy_play_normalized",
@@ -111,6 +119,10 @@ METRIC_COLUMNS = (
     "peak_update_device_gb",
     "eval_reward_vs_heuristic",
     "eval_bid_hit",
+    "eval_reward_vs_heuristic_sample",
+    "eval_bid_hit_sample",
+    "eval_reward_vs_heuristic_argmax",
+    "eval_bid_hit_argmax",
     "peak_cache_rows",
     "cache_rows_allocated",
     "cache_pressure",
@@ -430,9 +442,6 @@ def train_command(args: argparse.Namespace) -> int:
         )
 
         evaluation = resolved.evaluation
-        training_action_mode = str(
-            evaluation.get("training_action_mode", "argmax")
-        )
         switch_reward = float(evaluation.get("opponent_switch_reward", 0.0))
         switch_consecutive = int(
             evaluation.get("opponent_switch_consecutive", 1)
@@ -458,46 +467,51 @@ def train_command(args: argparse.Namespace) -> int:
         # no trained policy has won yet.
         if trainer.iteration == 0 and int(evaluation["every"]) > 0:
             initial_checkpoint = run.interval_checkpoint(0)
-            initial_protocol = EvaluationProtocol(
-                opponent="heuristic",
-                player_counts=resolved.training.player_counts,
-                hand_sizes=tuple(
-                    sorted(
-                        {
-                            cell.hand_size
-                            for cell in resolved.training.schedule_cells
-                        }
-                    )
-                ),
-                deals_per_configuration=int(evaluation["deals"]),
-                deal_seed=int(evaluation["seed"]),
-                action_seed=int(evaluation.get("action_seed", 17)),
-                bootstrap_samples=2000,
-                batch_size=int(evaluation["batch_size"]),
-                greedy=training_action_mode == "argmax",
+            initial_reports: dict[str, dict[str, Any]] = {}
+            for action_mode, greedy in (("sample", False), ("argmax", True)):
+                initial_protocol = EvaluationProtocol(
+                    opponent="heuristic",
+                    player_counts=resolved.training.player_counts,
+                    hand_sizes=tuple(
+                        sorted(
+                            {
+                                cell.hand_size
+                                for cell in resolved.training.schedule_cells
+                            }
+                        )
+                    ),
+                    deals_per_configuration=int(evaluation["deals"]),
+                    deal_seed=int(evaluation["seed"]),
+                    action_seed=int(evaluation.get("action_seed", 17)),
+                    bootstrap_samples=2000,
+                    batch_size=int(evaluation["batch_size"]),
+                    greedy=greedy,
+                )
+                payload, created = evaluate_checkpoint(
+                    run,
+                    initial_checkpoint,
+                    protocol=initial_protocol,
+                    deal_bank=eval_bank,
+                    device=device,
+                )
+                initial_report = payload["report"]
+                initial_reports[action_mode] = initial_report
+                status = "evaluated" if created else "cached"
+                _emit(
+                    run,
+                    f"Initial iter 0 [{action_mode}] {status} against "
+                    f"heuristic | "
+                    f"reward={float(initial_report['macro_relative_reward']):.4f} "
+                    f"bid_hit={float(initial_report['macro_bid_hit_rate']):.4f}.",
+                )
+            initial_reward = float(
+                initial_reports["sample"]["macro_relative_reward"]
             )
-            payload, created = evaluate_checkpoint(
-                run,
-                initial_checkpoint,
-                protocol=initial_protocol,
-                deal_bank=eval_bank,
-                device=device,
-            )
-            initial_report = payload["report"]
-            initial_reward = float(initial_report["macro_relative_reward"])
-            initial_bid_hit = float(initial_report["macro_bid_hit_rate"])
             best = run.best_metric()
             if best is None or initial_reward > best:
                 best_path = run.checkpoints / "best.pt"
                 trainer.save_checkpoint(best_path)
                 run.record_best(best_path, 0, initial_reward)
-            status = "evaluated" if created else "cached"
-            _emit(
-                run,
-                f"Initial iter 0 [{training_action_mode}] {status} against "
-                f"heuristic | reward={initial_reward:.4f} "
-                f"bid_hit={initial_bid_hit:.4f}.",
-            )
 
         for iteration in range(trainer.iteration + 1, target + 1):
             trainer.iteration = iteration
@@ -506,28 +520,28 @@ def train_command(args: argparse.Namespace) -> int:
             stats = trainer.update(trees)
             collector = trainer.collector.stats
 
-            eval_reward: float | None = None
-            eval_bid_hit: float | None = None
+            eval_reports: dict[str, Any] = {}
             opponent_switched = False
             if (
                 int(evaluation["every"]) > 0
                 and iteration % int(evaluation["every"]) == 0
             ):
-                policy = SeqModelPolicy(
-                    trainer.model,
-                    device=device,
-                    greedy=training_action_mode == "argmax",
-                    name="candidate",
-                )
-                report = evaluate_policy(
-                    policy,
-                    heuristic,
-                    eval_bank,
-                    seed=int(evaluation.get("action_seed", 17)),
-                    batch_size=int(evaluation["batch_size"]),
-                )
-                eval_reward = report.macro_relative_reward
-                eval_bid_hit = report.macro_bid_hit_rate
+                for action_mode, greedy in (("sample", False), ("argmax", True)):
+                    policy = SeqModelPolicy(
+                        trainer.model,
+                        device=device,
+                        greedy=greedy,
+                        name=f"candidate-{action_mode}",
+                    )
+                    eval_reports[action_mode] = evaluate_policy(
+                        policy,
+                        heuristic,
+                        eval_bank,
+                        seed=int(evaluation.get("action_seed", 17)),
+                        batch_size=int(evaluation["batch_size"]),
+                    )
+                sample_report = eval_reports["sample"]
+                eval_reward = sample_report.macro_relative_reward
                 opponent_switched = trainer.record_heuristic_evaluation(
                     eval_reward,
                     threshold=switch_reward,
@@ -548,8 +562,7 @@ def train_command(args: argparse.Namespace) -> int:
                 collector,
                 total,
                 elapsed_before + total,
-                eval_reward,
-                eval_bid_hit,
+                eval_reports,
             )
             _append_metric(run.metrics, row)
             elapsed_before += total
@@ -596,9 +609,10 @@ def train_command(args: argparse.Namespace) -> int:
                 message += f" ({stats.backtracks} backtracks)"
             if stats.rolled_back:
                 message += " ROLLBACK"
-            if eval_reward is not None:
+            if eval_reports:
                 message += (
-                    f" | eval-{training_action_mode} {eval_reward:.4f}"
+                    f" | eval sample {eval_reports['sample'].macro_relative_reward:.4f}"
+                    f" argmax {eval_reports['argmax'].macro_relative_reward:.4f}"
                     f" | anchor {trainer.opponent_phase}"
                 )
                 if trainer.opponent_phase == "heuristic":
@@ -793,9 +807,10 @@ def _metric_row(
     collector,
     total: float,
     elapsed: float,
-    eval_reward: float | None,
-    eval_bid_hit: float | None,
+    eval_reports: dict[str, Any],
 ) -> dict[str, Any]:
+    sample_report = eval_reports.get("sample")
+    argmax_report = eval_reports.get("argmax")
     return {
         "iteration": trainer.iteration,
         "optimizer_steps": trainer.optimizer_steps,
@@ -838,7 +853,15 @@ def _metric_row(
         "value_rows": stats.value_rows,
         "loss_suit": stats.loss_suit,
         "loss_trick": stats.loss_trick,
+        "loss_oracle_trick": stats.loss_oracle_trick,
         "loss_bid_hit": stats.loss_bid_hit,
+        "suit_accuracy_10c_0": stats.suit_accuracy_10c_0,
+        "suit_accuracy_10c_4": stats.suit_accuracy_10c_4,
+        "suit_accuracy_10c_8": stats.suit_accuracy_10c_8,
+        "trick_accuracy_10c_0": stats.trick_accuracy_10c_0,
+        "trick_accuracy_10c_4": stats.trick_accuracy_10c_4,
+        "trick_accuracy_10c_8": stats.trick_accuracy_10c_8,
+        "oracle_trick_accuracy": stats.oracle_trick_accuracy,
         "entropy": stats.entropy,
         "entropy_bid_normalized": stats.entropy_bid_normalized,
         "entropy_play_normalized": stats.entropy_play_normalized,
@@ -871,8 +894,26 @@ def _metric_row(
         "critic_loss_last_epoch": stats.critic_loss_last_epoch,
         "critic_loss_reduction": stats.critic_loss_reduction,
         "peak_update_device_gb": stats.peak_update_device_bytes / (1024**3),
-        "eval_reward_vs_heuristic": ("" if eval_reward is None else eval_reward),
-        "eval_bid_hit": "" if eval_bid_hit is None else eval_bid_hit,
+        # Legacy aliases intentionally follow sample mode: the curriculum gate
+        # and best-checkpoint selection are both defined by sampled reward.
+        "eval_reward_vs_heuristic": (
+            "" if sample_report is None else sample_report.macro_relative_reward
+        ),
+        "eval_bid_hit": (
+            "" if sample_report is None else sample_report.macro_bid_hit_rate
+        ),
+        "eval_reward_vs_heuristic_sample": (
+            "" if sample_report is None else sample_report.macro_relative_reward
+        ),
+        "eval_bid_hit_sample": (
+            "" if sample_report is None else sample_report.macro_bid_hit_rate
+        ),
+        "eval_reward_vs_heuristic_argmax": (
+            "" if argmax_report is None else argmax_report.macro_relative_reward
+        ),
+        "eval_bid_hit_argmax": (
+            "" if argmax_report is None else argmax_report.macro_bid_hit_rate
+        ),
         "peak_cache_rows": collector.peak_cache_rows,
         "cache_rows_allocated": collector.cache_rows_allocated,
         "cache_pressure": collector.peak_cache_rows
@@ -939,6 +980,18 @@ def _ensure_metrics_header(path: Path) -> None:
                 "critic_loss_last_epoch",
                 "critic_loss_reduction",
                 "peak_update_device_gb",
+                "loss_oracle_trick",
+                "suit_accuracy_10c_0",
+                "suit_accuracy_10c_4",
+                "suit_accuracy_10c_8",
+                "trick_accuracy_10c_0",
+                "trick_accuracy_10c_4",
+                "trick_accuracy_10c_8",
+                "oracle_trick_accuracy",
+                "eval_reward_vs_heuristic_sample",
+                "eval_bid_hit_sample",
+                "eval_reward_vs_heuristic_argmax",
+                "eval_bid_hit_argmax",
             }
             missing = set(METRIC_COLUMNS) - set(header)
             expected_existing = tuple(

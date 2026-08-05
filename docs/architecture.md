@@ -72,6 +72,11 @@ not pooled. The critic sequence is longer than an actor sequence by
 actor rollout tokens or KV caches. Its value head emits one column per absolute
 seat. Input owner/actor id `s` and value column `s` therefore name the same
 player throughout a game. Hidden cards never enter the deployed actor.
+The oracle also has a trainable feasibility-masked final-trick head on the
+same absolute-seat axis. Its suit-presence head stays frozen: every owner's
+remaining suits are directly recoverable from the perfect-information card
+prefix and public plays, so that task would be trivial. The observer-limited
+actor retains both nontrivial belief heads.
 
 Update-time sequences are tail-padded into configurable length buckets. With
 width 32, the 24 player/hand shapes coalesce into three actor lengths and four
@@ -120,6 +125,8 @@ are unbiased.
 - Relative value readout, supervised at focal policy decisions by default.
 - Oracle PPO value MLP with one output column per absolute seat, trained on all
   active players at each learned pre-action state and used only during updates.
+- Oracle PPO final-trick logits on the same absolute-seat axis, trained densely;
+  no oracle suit-presence objective.
 - Per-opponent suit-presence logits (sigmoid, four suits).
 - Per-seat final trick-count logits (softmax over `0..hand_size`,
   feasibility-masked), the observer included.

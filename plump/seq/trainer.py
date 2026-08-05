@@ -57,6 +57,7 @@ from .model import (
 from .policy import SeqLeague, best_seq_device
 from .precision import autocast_context
 from .ppo import (
+    PPO_BELIEF_STAGES,
     PPOCriticGroup,
     PPOTrainingGroup,
     build_ppo_training_batch,
@@ -135,7 +136,15 @@ class SeqUpdateStats:
     value_prediction_std: float = 0.0
     loss_suit: float = 0.0
     loss_trick: float = 0.0
+    loss_oracle_trick: float = 0.0
     loss_bid_hit: float = 0.0
+    suit_accuracy_10c_0: float = 0.0
+    suit_accuracy_10c_4: float = 0.0
+    suit_accuracy_10c_8: float = 0.0
+    trick_accuracy_10c_0: float = 0.0
+    trick_accuracy_10c_4: float = 0.0
+    trick_accuracy_10c_8: float = 0.0
+    oracle_trick_accuracy: float = 0.0
     entropy: float = 0.0
     entropy_bid_normalized: float = 0.0
     entropy_play_normalized: float = 0.0
@@ -979,6 +988,8 @@ class SeqTrainer:
             self.optimizer.zero_grad(set_to_none=True)
             epoch = self._ppo_actor_backward(groups)
             stats.loss_policy += epoch["policy_loss"]
+            stats.loss_suit += epoch["suit_loss"]
+            stats.loss_trick += epoch["trick_loss"]
             stats.entropy = epoch["entropy"]
             stats.entropy_bid_normalized = epoch["bid_entropy"]
             stats.entropy_play_normalized = epoch["play_entropy"]
@@ -988,6 +999,17 @@ class SeqTrainer:
                 # replays full sequences. This should remain numerical noise,
                 # not silently turn the first PPO epoch off-policy.
                 stats.ppo_behavior_replay_kl = epoch["behavior_kl"]
+                for stage in PPO_BELIEF_STAGES:
+                    setattr(
+                        stats,
+                        f"suit_accuracy_10c_{stage}",
+                        epoch[f"suit_accuracy_10c_{stage}"],
+                    )
+                    setattr(
+                        stats,
+                        f"trick_accuracy_10c_{stage}",
+                        epoch[f"trick_accuracy_10c_{stage}"],
+                    )
             stats.policy_logit_shift = epoch["logit_shift"]
             stats.core_grad_norm = float(
                 torch.nn.utils.clip_grad_norm_(
@@ -1280,6 +1302,86 @@ class SeqTrainer:
                 with autocast_context(self.device, self.train.precision):
                     hidden = model.forward_hidden(tokens)
                 loss = torch.zeros((), device=self.device, dtype=torch.float32)
+
+                position_weight = torch.from_numpy(
+                    group.position_weight[start:stop]
+                ).to(self.device)
+                stage_positions = group.belief_stage_positions[start:stop]
+
+                if self.train.suit_coef > 0:
+                    with autocast_context(self.device, self.train.precision):
+                        suit_logits = model.suit_presence_head(hidden).view(
+                            hidden.shape[0],
+                            hidden.shape[1],
+                            model.config.belief_opponents,
+                            4,
+                        )
+                    suit_logits = suit_logits.float()
+                    suit_targets = torch.from_numpy(
+                        group.suit_targets[start:stop]
+                    ).to(self.device)
+                    suit_labeled = suit_targets != IGNORE_LABEL
+                    bce = F.binary_cross_entropy_with_logits(
+                        suit_logits,
+                        suit_targets.clamp_min(0).float(),
+                        reduction="none",
+                    )
+                    per_position = (
+                        (bce * suit_labeled.float()).sum(dim=(2, 3))
+                        / suit_labeled.float().sum(dim=(2, 3)).clamp_min(1.0)
+                    )
+                    suit_loss = (per_position * position_weight).sum()
+                    loss = loss + self.train.suit_coef * suit_loss
+                    totals["suit_loss"].append(suit_loss.detach())
+                    self._record_ppo_belief_stage_accuracy(
+                        totals,
+                        "suit",
+                        suit_logits,
+                        suit_targets,
+                        None,
+                        stage_positions,
+                    )
+
+                if self.train.trick_coef > 0:
+                    with autocast_context(self.device, self.train.precision):
+                        trick_logits = model.trick_count_head(hidden).view(
+                            hidden.shape[0],
+                            hidden.shape[1],
+                            model.config.max_players,
+                            model.config.bid_count,
+                        )
+                    trick_logits = trick_logits.float()
+                    trick_targets = torch.from_numpy(
+                        group.trick_targets[start:stop]
+                    ).to(self.device)
+                    trick_masks = torch.from_numpy(
+                        group.trick_masks[start:stop]
+                    ).to(self.device)
+                    masked_logits = trick_logits.masked_fill(~trick_masks, -1e9)
+                    log_probs = torch.log_softmax(masked_logits, dim=-1)
+                    safe_targets = trick_targets.clamp_min(0)[:, None, :, None].expand(
+                        -1, masked_logits.shape[1], -1, 1
+                    )
+                    gathered = log_probs.gather(3, safe_targets).squeeze(-1)
+                    labeled = (
+                        (trick_targets != IGNORE_LABEL)[:, None, :]
+                        & trick_masks.any(dim=-1)
+                    )
+                    per_position = (-gathered * labeled.float()).sum(dim=2) / (
+                        labeled.float().sum(dim=2).clamp_min(1.0)
+                    )
+                    trick_loss = (per_position * position_weight).sum()
+                    loss = loss + self.train.trick_coef * trick_loss
+                    totals["trick_loss"].append(trick_loss.detach())
+                    self._record_ppo_belief_stage_accuracy(
+                        totals,
+                        "trick",
+                        masked_logits,
+                        trick_targets,
+                        trick_masks,
+                        stage_positions,
+                    )
+
                 for phase, rows in rows_by_phase.items():
                     if not rows["weight"]:
                         continue
@@ -1351,6 +1453,8 @@ class SeqTrainer:
         row_weight = max(reduced.get("row_weight", 0.0), 1e-12)
         result = {
             "policy_loss": reduced.get("policy_loss", 0.0),
+            "suit_loss": reduced.get("suit_loss", 0.0),
+            "trick_loss": reduced.get("trick_loss", 0.0),
             "entropy": reduced.get("entropy_raw", 0.0) / row_weight,
             "clip_fraction": reduced.get("clip", 0.0) / row_weight,
             "behavior_kl": reduced.get("behavior_kl", 0.0) / row_weight,
@@ -1363,7 +1467,56 @@ class SeqTrainer:
                 if entropy_weight > 0
                 else 0.0
             )
+        for head in ("suit", "trick"):
+            for stage in PPO_BELIEF_STAGES:
+                total = reduced.get(f"{head}_stage_{stage}_total", 0.0)
+                result[f"{head}_accuracy_10c_{stage}"] = (
+                    reduced.get(f"{head}_stage_{stage}_correct", 0.0) / total
+                    if total > 0
+                    else 0.0
+                )
         return result
+
+    @staticmethod
+    def _record_ppo_belief_stage_accuracy(
+        totals: dict[str, list[torch.Tensor]],
+        head: str,
+        logits: torch.Tensor,
+        targets: torch.Tensor,
+        feasibility: torch.Tensor | None,
+        stage_positions: np.ndarray,
+    ) -> None:
+        """Accumulate micro-accuracy before 1st/5th/9th ten-card plays."""
+
+        device = logits.device
+        for stage_index, cards_played in enumerate(PPO_BELIEF_STAGES):
+            positions_np = stage_positions[:, stage_index]
+            rows_np = np.flatnonzero(positions_np >= 0)
+            if rows_np.size == 0:
+                continue
+            rows = torch.from_numpy(rows_np).to(device=device, dtype=torch.long)
+            positions = torch.from_numpy(positions_np[rows_np]).to(
+                device=device, dtype=torch.long
+            )
+            selected_logits = logits[rows, positions]
+            if head == "suit":
+                selected_targets = targets[rows, positions]
+                labeled = selected_targets != IGNORE_LABEL
+                predictions = selected_logits >= 0
+            else:
+                selected_targets = targets[rows]
+                assert feasibility is not None
+                labeled = (
+                    (selected_targets != IGNORE_LABEL)
+                    & feasibility[rows, positions].any(dim=-1)
+                )
+                predictions = selected_logits.argmax(dim=-1)
+            totals[f"{head}_stage_{cards_played}_correct"].append(
+                ((predictions == selected_targets) & labeled).sum().detach()
+            )
+            totals[f"{head}_stage_{cards_played}_total"].append(
+                labeled.sum().detach()
+            )
 
     def _update_entropy_temperature(self, epoch: dict[str, float]) -> None:
         if self.entropy_optimizer is None:
@@ -1511,9 +1664,12 @@ class SeqTrainer:
 
         assert isinstance(self.critic, SeqPPOOracleCritic)
         assert self.critic_optimizer is not None
-        total_loss = 0.0
+        value_terms: list[torch.Tensor] = []
+        trick_terms: list[torch.Tensor] = []
         epoch_losses: list[float] = []
-        for _ in range(self.train.ppo_critic_epochs):
+        oracle_trick_correct: list[torch.Tensor] = []
+        oracle_trick_total: list[torch.Tensor] = []
+        for critic_epoch in range(self.train.ppo_critic_epochs):
             self.critic.train()
             self.critic_optimizer.zero_grad(set_to_none=True)
             pending: list[torch.Tensor] = []
@@ -1528,7 +1684,12 @@ class SeqTrainer:
                         self.device
                     )
                     with autocast_context(self.device, self.train.precision):
-                        values = self.critic.forward_full(tokens)
+                        if self.train.trick_coef > 0:
+                            values, trick_logits = (
+                                self.critic.forward_value_and_trick(tokens)
+                            )
+                        else:
+                            values = self.critic.forward_full(tokens)
                     seq = torch.tensor(
                         rows["seq_index"], device=self.device, dtype=torch.long
                     )
@@ -1560,12 +1721,52 @@ class SeqTrainer:
                     # Each state retains its actor-objective weight. Averaging
                     # the output-seat axis supplies all-player supervision
                     # without multiplying larger-player games' critic weight.
-                    loss = (
+                    value_loss = (
                         0.5
                         * weight
                         * (error.square() * active.float()).sum(dim=-1)
                         / players.float()
                     ).sum()
+                    loss = value_loss
+                    value_terms.append(value_loss.detach())
+
+                    if self.train.trick_coef > 0:
+                        trick_targets = torch.from_numpy(
+                            group.trick_targets[start:stop]
+                        ).to(self.device)
+                        trick_masks = torch.from_numpy(
+                            group.trick_masks[start:stop]
+                        ).to(self.device)
+                        position_weight = torch.from_numpy(
+                            group.position_weight[start:stop]
+                        ).to(self.device)
+                        masked_logits = trick_logits.float().masked_fill(
+                            ~trick_masks, -1e9
+                        )
+                        log_probs = torch.log_softmax(masked_logits, dim=-1)
+                        safe_targets = trick_targets.clamp_min(0)[
+                            :, None, :, None
+                        ].expand(-1, masked_logits.shape[1], -1, 1)
+                        gathered = log_probs.gather(3, safe_targets).squeeze(-1)
+                        labeled = (
+                            (trick_targets != IGNORE_LABEL)[:, None, :]
+                            & trick_masks.any(dim=-1)
+                        )
+                        per_position = (
+                            (-gathered * labeled.float()).sum(dim=2)
+                            / labeled.float().sum(dim=2).clamp_min(1.0)
+                        )
+                        trick_loss = (per_position * position_weight).sum()
+                        loss = loss + self.train.trick_coef * trick_loss
+                        trick_terms.append(trick_loss.detach())
+                        if critic_epoch == 0:
+                            predictions = masked_logits.argmax(dim=-1)
+                            oracle_trick_correct.append(
+                                ((predictions == trick_targets[:, None, :]) & labeled)
+                                .sum()
+                                .detach()
+                            )
+                            oracle_trick_total.append(labeled.sum().detach())
                     loss.backward()
                     pending.append(loss.detach())
             stats.critic_grad_norm = float(
@@ -1581,8 +1782,17 @@ class SeqTrainer:
             self.critic_optimizer.step()
             epoch_loss = math.fsum(float(value) for value in pending)
             epoch_losses.append(epoch_loss)
-            total_loss += epoch_loss
-        stats.loss_value = total_loss
+        stats.loss_value = math.fsum(float(value) for value in value_terms)
+        stats.loss_oracle_trick = math.fsum(
+            float(value) for value in trick_terms
+        )
+        correct = math.fsum(float(value) for value in oracle_trick_correct)
+        labeled = math.fsum(float(value) for value in oracle_trick_total)
+        stats.oracle_trick_accuracy = (
+            correct / labeled
+            if labeled > 0
+            else 0.0
+        )
         self._record_critic_loss_dynamics(stats, epoch_losses)
 
     @staticmethod
@@ -2301,9 +2511,16 @@ class SeqTrainer:
             if "critic_state_dict" in payload and compatible_critic:
                 self.critic.load_state_dict(payload["critic_state_dict"])
                 if "critic_optimizer_state_dict" in payload:
-                    self.critic_optimizer.load_state_dict(
-                        payload["critic_optimizer_state_dict"]
-                    )
+                    try:
+                        self.critic_optimizer.load_state_dict(
+                            payload["critic_optimizer_state_dict"]
+                        )
+                    except ValueError:
+                        # Checkpoints written before the oracle trick-count
+                        # readout became trainable have no Adam slots for that
+                        # head. Keep all critic weights, but start fresh critic
+                        # moments rather than inventing incompatible state.
+                        pass
             else:
                 # An actor-only checkpoint, or a checkpoint from a different
                 # critic topology, begins from the loaded actor without

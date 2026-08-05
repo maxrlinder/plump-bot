@@ -244,10 +244,19 @@ def test_fresh_run_evaluates_iteration_zero_before_training(
     assert payload["iteration"] == 0
     assert payload["protocol"]["greedy"] is False
     assert payload["report"]["rounds"] == 9
+    argmax = run / "evaluations" / "iter_000000" / "heuristic.json"
+    assert json.loads(argmax.read_text())["protocol"]["greedy"] is True
+    with (run / "metrics.csv").open(newline="") as handle:
+        row = next(csv.DictReader(handle))
+    assert row["eval_reward_vs_heuristic_sample"]
+    assert row["eval_bid_hit_sample"]
+    assert row["eval_reward_vs_heuristic_argmax"]
+    assert row["eval_bid_hit_argmax"]
     best = json.loads((run / "checkpoints" / "best.json").read_text())
     assert best["iteration"] in (0, 1)
     output = capsys.readouterr().out
     assert "Initial iter 0 [sample] evaluated against heuristic" in output
+    assert "Initial iter 0 [argmax] evaluated against heuristic" in output
 
 
 def test_cli_reconfigure_writes_resume_checkpoint_and_config_audit(

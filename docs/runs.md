@@ -62,8 +62,9 @@ seat cursors, rule fingerprint, and relocatable league references.
 New runs also save iteration zero so the untrained baseline can be evaluated
 and a run interrupted before its first interval can resume exactly. If
 evaluation is enabled, training evaluates this checkpoint before update one,
-caches the result below `evaluations/iter_000000/`, and records it as the
-initial best model without counting it toward an opponent-curriculum gate.
+caches both sampled and argmax results below `evaluations/iter_000000/`, and
+uses sampled reward to record the initial best model without counting it
+toward an opponent-curriculum gate.
 
 PPO checkpoints additionally retain every actor in the actor pool, the oracle
 or observer critic and its optimizer, adaptive bid/play entropy temperatures
@@ -98,6 +99,12 @@ reused unless `--force` is supplied.
 legal action without penalizing retained entropy. `sample` draws reproducibly
 from the learned legal-action distribution. `both` stores and dashboards the
 two protocols separately.
+
+The training loop itself always evaluates both modes at every configured
+evaluation step, independent of the sidecar command. It records reward and bid
+accuracy for each (four dashboard observations). Sampled reward is the durable
+legacy alias and is the only score used for `best.pt` and the
+heuristic-to-history win streak.
 
 Evaluation can follow a live trainer without sharing its run lock or metrics
 writer:

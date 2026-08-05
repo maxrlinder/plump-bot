@@ -40,6 +40,8 @@ def ppo_config(
     kv_dtype="fp16",
     critic_epochs=1,
     bucket_width=0,
+    suit_coef=0.0,
+    trick_coef=0.0,
 ):
     return SeqTrainingConfig(
         schedule_cells=cells
@@ -61,6 +63,8 @@ def ppo_config(
         policy_kl_p99_cap=1.0,
         precision=precision,
         kv_dtype=kv_dtype,
+        suit_coef=suit_coef,
+        trick_coef=trick_coef,
     )
 
 
@@ -216,6 +220,50 @@ def test_oracle_critic_reports_loss_dynamics_across_epochs():
     )
 
 
+def test_ppo_actor_beliefs_and_oracle_trick_head_train_with_ten_card_stages():
+    config = ppo_config(
+        cells=(GameScheduleCell(hand_size=10, num_players=3, games=1),),
+        suit_coef=0.1,
+        trick_coef=0.1,
+    )
+    trainer = SeqTrainer(SeqPlumpModel(MODEL), config, device="cpu")
+    trees, _ = trainer.collect()
+    batch = build_ppo_training_batch(trees, MODEL, config)
+
+    assert sum(group.position_weight.sum() for group in batch.policy_groups) == (
+        pytest.approx(1.0)
+    )
+    assert sum(group.position_weight.sum() for group in batch.critic_groups) == (
+        pytest.approx(1.0)
+    )
+    assert all(
+        np.all(group.belief_stage_positions >= 0)
+        for group in batch.policy_groups
+    )
+    assert isinstance(trainer.critic, SeqPPOOracleCritic)
+    assert all(
+        parameter.requires_grad
+        for parameter in trainer.critic.backbone.trick_count_head.parameters()
+    )
+    assert all(
+        not parameter.requires_grad
+        for parameter in trainer.critic.backbone.suit_presence_head.parameters()
+    )
+
+    stats = trainer.update(trees)
+
+    assert stats.loss_suit > 0
+    assert stats.loss_trick > 0
+    assert stats.loss_oracle_trick > 0
+    for stage in (0, 4, 8):
+        assert 0.0 <= getattr(stats, f"suit_accuracy_10c_{stage}") <= 1.0
+        assert 0.0 <= getattr(stats, f"trick_accuracy_10c_{stage}") <= 1.0
+    assert 0.0 <= stats.oracle_trick_accuracy <= 1.0
+    assert trainer.model.suit_presence_head.weight.grad is not None
+    assert trainer.model.trick_count_head.weight.grad is not None
+    assert trainer.critic.backbone.trick_count_head.weight.grad is not None
+
+
 def test_ppo_length_bucketing_merges_shapes_and_preserves_causal_readouts():
     cells = (
         GameScheduleCell(hand_size=4, num_players=3, games=2),
@@ -263,13 +311,21 @@ def test_ppo_length_bucketing_merges_shapes_and_preserves_causal_readouts():
     not torch.backends.mps.is_available(), reason="requires Apple MPS"
 )
 def test_mps_bf16_ppo_smoke():
-    config = ppo_config(precision="bf16", kv_dtype="bf16")
+    config = ppo_config(
+        precision="bf16",
+        kv_dtype="bf16",
+        suit_coef=0.1,
+        trick_coef=0.1,
+    )
     trainer = SeqTrainer(SeqPlumpModel(MODEL), config, device="mps")
     trees, _ = trainer.collect()
     stats = trainer.update(trees)
     torch.mps.synchronize()
     assert np.isfinite(stats.loss_policy)
     assert np.isfinite(stats.loss_value)
+    assert stats.loss_suit > 0
+    assert stats.loss_trick > 0
+    assert stats.loss_oracle_trick > 0
     assert stats.ppo_behavior_replay_kl < 1e-3
     # Autocast lowers compute, not the master weights or Adam state.
     assert next(trainer.model.parameters()).dtype == torch.float32

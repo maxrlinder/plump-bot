@@ -49,7 +49,7 @@ def render_dashboard(
         if evaluations_path is not None
         else metrics_path.parent / "evaluations",
     )
-    fig, axes = plt.subplots(3, 3, figsize=(20, 13), constrained_layout=True)
+    fig, axes = plt.subplots(4, 3, figsize=(20, 17), constrained_layout=True)
     fig.get_layout_engine().set(rect=(0.0, 0.035, 1.0, 0.96))
     fig.suptitle(
         title or f"Plump schema-v6 · {metrics_path.parent.name}",
@@ -153,6 +153,51 @@ def render_dashboard(
     )
     _mark_cache_cap_hits(axes[2, 2], iteration, rows)
     _mark_policy_rollbacks(axes[0, 2], iteration, rows)
+    _lines(
+        axes[3, 0],
+        iteration,
+        rows,
+        (
+            ("loss_suit", "actor opponent-suit BCE"),
+            ("loss_trick", "actor final-trick CE"),
+            ("loss_oracle_trick", "oracle final-trick CE"),
+        ),
+        smooth=smooth,
+        title="Belief auxiliary losses",
+        ylabel="normalized loss",
+        omit_zero=True,
+    )
+    _lines(
+        axes[3, 1],
+        iteration,
+        rows,
+        (
+            ("suit_accuracy_10c_0", "0 cards played"),
+            ("suit_accuracy_10c_4", "4 cards played"),
+            ("suit_accuracy_10c_8", "8 cards played"),
+        ),
+        smooth=smooth,
+        title="Opponent-suit accuracy · 10-card games",
+        ylabel="bit accuracy",
+        omit_zero=True,
+    )
+    axes[3, 1].set_ylim(0.0, 1.0)
+    _lines(
+        axes[3, 2],
+        iteration,
+        rows,
+        (
+            ("trick_accuracy_10c_0", "actor · 0 played"),
+            ("trick_accuracy_10c_4", "actor · 4 played"),
+            ("trick_accuracy_10c_8", "actor · 8 played"),
+            ("oracle_trick_accuracy", "oracle · all prefixes"),
+        ),
+        smooth=smooth,
+        title="Final-trick exact accuracy",
+        ylabel="seat accuracy",
+        omit_zero=True,
+    )
+    axes[3, 2].set_ylim(0.0, 1.0)
 
     for ax in axes.flat:
         ax.set_xlabel("Iteration")
@@ -209,22 +254,55 @@ def _evaluation_points(
     rows: list[dict[str, str]],
     evaluations_path: Path,
 ) -> list[dict[str, float | str]]:
-    """Merge inline legacy scores with checkpoint-scoped sidecar reports."""
+    """Merge paired inline scores with checkpoint-scoped sidecar reports."""
 
     points: dict[tuple[str, int], dict[str, float | str]] = {}
     iterations = _series(rows, "iteration")
+    explicit_fields = {
+        "sample": (
+            "eval_reward_vs_heuristic_sample",
+            "eval_bid_hit_sample",
+        ),
+        "argmax": (
+            "eval_reward_vs_heuristic_argmax",
+            "eval_bid_hit_argmax",
+        ),
+    }
+    for mode, (reward_field, bid_field) in explicit_fields.items():
+        rewards = _series(rows, reward_field)
+        bids = _series(rows, bid_field)
+        for iteration, reward, bid in zip(iterations, rewards, bids):
+            if np.isfinite(iteration) and (
+                np.isfinite(reward) or np.isfinite(bid)
+            ):
+                points[(mode, int(iteration))] = {
+                    "iteration": float(iteration),
+                    "mode": mode,
+                    "reward": float(reward),
+                    "bid_hit": float(bid),
+                    "ci_low": math.nan,
+                    "ci_high": math.nan,
+                }
+
+    # Before paired evaluation existed, the inline columns represented the
+    # configured action mode. Preserve those historical observations, but let
+    # explicit paired columns (and then sidecars below) take precedence.
+    legacy_mode = _legacy_evaluation_mode(evaluations_path.parent / "config.toml")
     rewards = _series(rows, "eval_reward_vs_heuristic")
     bids = _series(rows, "eval_bid_hit")
     for iteration, reward, bid in zip(iterations, rewards, bids):
         if np.isfinite(iteration) and (np.isfinite(reward) or np.isfinite(bid)):
-            points[("argmax", int(iteration))] = {
-                "iteration": float(iteration),
-                "mode": "argmax",
-                "reward": float(reward),
-                "bid_hit": float(bid),
-                "ci_low": math.nan,
-                "ci_high": math.nan,
-            }
+            points.setdefault(
+                (legacy_mode, int(iteration)),
+                {
+                    "iteration": float(iteration),
+                    "mode": legacy_mode,
+                    "reward": float(reward),
+                    "bid_hit": float(bid),
+                    "ci_low": math.nan,
+                    "ci_high": math.nan,
+                },
+            )
 
     if evaluations_path.is_dir():
         paths = sorted(evaluations_path.glob("iter_*/heuristic.json"))
@@ -260,6 +338,17 @@ def _evaluation_points(
             except (KeyError, TypeError, ValueError, json.JSONDecodeError, OSError):
                 continue
     return [points[key] for key in sorted(points)]
+
+
+def _legacy_evaluation_mode(config_path: Path) -> str:
+    """Infer the meaning of pre-paired inline evaluation columns."""
+
+    try:
+        with config_path.open("rb") as handle:
+            mode = tomllib.load(handle)["evaluation"]["training_action_mode"]
+        return "sample" if mode == "sample" else "argmax"
+    except (KeyError, OSError, TypeError, ValueError, tomllib.TOMLDecodeError):
+        return "argmax"
 
 
 def _checkpoint_evaluation(

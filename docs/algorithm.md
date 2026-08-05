@@ -860,6 +860,14 @@ pre-action state, all active output columns are trained by Monte Carlo MSE
 against $(R_0,\ldots,R_{P-1})$; the player axis is averaged so it does not
 reweight games by player count.
 
+The same oracle hidden states have a second, feasibility-masked categorical
+head for every absolute seat's final trick count. It is supervised densely at
+all real oracle positions. There is deliberately no oracle suit-presence loss:
+the oracle HAND prefix already states every card owner, so that target would
+measure copying rather than inference. This auxiliary may improve the critic's
+representation, but it does not enter the advantage directly and does not
+change the validity of the baseline argument above.
+
 For the actor, define
 
 $$
@@ -902,6 +910,22 @@ $$
 Self-play can learn from every seat without counting one deal as $P$
 independent games. The sum is deliberately not divided by decision count, so a
 longer hand contributes more policy decisions.
+
+The actor's suit-presence and final-trick auxiliaries use a separate dense
+normalization:
+
+$$
+L_{aux}=\frac{1}{G}\sum_g\frac{1}{|C_g|}
+\sum_{i\in C_g}\frac{1}{L_{g,i}}\sum_{t=1}^{L_{g,i}}
+\ell_{aux}(h_{g,i,t}).
+$$
+
+Thus each game contributes equal auxiliary mass while longer games retain
+their requested larger policy mass. For ten-card games, evaluation of these
+heads is pinned to the pre-action states before plays 1, 5, and 9, meaning the
+observer has personally played exactly 0, 4, or 8 cards. Opponent-suit accuracy
+is micro-accuracy over opponent/suit bits; final-trick accuracy is exact-class
+accuracy over active seats.
 
 ### Preventing entropy collapse
 
@@ -951,7 +975,10 @@ larger ceiling raised memory use without a repeatable throughput gain.
 
 The run writes dashboard metrics every five updates and checkpoints and
 evaluates every 100 updates, approximately every 31 minutes at the measured
-18.7 seconds per update. These intervals affect observability and recovery,
+18.7 seconds per update. Every inline evaluation runs both the sampled policy
+and deterministic argmax on the same deal bank, yielding reward and bid
+accuracy for each. Sampled reward alone controls `best` and the four-win
+heuristic-to-history gate. These intervals affect observability and recovery,
 not the estimator.
 
 The PPO implementation is in `plump/seq/ppo.py`; the default critic is

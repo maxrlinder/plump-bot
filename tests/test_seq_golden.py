@@ -258,8 +258,16 @@ def test_schema_v6_collection_and_update_match_corrected_golden_hashes():
                             "critic_all_player_correlation",
                             "critic_loss_first_epoch",
                             "critic_loss_last_epoch",
-                            "critic_loss_reduction",
-                            "peak_update_device_bytes",
+                                "critic_loss_reduction",
+                                "loss_oracle_trick",
+                                "suit_accuracy_10c_0",
+                                "suit_accuracy_10c_4",
+                                "suit_accuracy_10c_8",
+                                "trick_accuracy_10c_0",
+                                "trick_accuracy_10c_4",
+                                "trick_accuracy_10c_8",
+                                "oracle_trick_accuracy",
+                                "peak_update_device_bytes",
                         }
                 }
             ),

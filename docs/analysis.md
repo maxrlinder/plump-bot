@@ -17,6 +17,8 @@ outcomes, value and belief learning, entropy and KL, branch/data volume,
 pre-clip gradient norms, wall-time breakdown, cache pressure, device memory,
 and rollback state. Learning rate is hidden unless `--include-learning-rate`
 is passed. Sparse evaluation results and resumed CSV files are supported.
+New inline evaluations always contribute four exact observations: sampled and
+argmax relative reward plus sampled and argmax bid accuracy.
 
 Every continuous per-iteration training series uses a trailing 50-iteration
 mean by default, with raw observations retained as faint lines underneath.
@@ -47,6 +49,13 @@ update. `metrics.csv` retains the raw `critic_loss_first_epoch` and
 `critic_grad_norm` beside the core/shared and value/belief groups on its
 logarithmic scale. Historical CSVs are upgraded with blank cells, so new series
 begin only when the resumed trainer can measure them.
+
+The bottom row preserves the tree/search panel above it and adds PPO auxiliary
+telemetry: actor opponent-suit loss, actor final-trick loss, oracle final-trick
+loss, and actor accuracies at 0/4/8 cards personally played in ten-card games.
+Suit accuracy is per opponent/suit bit; trick accuracy is exact final-count per
+active seat. Oracle trick accuracy is shown separately over all real oracle
+prefixes and must not be compared as hidden-information inference.
 
 `value_prediction_std`, normalized MSE, and value-row count remain available
 in `metrics.csv` even when they are not separately plotted.
