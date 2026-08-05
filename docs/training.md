@@ -197,6 +197,17 @@ parameters and Adam state, FP16 KV storage, and FP32 attention softmax, masked
 log-softmax, ratios, KL, entropy, returns, and advantages. Rollout games and
 update microbatch positions are independent memory knobs.
 
+PPO update groups can be coalesced with `ppo_sequence_bucket_width`. Each
+actor/oracle sequence is tail-padded to the next bucket boundary (capped at its
+model's positional capacity), then shapes with the same padded length are
+processed together. Causality makes selected pre-padding readouts exactly
+unchanged. The MPS preset uses width 32: at 768 games/update this reduced the
+24 small per-shape groups to 3 actor and 4 critic length buckets. PPO replay
+also evaluates bid/card heads only on actual decision rows rather than every
+token. Measured together, these changes cut steady update time while keeping
+`microbatch_positions=16384`; larger microbatches increased memory without a
+repeatable speed gain.
+
 ## Rollout packing and opponent curriculum
 
 The preset keeps the existing 48-deal update budget and apportions it exactly:

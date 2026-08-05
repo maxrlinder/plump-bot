@@ -1141,26 +1141,23 @@ class SeqTrainer:
                         rows["position"], device=self.device, dtype=torch.long
                     )
                     selected_all = (
-                        values[seq, pos, : group.num_players]
-                        .float()
-                        .cpu()
-                        .numpy()
+                        values[seq, pos].float().cpu().numpy()
                     )
                     acting_seat = np.asarray(rows["acting_seat"], dtype=np.int64)
                     selected = selected_all[
                         np.arange(selected_all.shape[0]), acting_seat
                     ]
-                    target_all = np.stack(rows["returns"])[
-                        :, : group.num_players
-                    ]
+                    target_all = np.stack(rows["returns"])
+                    players = np.asarray(rows["num_players"], dtype=np.int64)
+                    active = (
+                        np.arange(self.model.config.max_players)[None, :]
+                        < players[:, None]
+                    )
                     row_weight = np.asarray(rows["weight"], dtype=np.float64)
-                    all_player_predictions.append(selected_all.reshape(-1))
-                    all_player_targets.append(target_all.reshape(-1))
+                    all_player_predictions.append(selected_all[active])
+                    all_player_targets.append(target_all[active])
                     all_player_weights.append(
-                        np.repeat(
-                            row_weight / group.num_players,
-                            group.num_players,
-                        )
+                        np.repeat(row_weight / players, players)
                     )
                     for local, prediction in enumerate(selected):
                         address = (
@@ -1281,21 +1278,20 @@ class SeqTrainer:
             ):
                 tokens = torch.from_numpy(group.tokens[start:stop]).to(self.device)
                 with autocast_context(self.device, self.train.precision):
-                    output = model.forward_full(tokens, aux_heads=False)
+                    hidden = model.forward_hidden(tokens)
                 loss = torch.zeros((), device=self.device, dtype=torch.float32)
                 for phase, rows in rows_by_phase.items():
                     if not rows["weight"]:
                         continue
-                    logits_all = (
-                        output.bid_logits if phase == "bid" else output.card_logits
-                    )
                     seq = torch.tensor(
                         rows["seq_index"], device=self.device, dtype=torch.long
                     )
                     pos = torch.tensor(
                         rows["position"], device=self.device, dtype=torch.long
                     )
-                    logits = logits_all[seq, pos].float()
+                    with autocast_context(self.device, self.train.precision):
+                        logits = model.policy_logits(hidden[seq, pos], phase)
+                    logits = logits.float()
                     old_probs = torch.from_numpy(
                         np.stack(rows["old_probs_full"])
                     ).to(self.device)
@@ -1403,15 +1399,10 @@ class SeqTrainer:
                 ):
                     tokens = torch.from_numpy(group.tokens[start:stop]).to(self.device)
                     with autocast_context(self.device, self.train.precision):
-                        output = model.forward_full(tokens, aux_heads=False)
+                        hidden = model.forward_hidden(tokens)
                     for phase, rows in rows_by_phase.items():
                         if not rows["weight"]:
                             continue
-                        logits_all = (
-                            output.bid_logits
-                            if phase == "bid"
-                            else output.card_logits
-                        )
                         seq = torch.tensor(
                             rows["seq_index"], device=self.device, dtype=torch.long
                         )
@@ -1427,8 +1418,12 @@ class SeqTrainer:
                         advantages = torch.tensor(
                             rows["advantages"], device=self.device
                         )
+                        with autocast_context(self.device, self.train.precision):
+                            logits = model.policy_logits(
+                                hidden[seq, pos], phase
+                            )
                         terms = ppo_clipped_terms(
-                            logits_all[seq, pos],
+                            logits,
                             old_probs,
                             actions,
                             advantages,
@@ -1542,11 +1537,23 @@ class SeqTrainer:
                     )
                     targets = torch.from_numpy(np.stack(rows["returns"])).to(
                         self.device
-                    )[:, : group.num_players]
+                    )
                     weight = torch.tensor(
                         rows["weight"], device=self.device, dtype=torch.float32
                     )
-                    predictions = values[seq, pos, : group.num_players].float()
+                    players = torch.tensor(
+                        rows["num_players"],
+                        device=self.device,
+                        dtype=torch.long,
+                    )
+                    active = (
+                        torch.arange(
+                            self.model.config.max_players,
+                            device=self.device,
+                        )[None, :]
+                        < players[:, None]
+                    )
+                    predictions = values[seq, pos].float()
                     error = (
                         predictions - targets.float()
                     ) / self.train.value_reward_scale
@@ -1554,7 +1561,10 @@ class SeqTrainer:
                     # the output-seat axis supplies all-player supervision
                     # without multiplying larger-player games' critic weight.
                     loss = (
-                        0.5 * weight * error.square().mean(dim=-1)
+                        0.5
+                        * weight
+                        * (error.square() * active.float()).sum(dim=-1)
+                        / players.float()
                     ).sum()
                     loss.backward()
                     pending.append(loss.detach())

@@ -55,6 +55,7 @@ class PPOCriticRows:
     seq_index: list[int] = field(default_factory=list)
     position: list[int] = field(default_factory=list)
     acting_seat: list[int] = field(default_factory=list)
+    num_players: list[int] = field(default_factory=list)
     returns: list[np.ndarray] = field(default_factory=list)
     weight: list[float] = field(default_factory=list)
 
@@ -212,6 +213,7 @@ def build_ppo_training_batch(
                 critic_rows.seq_index.append(seq_index)
                 critic_rows.position.append(position)
                 critic_rows.acting_seat.append(record.seat)
+                critic_rows.num_players.append(players)
                 critic_rows.returns.append(returns.copy())
                 critic_rows.weight.append(seat_weight)
         critic_groups.append(
@@ -283,7 +285,139 @@ def build_ppo_training_batch(
                 policy=policy,
             )
         )
-    return PPOTrainingBatch(policy_groups=groups, critic_groups=critic_groups)
+    batch = PPOTrainingBatch(policy_groups=groups, critic_groups=critic_groups)
+    return bucket_ppo_training_batch(
+        batch,
+        width=train_config.ppo_sequence_bucket_width,
+        model_config=model_config,
+    )
+
+
+def _bucket_length(length: int, width: int, capacity: int) -> int:
+    if width <= 0:
+        return length
+    return min(((length + width - 1) // width) * width, capacity)
+
+
+def bucket_ppo_training_batch(
+    batch: PPOTrainingBatch,
+    *,
+    width: int,
+    model_config: SeqModelConfig,
+) -> PPOTrainingBatch:
+    """Merge shape groups after tail-padding to nearby sequence lengths.
+
+    Every PPO readout precedes the appended padding, so causal attention makes
+    the operation exactly loss/logit preserving. The larger rectangular
+    batches trade a small amount of padded FLOPs for substantially fewer
+    transformer launches and better accelerator utilization.
+    """
+
+    if width <= 0:
+        return batch
+
+    critic_buckets: dict[int, list[tuple[int, PPOCriticGroup]]] = defaultdict(list)
+    for old_index, group in enumerate(batch.critic_groups):
+        length = _bucket_length(
+            group.tokens.shape[1], width, model_config.oracle_max_seq_len
+        )
+        critic_buckets[length].append((old_index, group))
+
+    critic_groups: list[PPOCriticGroup] = []
+    critic_address: dict[tuple[int, int], tuple[int, int]] = {}
+    critic_fields = tuple(PPOCriticRows.__dataclass_fields__)
+    for length, sources in sorted(critic_buckets.items()):
+        total = sum(group.tokens.shape[0] for _, group in sources)
+        tokens = np.zeros((total, length, TOKEN_WIDTH), dtype=np.int64)
+        rows = PPOCriticRows()
+        offset = 0
+        new_group_index = len(critic_groups)
+        for old_group_index, group in sources:
+            count, source_length = group.tokens.shape[:2]
+            tokens[offset : offset + count, :source_length] = group.tokens
+            for seq_index in range(count):
+                critic_address[(old_group_index, seq_index)] = (
+                    new_group_index,
+                    offset + seq_index,
+                )
+            for name in critic_fields:
+                values = getattr(group.rows, name)
+                if name == "seq_index":
+                    getattr(rows, name).extend(value + offset for value in values)
+                else:
+                    getattr(rows, name).extend(values)
+            offset += count
+        critic_groups.append(
+            PPOCriticGroup(
+                num_players=max(group.num_players for _, group in sources),
+                hand_size=max(group.hand_size for _, group in sources),
+                tokens=tokens,
+                rows=rows,
+            )
+        )
+
+    # Redirect actor decision rows to their game's new critic bucket address.
+    for group in batch.policy_groups:
+        for rows in group.policy.values():
+            for index in range(len(rows.weight)):
+                address = (
+                    rows.critic_group[index],
+                    rows.critic_seq_index[index],
+                )
+                new_group, new_seq = critic_address[address]
+                rows.critic_group[index] = new_group
+                rows.critic_seq_index[index] = new_seq
+
+    policy_buckets: dict[
+        tuple[str, int], list[PPOTrainingGroup]
+    ] = defaultdict(list)
+    for group in batch.policy_groups:
+        length = _bucket_length(
+            group.tokens.shape[1], width, model_config.max_seq_len
+        )
+        policy_buckets[(group.policy_id, length)].append(group)
+
+    policy_groups: list[PPOTrainingGroup] = []
+    policy_fields = tuple(PPOPolicyRows.__dataclass_fields__)
+    for (policy_id, length), sources in sorted(policy_buckets.items()):
+        total = sum(group.tokens.shape[0] for group in sources)
+        tokens = np.zeros((total, length, TOKEN_WIDTH), dtype=np.int64)
+        initial_hands = np.empty(
+            (total, model_config.max_players, model_config.max_hand_size),
+            dtype=np.int64,
+        )
+        policy = {"bid": PPOPolicyRows(), "play": PPOPolicyRows()}
+        offset = 0
+        for group in sources:
+            count, source_length = group.tokens.shape[:2]
+            tokens[offset : offset + count, :source_length] = group.tokens
+            initial_hands[offset : offset + count] = group.initial_hands
+            for phase in policy:
+                source_rows = group.policy[phase]
+                target_rows = policy[phase]
+                for name in policy_fields:
+                    values = getattr(source_rows, name)
+                    if name == "seq_index":
+                        getattr(target_rows, name).extend(
+                            value + offset for value in values
+                        )
+                    else:
+                        getattr(target_rows, name).extend(values)
+            offset += count
+        policy_groups.append(
+            PPOTrainingGroup(
+                policy_id=policy_id,
+                num_players=max(group.num_players for group in sources),
+                hand_size=max(group.hand_size for group in sources),
+                tokens=tokens,
+                initial_hands=initial_hands,
+                policy=policy,
+            )
+        )
+    return PPOTrainingBatch(
+        policy_groups=policy_groups,
+        critic_groups=critic_groups,
+    )
 
 
 def build_ppo_training_groups(
@@ -410,6 +544,7 @@ def ppo_critic_rows_by_chunk(
             "seq_index": [],
             "position": [],
             "acting_seat": [],
+            "num_players": [],
             "returns": [],
             "weight": [],
         }
@@ -418,6 +553,7 @@ def ppo_critic_rows_by_chunk(
                 selected["seq_index"].append(seq_index - start)
                 selected["position"].append(group.rows.position[index])
                 selected["acting_seat"].append(group.rows.acting_seat[index])
+                selected["num_players"].append(group.rows.num_players[index])
                 selected["returns"].append(group.rows.returns[index])
                 selected["weight"].append(group.rows.weight[index])
         out.append(selected)

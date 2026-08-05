@@ -198,8 +198,11 @@ def resolve_training_config(raw: dict[str, Any]) -> ResolvedTraining:
         ppo_self_play_seats=str(
             training_raw.get("ppo_self_play_seats", "all")
         ),
+        ppo_sequence_bucket_width=int(
+            training_raw.get("ppo_sequence_bucket_width", 0)
+        ),
         ppo_critic_mode=str(
-            training_raw.get("ppo_critic_mode", "privileged")
+            training_raw.get("ppo_critic_mode", "oracle")
         ),
         ppo_critic_learning_rate=float(
             training_raw.get("ppo_critic_learning_rate", 3e-4)

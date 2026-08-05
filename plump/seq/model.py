@@ -410,6 +410,23 @@ class SeqPlumpModel(nn.Module):
             value=self.value_head(hidden).squeeze(-1),
         )
 
+    def forward_hidden(self, tokens: torch.Tensor) -> torch.Tensor:
+        """Full causal trunk without materializing any readout head."""
+
+        x = self.embed(tokens)
+        for block in self.blocks:
+            x = block.forward_full(x)
+        return self.final_norm(x)
+
+    def policy_logits(self, hidden: torch.Tensor, phase: str) -> torch.Tensor:
+        """Evaluate only the requested action head on selected hidden rows."""
+
+        if phase == "bid":
+            return self.bid_head(hidden)
+        if phase == "play":
+            return self._card_logits(hidden)
+        raise ValueError(f"Unknown policy phase {phase!r}.")
+
     def forward_full(
         self,
         tokens: torch.Tensor,
@@ -434,10 +451,7 @@ class SeqPlumpModel(nn.Module):
             if unknown:
                 raise ValueError(f"Unknown auxiliary heads: {unknown}")
 
-        x = self.embed(tokens)
-        for block in self.blocks:
-            x = block.forward_full(x)
-        hidden = self.final_norm(x)
+        hidden = self.forward_hidden(tokens)
 
         config = self.config
         output = SeqOutput(

@@ -32,7 +32,9 @@ from plump.seq.trainer import SeqTrainer
 MODEL = SeqModelConfig(d_model=32, n_layers=1, n_heads=2, d_ff=64)
 
 
-def ppo_config(*, cells=None, actors=1, precision="fp32", critic_epochs=1):
+def ppo_config(
+    *, cells=None, actors=1, precision="fp32", critic_epochs=1, bucket_width=0
+):
     return SeqTrainingConfig(
         schedule_cells=cells
         or (GameScheduleCell(hand_size=3, num_players=3, games=2),),
@@ -46,6 +48,7 @@ def ppo_config(*, cells=None, actors=1, precision="fp32", critic_epochs=1):
         ),
         policy_objective="ppo",
         ppo_trainable_policies=actors,
+        ppo_sequence_bucket_width=bucket_width,
         ppo_critic_epochs=critic_epochs,
         microbatch_positions=512,
         policy_kl_cap=1.0,
@@ -205,6 +208,49 @@ def test_oracle_critic_reports_loss_dynamics_across_epochs():
         (stats.critic_loss_first_epoch - stats.critic_loss_last_epoch)
         / stats.critic_loss_first_epoch
     )
+
+
+def test_ppo_length_bucketing_merges_shapes_and_preserves_causal_readouts():
+    cells = (
+        GameScheduleCell(hand_size=4, num_players=3, games=2),
+        GameScheduleCell(hand_size=3, num_players=4, games=2),
+    )
+    exact_config = ppo_config(cells=cells, bucket_width=0)
+    bucket_config = ppo_config(cells=cells, bucket_width=16)
+    trainer = SeqTrainer(SeqPlumpModel(MODEL), exact_config, device="cpu")
+    trees, _ = trainer.collect()
+    exact = build_ppo_training_batch(trees, MODEL, exact_config)
+    bucketed = build_ppo_training_batch(trees, MODEL, bucket_config)
+
+    assert len(exact.policy_groups) == 2
+    assert len(bucketed.policy_groups) == 1
+    assert len(exact.critic_groups) == 2
+    assert len(bucketed.critic_groups) == 1
+
+    model = trainer.model.eval()
+    offset = 0
+    with torch.inference_mode():
+        bucket_output = model.forward_full(
+            torch.from_numpy(bucketed.policy_groups[0].tokens), aux_heads=False
+        )
+        for group in exact.policy_groups:
+            count, length = group.tokens.shape[:2]
+            exact_output = model.forward_full(
+                torch.from_numpy(group.tokens), aux_heads=False
+            )
+            torch.testing.assert_close(
+                bucket_output.bid_logits[offset : offset + count, :length],
+                exact_output.bid_logits,
+                atol=2e-6,
+                rtol=2e-6,
+            )
+            torch.testing.assert_close(
+                bucket_output.card_logits[offset : offset + count, :length],
+                exact_output.card_logits,
+                atol=2e-6,
+                rtol=2e-6,
+            )
+            offset += count
 
 
 @pytest.mark.skipif(

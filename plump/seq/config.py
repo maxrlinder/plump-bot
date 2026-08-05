@@ -840,6 +840,10 @@ class SeqTrainingConfig:
     ppo_clip_ratio: float = 0.1
     ppo_trainable_policies: int = 1
     ppo_self_play_seats: Literal["focal", "all"] = "all"
+    # Round actor/oracle sequence lengths up to this many positions and merge
+    # compatible PPO shape groups. 0 keeps exact per-shape batches. Padding is
+    # appended after every selected causal position and cannot affect logits.
+    ppo_sequence_bucket_width: int = 0
     # The default oracle critic has its own trunk and receives one distinct,
     # owner-tagged token for every dealt card. It processes one canonical
     # sequence per environmental game and emits one value per absolute seat.
@@ -1050,6 +1054,8 @@ class SeqTrainingConfig:
             )
         if self.ppo_self_play_seats not in ("focal", "all"):
             raise ValueError("ppo_self_play_seats must be 'focal' or 'all'.")
+        if self.ppo_sequence_bucket_width < 0:
+            raise ValueError("ppo_sequence_bucket_width must be >= 0.")
         if self.ppo_critic_mode not in PPO_CRITIC_MODES:
             raise ValueError(
                 f"Unknown ppo_critic_mode {self.ppo_critic_mode!r}; expected "

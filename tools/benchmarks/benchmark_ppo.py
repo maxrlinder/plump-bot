@@ -35,6 +35,7 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--precision", choices=("fp32", "bf16"))
     result.add_argument("--games-per-shape", type=int, default=2)
     result.add_argument("--microbatch-positions", type=int)
+    result.add_argument("--bucket-width", type=int)
     result.add_argument("--policies", type=int)
     result.add_argument("--warmup", type=int, default=1)
     result.add_argument("--repeats", type=int, default=3)
@@ -65,6 +66,10 @@ def main() -> int:
     if args.microbatch_positions:
         overrides.append(
             f"training.microbatch_positions={args.microbatch_positions}"
+        )
+    if args.bucket_width is not None:
+        overrides.append(
+            f"training.ppo_sequence_bucket_width={args.bucket_width}"
         )
     if args.policies:
         overrides.append(f"training.ppo_trainable_policies={args.policies}")
