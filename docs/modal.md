@@ -5,8 +5,10 @@ trainer, objective, metrics, checkpoint validation, and curriculum are shared
 with local execution; `infra/modal_training.py` supplies only the image, CUDA
 resources, persistent Volume, retries, and detached entrypoint.
 
-`configs/modal-l40s.toml` differs from the MPS preset only in execution
-capacity:
+This guide documents the checked-in `configs/modal-l40s.toml` NeuRD profile.
+It is separate from the local `configs/ppo-mps.toml` oracle-PPO profile; the
+PPO length bucketing and microbatch measurements in the local training guide
+do not imply tuned CUDA values. The Modal profile uses:
 
 - CUDA is explicit and float32 matrix multiplies use PyTorch's `high` mode;
 - each update has 192 games: 96 self-play plus 96 anchor games;

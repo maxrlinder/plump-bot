@@ -281,7 +281,7 @@ stratified candidates is useful.
 
 ### The stratified candidate rule
 
-The active preset uses five candidate strata for bidding and four for play.
+The NeuRD preset uses five candidate strata for bidding and four for play.
 If the legal set is no larger than that budget, every legal action is evaluated
 and $q(a)=1$.
 
@@ -559,7 +559,7 @@ D_{\mathrm{KL}}
 \pi_{\text{new}}(\cdot\mid h)\right).
 $$
 
-The standard local preset requires both the objective-weighted mean KL to be
+The NeuRD preset requires both the objective-weighted mean KL to be
 at most 0.01 and the weighted p99 to be at most 0.05. These numbers are
 configuration values, not mathematical constants.
 
@@ -632,9 +632,9 @@ policy representation, but they are another reason the neural update is not a
 literal tabular policy-improvement proof. The KL guard observes their net
 effect on the policy.
 
-## 11. What one current local update contains
+## 11. What one counterfactual local update contains
 
-The standard local configuration covers all 24 combinations of
+The NeuRD configuration in `configs/train.toml` covers all 24 combinations of
 
 - 3, 4, or 5 players; and
 - 3 through 10 cards.
@@ -658,6 +658,10 @@ For one update, opponents and $\pi_{\text{old}}$ are frozen. In self-play the
 gradient does not differentiate through the opponents' sampled actions; it
 improves the focal policy against the behavior encountered in that rollout.
 The next update recollects games with the new policy.
+
+The current local production run instead uses the branch-free PPO method in
+Section 18. Its rollout batch and execution details are recorded there so the
+two estimators are not conflated.
 
 ## 12. Why sampling can eventually produce a good policy
 
@@ -808,7 +812,7 @@ repeat for each training update:
   inclusion probabilities, propagates reach, and backs up terminal values.
 - `plump/seq/trainer.py` constructs $\widehat Q$ and $\widehat A$, evaluates
   the NeuRD/value/auxiliary losses, and performs KL backtracking.
-- `configs/train.toml` records the active local algorithm settings and loss
+- `configs/train.toml` records the counterfactual NeuRD settings and loss
   coefficients.
 - `tests/test_seq_rollout.py` and `tests/test_seq_trainer.py` pin the estimator
   and optimizer invariants described above.
@@ -924,6 +928,30 @@ On MPS, BF16 autocast lowers eligible transformer operations while parameters
 and Adam state stay FP32. Cached K/V is independently FP16. Attention softmax,
 masked policy log-softmax, likelihood ratios, KL, entropy, returns, advantages,
 and loss accumulation are explicitly FP32.
+
+### Current local production batch and execution
+
+The `ppo-oracle-mps-768` profile collects 32 independent games for each of the
+24 `(players, cards)` shapes, or 768 games per update. Half are shared-actor
+self-play and half use the heuristic or historical anchor. Thus each arm has
+384 games and each player-count bucket has 256 games. All shared-actor seats
+contribute policy rows in self-play; only the focal actor contributes policy
+rows in anchor games. The larger Monte Carlo batch reduces estimator variance
+but does not change the PPO objective above.
+
+At update time, sequences are tail-padded to length buckets of width 32 and
+concatenated. At 768 games this turns the 24 per-shape groups into three actor
+and four oracle-critic groups. Causal masking means padding after a selected
+decision cannot alter that decision's hidden state, so this coalescing is an
+exact execution optimization. Actor replay also computes bid and card heads
+only at stored decision rows; unused token positions do not enter the PPO
+loss. The production microbatch ceiling remains 16,384 positions because a
+larger ceiling raised memory use without a repeatable throughput gain.
+
+The run writes dashboard metrics every five updates and checkpoints and
+evaluates every 100 updates, approximately every 31 minutes at the measured
+18.7 seconds per update. These intervals affect observability and recovery,
+not the estimator.
 
 The PPO implementation is in `plump/seq/ppo.py`; the default critic is
 `SeqPPOOracleCritic` in `plump/seq/model.py`; dispatch, optimization, entropy

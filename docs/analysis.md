@@ -33,15 +33,23 @@ crosses; ordinary successful backtracks are already represented by the
 accepted and proposed KL series and do not add markers. Runs created before
 this telemetry simply begin the dashed series after their next resumed update.
 
-The value-and-belief panel is scoped to focal decision states. Raw reward-point
-value RMSE has its own axis; weighted prediction/target correlation,
-suit-presence loss, and final trick-count loss share the dimensionless axis.
-The gradient panel shows the separately clipped core/shared and
-value/belief-readout parameter-group norms before clipping on a logarithmic
-scale, with the configured `1.0` threshold as a dotted reference.
-`value_zero_rmse`, `value_prediction_std`, normalized MSE, and value-row count
-remain available in `metrics.csv`. These series start at the first update
-produced by the newer reporting schema.
+For counterfactual runs, the value-and-belief panel is scoped to focal decision
+states. Raw reward-point value RMSE has its own axis; weighted
+prediction/target correlation, suit-presence loss, and final trick-count loss
+share the dimensionless axis.
+
+When oracle-PPO telemetry is present, that panel automatically becomes
+**Oracle critic dynamics**. It compares acting-seat RMSE, all-active-seat RMSE,
+and the zero-baseline RMSE, then shows acting/all-seat return correlation and
+the fractional critic-loss reduction from the first to last critic epoch in an
+update. `metrics.csv` retains the raw `critic_loss_first_epoch` and
+`critic_loss_last_epoch` values. The gradient panel adds the separately clipped
+`critic_grad_norm` beside the core/shared and value/belief groups on its
+logarithmic scale. Historical CSVs are upgraded with blank cells, so new series
+begin only when the resumed trainer can measure them.
+
+`value_prediction_std`, normalized MSE, and value-row count remain available
+in `metrics.csv` even when they are not separately plotted.
 
 While an older trainer process is still refreshing `dashboard.png`, a sidecar
 evaluator writes the new layout to `dashboard-eval.png`.

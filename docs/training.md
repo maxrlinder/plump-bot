@@ -4,8 +4,9 @@
 
 ### NeuRD
 
-The current preset uses paper-backed NeuRD with a multi-action control-variate
-estimator. For frozen pre-sampling value prediction `b`, action-value sample
+The counterfactual preset in `configs/train.toml` uses paper-backed NeuRD with
+a multi-action control-variate estimator. For frozen pre-sampling value
+prediction `b`, action-value sample
 `Q(a)`, and exact candidate-inclusion probability `q(a)`:
 
 ```text
@@ -39,7 +40,7 @@ and descendant policy losses are weighted by that reach. Cache blocking
 changes estimator variance, not the expected objective.
 
 After Adam proposes an update, KL is measured on every policy row. Both
-weighted mean and weighted p99 caps must pass; the current preset uses `0.01`
+weighted mean and weighted p99 caps must pass; the NeuRD preset uses `0.01`
 and `0.05`, respectively. Failed proposals restore the exact model and
 optimizer state and retry at a geometrically smaller learning rate.
 
@@ -59,7 +60,7 @@ remembered when interpreting or changing the tail cap.
 Backtracking scales the shared trunk and bid/card action heads because those
 parameters can move the policy. It does not scale the value, suit-presence,
 trick-count, or bid-hit readout heads: those heads only consume the shared
-representation and cannot change policy KL. The current preset starts both the
+representation and cannot change policy KL. The NeuRD preset starts both the
 core and auxiliary readouts at `2.5e-5`; the older
 `learning_rate` field remains the fallback when a group-specific value is
 omitted. Core and readout gradients are clipped independently, so an exact
@@ -87,7 +88,7 @@ The optimizer also trains relative value plus suit-presence and final
 trick-count auxiliaries. Both belief auxiliaries use coefficient `0.05`; value
 remains `0.5`. Bid hit and entropy remain disabled.
 
-Value is a control variate for the focal policy update, so the current
+Value is a control variate for the focal policy update, so the NeuRD
 objective is normalized MSE at exactly the focal bid/play readout positions:
 
 ```text
@@ -163,9 +164,9 @@ At each learned pre-action state the critic is trained against all active
 players' undiscounted terminal relative returns. Its loss averages the player
 axis, so adding output columns does not multiply the weight of larger tables.
 For the actor advantage only the acting player's column is selected. The
-critic runs after rollout collection, uses full causal forwards grouped by
-player/hand shape, and never changes actor tokens or exposes hidden cards at
-deployment. The older `privileged` pooled-deal observer critic and the
+critic runs after rollout collection, uses full causal forwards coalesced by
+padded sequence length, and never changes actor tokens or exposes hidden cards
+at deployment. The older `privileged` pooled-deal observer critic and the
 non-privileged `independent` critic remain available as ablations.
 
 For oracle PPO runs, the dashboard's value panel becomes **Oracle critic
@@ -201,8 +202,9 @@ PPO update groups can be coalesced with `ppo_sequence_bucket_width`. Each
 actor/oracle sequence is tail-padded to the next bucket boundary (capped at its
 model's positional capacity), then shapes with the same padded length are
 processed together. Causality makes selected pre-padding readouts exactly
-unchanged. The MPS preset uses width 32: at 768 games/update this reduced the
-24 small per-shape groups to 3 actor and 4 critic length buckets. PPO replay
+unchanged. The PPO MPS preset uses width 32. In the 768-game production
+profile this reduced the 24 small per-shape groups to 3 actor and 4 critic
+length buckets. PPO replay
 also evaluates bid/card heads only on actual decision rows rather than every
 token. Measured together, these changes cut steady update time while keeping
 `microbatch_positions=16384`; larger microbatches increased memory without a
@@ -210,13 +212,22 @@ repeatable speed gain.
 
 ## Rollout packing and opponent curriculum
 
-The preset keeps the existing 48-deal update budget and apportions it exactly:
+The counterfactual `configs/train.toml` preset keeps the 48-deal update budget
+and apportions it exactly:
 24 current-policy self-play games and 24 anchor-opponent games. Each of the 24
 `(players, cards)` cells contributes one of each. Through five cards the pair
 shares one wave loop; from six cards upward each deal runs in its own wave loop
 so a wide tree gets the full cache budget. `rollout.opponent_fraction`,
 `rollout.opponent_packing`, `rollout.deals_per_batch`, and
 `rollout.parallel_deals_max_hand_size` configure these behaviors.
+
+The current local PPO production profile instead uses 32 independent games for
+each of the 24 `(players, cards)` shapes: 768 complete games/update, split into
+384 self-play and 384 anchor games. Equivalently, each player-count bucket gets
+256 games across its eight hand sizes. PPO never branches; in self-play all
+seats controlled by the shared actor produce policy rows, while an anchor game
+learns only from its focal actor. `deals_per_batch=128` is only a rollout wave
+capacity and does not change the 768-game objective batch.
 
 The anchor initially consists of deterministic heuristic opponents. Heuristic
 seats run through the batched wave scheduler but consume no neural forward or
@@ -227,6 +238,21 @@ reward is above `evaluation.opponent_switch_reward` for
 switches permanently to historical league opponents. The phase and streak are
 checkpointed. Only historical checkpoints with iteration in
 `[ceil(current / 2), current]` are eligible for sampling.
+
+For the active 768-game MPS run, inline sampled-policy evaluation and interval
+checkpointing both occur every 100 updates. The measured update cycle is about
+18.7 seconds, so this is roughly 31 minutes. Dashboard rendering remains every
+five updates. A fresh, random initialization with that profile is:
+
+```bash
+uv run plump train ppo-oracle-mps-768 --config configs/ppo-mps.toml \
+  --set training.deals_per_shape=32 \
+  --set run.checkpoint_every=100 \
+  --set evaluation.every=100
+```
+
+Omitting `--from-checkpoint` creates and records `iter_000000.pt` before the
+first update. The resolved overrides are copied into the run's `config.toml`.
 
 An existing run can adopt an explicitly changed configuration with
 `plump train RUN --config ... --reconfigure --reconfigure-reason ...`. This
@@ -242,8 +268,9 @@ beyond this local optimizer.
 
 ## Configuration
 
-`configs/train.toml` is the source of truth for a new run. Its defaults match
-the optimized schema-v6 training entrypoint:
+`configs/train.toml` is the counterfactual NeuRD source of truth;
+`configs/ppo-mps.toml` is the branch-free PPO/MPS preset. Both use the same
+typed schema-v6 training entrypoint and run/checkpoint machinery:
 
 - balanced player/card/bidding-position schedule;
 - schema-v6 model dimensions and token flags;
@@ -276,7 +303,8 @@ The production PPO actor/critic path has a dedicated benchmark:
 
 ```bash
 .venv/bin/python tools/benchmarks/benchmark_ppo.py \
-  --games-per-shape 128 \
+  --games-per-shape 32 \
+  --bucket-width 32 \
   --microbatch-positions 16384 \
   --warmup 1 --repeats 3
 ```

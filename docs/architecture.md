@@ -18,7 +18,7 @@ checkpoint and prevents loading weights under different game rules.
 Each observer receives a causal sequence:
 
 ```text
-[GAME] [HAND × N] [TURN] [BID × P]
+[GAME] [HAND × N] { [TURN] [BID] } × P
 { [PLAY × P] [TRICK_WIN] } × N
 ```
 
@@ -49,8 +49,8 @@ its hand.
 
 ## Model and rollout
 
-`SeqPlumpModel` is a causal transformer with grouped-query attention. The
-current preset uses a 384-wide, six-layer model with twelve query heads, two KV
+`SeqPlumpModel` is a causal transformer with grouped-query attention. Both
+local presets use a 384-wide, six-layer model with twelve query heads, two KV
 heads, and a 1152-wide feed-forward block — 7.83M parameters.
 
 The rollout collector advances every live branch in event waves. KV prefixes
@@ -73,16 +73,26 @@ actor rollout tokens or KV caches. Its value head emits one column per absolute
 seat. Input owner/actor id `s` and value column `s` therefore name the same
 player throughout a game. Hidden cards never enter the deployed actor.
 
-Branch placement and candidate selection are controlled by the training
-configuration. The active preset branches every eligible decision through
-seven cards and tapers geometrically to rate `0.5` at ten cards under a fixed
-cache-row budget.
+Update-time sequences are tail-padded into configurable length buckets. With
+width 32, the 24 player/hand shapes coalesce into three actor lengths and four
+oracle-critic lengths. Every supervised readout precedes padding, so causal
+attention makes the selected hidden states and losses identical to exact-length
+batches. PPO actor replay evaluates bid/card heads only at actual decision rows
+rather than materializing both action heads and the unused actor value at every
+token. These are execution optimizations, not changes to the policy estimator.
 
-Each update contains 24 self-play deals and 24 anchor deals. The anchor starts
-as the deterministic heuristic and changes to recent historical checkpoints
-after four consecutive positive sampled-policy evaluations. Heuristic games
-share the wave scheduler with self-play but allocate model state only for the
-focal learner, so opponent actions add no transformer forwards or KV rows.
+For counterfactual objectives, branch placement and candidate selection are
+controlled by the training configuration. The NeuRD preset branches every
+eligible decision through seven cards and tapers geometrically to rate `0.5`
+at ten cards under a fixed cache-row budget.
+
+The NeuRD preset contains 24 self-play deals and 24 anchor deals. The active
+local PPO profile instead contains 384 of each: 32 games for every one of the
+24 player/hand shapes. The anchor starts as the deterministic heuristic and
+changes to recent historical checkpoints after four consecutive positive
+sampled-policy evaluations. Heuristic games share the wave scheduler with
+self-play but allocate model state only for the focal learner, so opponent
+actions add no transformer forwards or KV rows.
 
 Bids use five distinct policy-mass strata and plays use four. If no more than
 that many actions are legal, every action is evaluated. Otherwise actions are
@@ -108,10 +118,12 @@ are unbiased.
   one suit embedding. This shares rank behavior across suits and suit behavior
   across ranks without forcing different cards to be identical.
 - Relative value readout, supervised at focal policy decisions by default.
+- Oracle PPO value MLP with one output column per absolute seat, trained on all
+  active players at each learned pre-action state and used only during updates.
 - Per-opponent suit-presence logits (sigmoid, four suits).
 - Per-seat final trick-count logits (softmax over `0..hand_size`,
   feasibility-masked), the observer included.
-- Optional per-seat bid-hit logits (sigmoid), off in the current preset.
+- Optional per-seat bid-hit logits (sigmoid), off in both local presets.
 
 The shared output rows start at zero, so introducing them into an existing
 checkpoint preserves every card logit exactly. They then learn with the core

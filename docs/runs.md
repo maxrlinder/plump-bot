@@ -12,8 +12,8 @@ runs/<name>/
   dashboard-eval.png
   checkpoints/
     iter_000000.pt
-    iter_000050.pt
     iter_000100.pt
+    iter_000200.pt
     latest.json
     best.pt
     best.json
@@ -61,6 +61,13 @@ optimizer steps, trainer/framework RNG states, collector adaptive batching and
 seat cursors, rule fingerprint, and relocatable league references.
 New runs also save iteration zero so the untrained baseline can be evaluated
 and a run interrupted before its first interval can resume exactly.
+
+PPO checkpoints additionally retain every actor in the actor pool, the oracle
+or observer critic and its optimizer, adaptive bid/play entropy temperatures
+and their optimizer, and the rotating actor-assignment cursor. On an explicit
+fork, changing actor count or critic topology initializes only incompatible new
+state; it does not invent optimizer moments for parameters absent from the
+source checkpoint.
 
 Writes go to a temporary sibling, are reloaded for validation, and atomically
 replace the destination. Only then is `latest.json` advanced. Historical files
