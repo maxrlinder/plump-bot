@@ -256,16 +256,17 @@ capacity and does not change the 768-game objective batch.
 
 The anchor initially consists of deterministic heuristic opponents. Heuristic
 seats run through the batched wave scheduler but consume no neural forward or
-KV-cache rows; only the focal current policy is encoded. Inline evaluation
+KV-cache rows; only the focal current policy is encoded. Automatic evaluation
 always runs both reproducible policy sampling and deterministic argmax against
-the same fixed deal bank. After sampled mean relative
+the same fixed deal bank in a separate checkpoint process. Training queues the
+job and immediately collects the next update. After sampled mean relative
 reward is above `evaluation.opponent_switch_reward` for
 `evaluation.opponent_switch_consecutive` consecutive evaluations, the anchor
 switches permanently to historical league opponents. The phase and streak are
 checkpointed. Only historical checkpoints with iteration in
 `[ceil(current / 2), current]` are eligible for sampling.
 
-For the active 768-game MPS run, paired inline evaluation and interval
+For the active 768-game MPS run, paired background evaluation and interval
 checkpointing both occur every 100 updates. The measured update cycle is about
 18.7 seconds, so this is roughly 31 minutes. Dashboard rendering remains every
 five updates. A fresh, random initialization with that profile is:
@@ -279,10 +280,11 @@ uv run plump train ppo-oracle-mps-768-v2 --config configs/ppo-mps.toml \
 
 Omitting `--from-checkpoint` creates and records `iter_000000.pt` before the
 first update. When evaluation is enabled, that checkpoint is immediately
-evaluated against the heuristic in both sample and argmax modes using the
-configured deal bank. The two rewards plus two bid accuracies supply four
-random-policy points on the dashboard. Sampled reward initializes `best`, but
-deliberately does not advance the
+queued for evaluation against the heuristic in both sample and argmax modes
+using the configured deal bank; update one does not wait for it. The two
+rewards plus two bid accuracies supply four random-policy points on the
+dashboard. Sampled reward initializes `best`, but deliberately does not
+advance the
 heuristic-switch win streak. A matching cached result is reused if an
 iteration-zero run is resumed. The resolved overrides are copied into the
 run's `config.toml`.

@@ -248,15 +248,23 @@ def test_fresh_run_evaluates_iteration_zero_before_training(
     assert json.loads(argmax.read_text())["protocol"]["greedy"] is True
     with (run / "metrics.csv").open(newline="") as handle:
         row = next(csv.DictReader(handle))
-    assert row["eval_reward_vs_heuristic_sample"]
-    assert row["eval_bid_hit_sample"]
-    assert row["eval_reward_vs_heuristic_argmax"]
-    assert row["eval_bid_hit_argmax"]
+    # Scheduled inference is checkpoint-scoped and asynchronous; exact points
+    # live in sidecars instead of delaying and then rewriting the update row.
+    assert not row["eval_reward_vs_heuristic_sample"]
+    assert not row["eval_bid_hit_sample"]
+    assert not row["eval_reward_vs_heuristic_argmax"]
+    assert not row["eval_bid_hit_argmax"]
     best = json.loads((run / "checkpoints" / "best.json").read_text())
     assert best["iteration"] in (0, 1)
     output = capsys.readouterr().out
-    assert "Initial iter 0 [sample] evaluated against heuristic" in output
-    assert "Initial iter 0 [argmax] evaluated against heuristic" in output
+    update_line = next(line for line in output.splitlines() if "iter     1" in line)
+    assert "Queued background sample+argmax evaluation 0" in output
+    assert "Background paired evaluation 0 completed" in output
+    assert "Applied eval 0 | sample reward=" in output
+    assert "eval" not in update_line
+    assert output.index("iter     1") < output.index(
+        "Background paired evaluation 0 completed"
+    )
 
 
 def test_cli_reconfigure_writes_resume_checkpoint_and_config_audit(

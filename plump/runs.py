@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -44,6 +45,7 @@ class RunDirectory:
         self.metrics = self.path / "metrics.csv"
         self.dashboard = self.path / "dashboard.png"
         self.evaluation_dashboard = self.path / "dashboard-eval.png"
+        self.evaluation_state = self.evaluations / "state.json"
         self.config = self.path / "config.toml"
         self.config_history = self.path / "config-history"
         self.metadata = self.path / "metadata.json"
@@ -145,6 +147,28 @@ class RunDirectory:
         manifest = checkpoint_manifest(checkpoint, iteration)
         manifest["metric"] = metric
         atomic_write_json(self.checkpoints / "best.json", manifest)
+
+    def promote_best(
+        self,
+        checkpoint: Path,
+        iteration: int,
+        metric: float,
+    ) -> Path:
+        """Atomically expose an already-written interval checkpoint as best."""
+
+        best = self.checkpoints / "best.pt"
+        temporary = best.with_name(f".{best.name}.{uuid.uuid4().hex}.tmp")
+        try:
+            try:
+                os.link(checkpoint, temporary)
+            except OSError:
+                shutil.copy2(checkpoint, temporary)
+            temporary.replace(best)
+            self.record_best(best, iteration, metric)
+        finally:
+            if temporary.exists():
+                temporary.unlink()
+        return best
 
     def best_metric(self) -> float | None:
         path = self.checkpoints / "best.json"

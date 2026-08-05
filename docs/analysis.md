@@ -17,7 +17,7 @@ outcomes, value and belief learning, entropy and KL, branch/data volume,
 pre-clip gradient norms, wall-time breakdown, cache pressure, device memory,
 and rollback state. Learning rate is hidden unless `--include-learning-rate`
 is passed. Sparse evaluation results and resumed CSV files are supported.
-New inline evaluations always contribute four exact observations: sampled and
+New automatic evaluations always contribute four exact observations: sampled and
 argmax relative reward plus sampled and argmax bid accuracy.
 
 Every continuous per-iteration training series uses a trailing 50-iteration
@@ -50,18 +50,22 @@ update. `metrics.csv` retains the raw `critic_loss_first_epoch` and
 logarithmic scale. Historical CSVs are upgraded with blank cells, so new series
 begin only when the resumed trainer can measure them.
 
-The bottom row preserves the tree/search panel above it and adds PPO auxiliary
-telemetry: actor opponent-suit loss, actor final-trick loss, oracle final-trick
-loss, and actor accuracies at 0/4/8 cards personally played in ten-card games.
+Belief losses replace the old tree/search-volume panel. The bottom row adds PPO
+auxiliary telemetry: actor accuracies at 0/4/8 cards personally played in
+ten-card games plus the exact argmax-minus-sample reward and bid-accuracy gaps.
 Suit accuracy is per opponent/suit bit; trick accuracy is exact final-count per
 active seat. Oracle trick accuracy is shown separately over all real oracle
 prefixes and must not be compared as hidden-information inference.
 
+When an automatic background evaluation completes, the trainer refreshes
+`dashboard.png` directly, so all four evaluation observations and their mode
+gaps appear without waiting for the next five-update dashboard cadence.
+
 `value_prediction_std`, normalized MSE, and value-row count remain available
 in `metrics.csv` even when they are not separately plotted.
 
-While an older trainer process is still refreshing `dashboard.png`, a sidecar
-evaluator writes the new layout to `dashboard-eval.png`.
+Manual or watch-mode sidecar evaluators write `dashboard-eval.png`; the current
+training pipeline keeps `dashboard.png` authoritative for automatic jobs.
 
 ## Card representation analysis
 

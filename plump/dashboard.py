@@ -97,14 +97,14 @@ def render_dashboard(
         iteration,
         rows,
         (
-            ("leaves", "terminal leaves"),
-            ("policy_rows", "policy rows"),
-            ("branch_decisions", "branch decisions"),
-            ("skipped_by_placement", "placement skips"),
+            ("loss_suit", "actor opponent-suit BCE"),
+            ("loss_trick", "actor final-trick CE"),
+            ("loss_oracle_trick", "oracle final-trick CE"),
         ),
         smooth=smooth,
-        title="Tree and search volume",
-        ylabel="count",
+        title="Belief auxiliary losses",
+        ylabel="normalized loss",
+        omit_zero=True,
     )
     _lines(
         axes[1, 2],
@@ -158,20 +158,6 @@ def render_dashboard(
         iteration,
         rows,
         (
-            ("loss_suit", "actor opponent-suit BCE"),
-            ("loss_trick", "actor final-trick CE"),
-            ("loss_oracle_trick", "oracle final-trick CE"),
-        ),
-        smooth=smooth,
-        title="Belief auxiliary losses",
-        ylabel="normalized loss",
-        omit_zero=True,
-    )
-    _lines(
-        axes[3, 1],
-        iteration,
-        rows,
-        (
             ("suit_accuracy_10c_0", "0 cards played"),
             ("suit_accuracy_10c_4", "4 cards played"),
             ("suit_accuracy_10c_8", "8 cards played"),
@@ -181,9 +167,9 @@ def render_dashboard(
         ylabel="bit accuracy",
         omit_zero=True,
     )
-    axes[3, 1].set_ylim(0.0, 1.0)
+    axes[3, 0].set_ylim(0.0, 1.0)
     _lines(
-        axes[3, 2],
+        axes[3, 1],
         iteration,
         rows,
         (
@@ -197,7 +183,8 @@ def render_dashboard(
         ylabel="seat accuracy",
         omit_zero=True,
     )
-    axes[3, 2].set_ylim(0.0, 1.0)
+    axes[3, 1].set_ylim(0.0, 1.0)
+    _evaluation_gap(axes[3, 2], evaluation_points)
 
     for ax in axes.flat:
         ax.set_xlabel("Iteration")
@@ -444,6 +431,72 @@ def _checkpoint_evaluation(
     else:
         right_ax.set_yticks([])
         right_ax.spines["right"].set_visible(False)
+    if handles:
+        ax.legend(handles=handles, fontsize=8, loc="best")
+
+
+def _evaluation_gap(
+    ax,
+    points: list[dict[str, float | str]],
+) -> None:
+    """Plot exact argmax-minus-sample reward and bid-accuracy differences."""
+
+    by_key = {
+        (str(point["mode"]), int(float(point["iteration"]))): point
+        for point in points
+    }
+    iterations = sorted(
+        iteration
+        for mode, iteration in by_key
+        if mode == "sample" and ("argmax", iteration) in by_key
+    )
+    right_ax = ax.twinx()
+    ax.set_title("Evaluation mode gap · argmax − sample")
+    if not iterations:
+        right_ax.set_yticks([])
+        right_ax.spines["right"].set_visible(False)
+        _no_data(ax)
+        return
+    reward_gap = np.asarray(
+        [
+            float(by_key[("argmax", iteration)]["reward"])
+            - float(by_key[("sample", iteration)]["reward"])
+            for iteration in iterations
+        ]
+    )
+    bid_gap = np.asarray(
+        [
+            float(by_key[("argmax", iteration)]["bid_hit"])
+            - float(by_key[("sample", iteration)]["bid_hit"])
+            for iteration in iterations
+        ]
+    )
+    x = np.asarray(iterations, dtype=np.float64)
+    handles = []
+    reward_valid = np.isfinite(reward_gap)
+    if reward_valid.any():
+        (line,) = ax.plot(
+            x[reward_valid],
+            reward_gap[reward_valid],
+            marker="o",
+            color="C0",
+            label="relative reward gap",
+        )
+        handles.append(line)
+    bid_valid = np.isfinite(bid_gap)
+    if bid_valid.any():
+        (line,) = right_ax.plot(
+            x[bid_valid],
+            bid_gap[bid_valid],
+            marker="s",
+            color="C1",
+            label="bid accuracy gap",
+        )
+        handles.append(line)
+    ax.axhline(0.0, color="#777777", linewidth=0.8, alpha=0.45)
+    ax.set_ylabel("reward difference")
+    right_ax.set_ylabel("bid-accuracy difference")
+    right_ax.grid(False)
     if handles:
         ax.legend(handles=handles, fontsize=8, loc="best")
 

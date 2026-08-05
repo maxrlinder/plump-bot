@@ -975,9 +975,10 @@ larger ceiling raised memory use without a repeatable throughput gain.
 
 The run writes dashboard metrics every five updates and checkpoints and
 evaluates every 100 updates, approximately every 31 minutes at the measured
-18.7 seconds per update. Every inline evaluation runs both the sampled policy
-and deterministic argmax on the same deal bank, yielding reward and bid
-accuracy for each. Sampled reward alone controls `best` and the four-win
+18.7 seconds per update. Every automatic evaluation runs both the sampled
+policy and deterministic argmax on the same deal bank in a background process,
+yielding reward and bid accuracy for each while updates continue. Sampled
+reward alone controls `best` and the four-win
 heuristic-to-history gate. These intervals affect observability and recovery,
 not the estimator.
 

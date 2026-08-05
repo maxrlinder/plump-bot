@@ -61,10 +61,11 @@ optimizer steps, trainer/framework RNG states, collector adaptive batching and
 seat cursors, rule fingerprint, and relocatable league references.
 New runs also save iteration zero so the untrained baseline can be evaluated
 and a run interrupted before its first interval can resume exactly. If
-evaluation is enabled, training evaluates this checkpoint before update one,
-caches both sampled and argmax results below `evaluations/iter_000000/`, and
-uses sampled reward to record the initial best model without counting it
-toward an opponent-curriculum gate.
+evaluation is enabled, training queues both sampled and argmax evaluations of
+this checkpoint before update one, then starts update one without waiting. The
+background job caches both results below `evaluations/iter_000000/`; sampled
+reward records the initial best model without counting toward an
+opponent-curriculum gate.
 
 PPO checkpoints additionally retain every actor in the actor pool, the oracle
 or observer critic and its optimizer, adaptive bid/play entropy temperatures
@@ -100,9 +101,11 @@ legal action without penalizing retained entropy. `sample` draws reproducibly
 from the learned legal-action distribution. `both` stores and dashboards the
 two protocols separately.
 
-The training loop itself always evaluates both modes at every configured
-evaluation step, independent of the sidecar command. It records reward and bid
-accuracy for each (four dashboard observations). Sampled reward is the durable
+The training loop itself always queues both modes at every configured
+evaluation step, independent of the sidecar command. A serialized background
+process evaluates the immutable checkpoint while training continues and
+records reward and bid accuracy for each (four dashboard observations).
+Completed reports are polled between updates. Sampled reward is the durable
 legacy alias and is the only score used for `best.pt` and the
 heuristic-to-history win streak.
 

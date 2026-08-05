@@ -768,6 +768,9 @@ class SeqTrainer:
         self.iteration = 0
         self.opponent_phase = train_config.rollout.initial_opponent
         self.heuristic_eval_win_streak = 0
+        # -1 lets a fresh run consume iteration zero as a best-model baseline
+        # without counting it toward the heuristic curriculum gate.
+        self.last_heuristic_eval_iteration = -1
         # Optimizer steps actually kept (rolled-back steps do not count), for
         # the LR warmup ramp. Persisted in checkpoints.
         self.optimizer_steps = 0
@@ -2386,6 +2389,9 @@ class SeqTrainer:
             "opponent_curriculum_state": {
                 "phase": self.opponent_phase,
                 "heuristic_eval_win_streak": self.heuristic_eval_win_streak,
+                "last_heuristic_eval_iteration": (
+                    self.last_heuristic_eval_iteration
+                ),
             },
         }
         if self.train.policy_objective == "ppo" or len(self.models) > 1:
@@ -2548,9 +2554,12 @@ class SeqTrainer:
             phase = curriculum.get("phase")
             if phase in ("heuristic", "historical"):
                 self.opponent_phase = phase
-                self.heuristic_eval_win_streak = int(
-                    curriculum.get("heuristic_eval_win_streak", 0)
-                )
+            self.heuristic_eval_win_streak = int(
+                curriculum.get("heuristic_eval_win_streak", 0)
+            )
+            self.last_heuristic_eval_iteration = int(
+                curriculum.get("last_heuristic_eval_iteration", 0)
+            )
         else:
             self.opponent_phase = self.train.rollout.initial_opponent
             self.heuristic_eval_win_streak = 0
