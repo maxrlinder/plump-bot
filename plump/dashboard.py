@@ -677,16 +677,18 @@ def _trust_region(
         caps = _current_kl_caps(metrics_path)
         if caps is not None:
             mean_cap, p99_cap = caps
-            handles.extend(
-                (
-                    ax.axhline(
-                        mean_cap,
-                        linewidth=1.0,
-                        linestyle=":",
-                        color="C0",
-                        alpha=0.8,
-                        label=f"current mean cap ({mean_cap:g})",
-                    ),
+            handles.append(
+                ax.axhline(
+                    mean_cap,
+                    linewidth=1.0,
+                    linestyle=":",
+                    color="C0",
+                    alpha=0.8,
+                    label=f"current mean cap ({mean_cap:g})",
+                )
+            )
+            if p99_cap is not None:
+                handles.append(
                     ax.axhline(
                         p99_cap,
                         linewidth=1.0,
@@ -694,9 +696,8 @@ def _trust_region(
                         color="C1",
                         alpha=0.8,
                         label=f"current p99 cap ({p99_cap:g})",
-                    ),
+                    )
                 )
-            )
         # Nominal proposals can be orders of magnitude above accepted KL, and
         # even accepted mean/p99/max differ materially in scale. Keep this
         # panel logarithmic with or without proposal telemetry.
@@ -823,7 +824,7 @@ def _value_and_critic_learning(
     )
 
 
-def _current_kl_caps(metrics_path: Path) -> tuple[float, float] | None:
+def _current_kl_caps(metrics_path: Path) -> tuple[float, float | None] | None:
     """Read current run caps for dashboard reference lines, if available."""
 
     config_path = metrics_path.parent / "config.toml"
@@ -836,9 +837,9 @@ def _current_kl_caps(metrics_path: Path) -> tuple[float, float] | None:
         p99_cap = float(training["policy_kl_p99_cap"])
     except (KeyError, OSError, TypeError, ValueError, tomllib.TOMLDecodeError):
         return None
-    if mean_cap <= 0 or p99_cap <= 0:
+    if mean_cap <= 0 or p99_cap < 0:
         return None
-    return mean_cap, p99_cap
+    return mean_cap, p99_cap if p99_cap > 0 else None
 
 
 def _dual_lines(

@@ -876,9 +876,11 @@ class SeqTrainingConfig:
     neurd_regret_coef: float = 1.0
     neurd_kl_coef: float = 1.0
     policy_kl_cap: float = 0.01
-    # The mean guard can hide a small tail of badly moved states. The proposed
-    # step must satisfy both caps; max KL is reported but deliberately not a
-    # hard guard because one nearly-degenerate row is too noisy.
+    # The mean guard can hide a small tail of badly moved states. When this is
+    # positive, the proposed step must satisfy both caps. Zero disables the
+    # p99 acceptance guard while p95/p99/max remain reporting diagnostics.
+    # Max KL is deliberately never a hard guard because one nearly-degenerate
+    # row is too noisy.
     policy_kl_p99_cap: float = 0.05
     # Clamp on A(a) = Q(a) - V. Relative rewards reach ~+/-20 at five players
     # and the value baseline is untrained early, so one outlier row could
@@ -1081,8 +1083,12 @@ class SeqTrainingConfig:
             raise ValueError("precision must be 'fp32', 'fp16', or 'bf16'.")
         if self.kv_dtype not in ("fp32", "fp16", "bf16"):
             raise ValueError("kv_dtype must be 'fp32', 'fp16', or 'bf16'.")
-        if self.policy_kl_cap <= 0 or self.policy_kl_p99_cap <= 0:
-            raise ValueError("Policy KL caps must be > 0.")
+        if self.policy_kl_cap <= 0:
+            raise ValueError("policy_kl_cap must be > 0.")
+        if self.policy_kl_p99_cap < 0:
+            raise ValueError(
+                "policy_kl_p99_cap must be >= 0 (zero disables the guard)."
+            )
         if self.neurd_advantage_clip < 0 or self.sampled_mirror_advantage_clip < 0:
             raise ValueError("Advantage clips must be >= 0.")
         if (

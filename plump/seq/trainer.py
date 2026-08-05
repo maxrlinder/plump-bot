@@ -893,7 +893,11 @@ class SeqTrainer:
                     # exact final diagnostics.
                     reject_p99_above=(
                         self.train.policy_kl_p99_cap
-                        if attempt > 0 and attempt + 1 < attempts
+                        if (
+                            self.train.policy_kl_p99_cap > 0
+                            and attempt > 0
+                            and attempt + 1 < attempts
+                        )
                         else None
                     ),
                 )
@@ -906,7 +910,8 @@ class SeqTrainer:
                         policy_kl > self.train.policy_kl_cap
                     )
                     stats.proposed_p99_exceeded = (
-                        kl_p99 > self.train.policy_kl_p99_cap
+                        self.train.policy_kl_p99_cap > 0
+                        and kl_p99 > self.train.policy_kl_p99_cap
                     )
                 stats.policy_kl = policy_kl
                 stats.policy_kl_p95 = kl_p95
@@ -914,7 +919,10 @@ class SeqTrainer:
                 stats.policy_kl_max = kl_max
                 if stats.policy_rows == 0 or (
                     policy_kl <= self.train.policy_kl_cap
-                    and kl_p99 <= self.train.policy_kl_p99_cap
+                    and (
+                        self.train.policy_kl_p99_cap == 0
+                        or kl_p99 <= self.train.policy_kl_p99_cap
+                    )
                 ):
                     stats.backtracks += attempt
                     stats.step_scale = min(stats.step_scale, scale)
@@ -1050,13 +1058,17 @@ class SeqTrainer:
                     stats.proposed_policy_kl_max = kl_max
                     stats.proposed_mean_exceeded = policy_kl > self.train.policy_kl_cap
                     stats.proposed_p99_exceeded = (
-                        kl_p99 > self.train.policy_kl_p99_cap
+                        self.train.policy_kl_p99_cap > 0
+                        and kl_p99 > self.train.policy_kl_p99_cap
                     )
                 stats.policy_kl = policy_kl
                 stats.policy_kl_p95 = kl_p95
                 stats.policy_kl_p99 = kl_p99
                 stats.policy_kl_max = kl_max
-                if policy_kl <= self.train.policy_kl_cap and kl_p99 <= self.train.policy_kl_p99_cap:
+                if policy_kl <= self.train.policy_kl_cap and (
+                    self.train.policy_kl_p99_cap == 0
+                    or kl_p99 <= self.train.policy_kl_p99_cap
+                ):
                     stats.backtracks += attempt
                     stats.step_scale = min(stats.step_scale, scale)
                     self.optimizer_steps += 1

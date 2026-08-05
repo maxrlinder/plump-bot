@@ -29,9 +29,10 @@ rollback markers, and cache-cap events remain at their exact iterations.
 The trust-region panel distinguishes the exact nominal Adam proposal from the
 accepted post-backtracking update. The dashed `proposed mean KL` series is
 measured before any reduction; accepted mean, weighted p99, and max retain
-their usual meanings. The KL axis is always logarithmic, and the current run's
-mean and p99 caps appear as dotted reference lines. Full rollbacks retain red
-crosses; ordinary successful backtracks are already represented by the
+their usual meanings. The KL axis is always logarithmic. The current mean cap
+appears as a dotted reference line, as does the p99 cap when that guard is
+enabled. Full rollbacks retain red crosses; ordinary successful backtracks are
+already represented by the
 accepted and proposed KL series and do not add markers. Runs created before
 this telemetry simply begin the dashed series after their next resumed update.
 

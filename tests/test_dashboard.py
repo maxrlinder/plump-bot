@@ -9,12 +9,23 @@ import numpy as np
 
 from plump.dashboard import (
     DEFAULT_SMOOTH_WINDOW,
+    _current_kl_caps,
     _duration,
     _evaluation_points,
     _has_signal,
     _smooth,
     render_dashboard,
 )
+
+
+def test_dashboard_omits_disabled_p99_cap_but_keeps_mean_cap(tmp_path):
+    metrics = tmp_path / "metrics.csv"
+    metrics.touch()
+    (tmp_path / "config.toml").write_text(
+        "[training]\npolicy_kl_cap = 0.004\npolicy_kl_p99_cap = 0\n"
+    )
+
+    assert _current_kl_caps(metrics) == (0.004, None)
 
 
 def test_dashboard_renders_sparse_partial_and_resumed_rows(tmp_path):

@@ -559,9 +559,10 @@ D_{\mathrm{KL}}
 \pi_{\text{new}}(\cdot\mid h)\right).
 $$
 
-The NeuRD preset requires both the objective-weighted mean KL to be
-at most 0.01 and the weighted p99 to be at most 0.05. These numbers are
-configuration values, not mathematical constants.
+The mean KL acceptance guard is always active. A positive
+`policy_kl_p99_cap` also constrains weighted p99; zero disables that tail
+constraint while retaining p95, p99, and max diagnostics. The configured
+thresholds are engineering choices, not mathematical constants.
 
 If either guard fails, the exact pre-update model and Adam state are restored,
 and the same proposal is retried with half the policy-sensitive learning rate.
@@ -679,7 +680,8 @@ The chain of reasoning is:
    reward derivative
    $\sum_h d^\pi(h)c(h)\mathbb E_{a\sim\pi}[A(h,a)^2]\ge0$.
 7. Repeated recollection updates the $Q$ estimates after the policy changes.
-8. KL backtracking keeps each accepted neural policy change local.
+8. Mean-KL backtracking keeps each accepted neural policy change local; an
+   optional p99 guard can also constrain the tail of decision-state changes.
 
 Thus action sampling is not noise with no relationship to the objective. It is
 a Monte Carlo method for estimating the direction in which expected terminal
@@ -719,7 +721,8 @@ Under the current exact estimator settings:
   expectation;
 - the expected independent-logit NeuRD direction is a local reward-improvement
   direction against fixed opponents;
-- every accepted neural step is bounded by configured mean and p99 policy KL.
+- every accepted neural step is bounded by configured mean policy KL and,
+  when enabled, weighted p99 policy KL.
 
 The repository has statistical and deterministic tests for inclusion
 probabilities, stratified backups, represented reach, full-action advantage
@@ -783,7 +786,7 @@ repeat for each training update:
     backpropagate through the shared model
     let Adam propose an update
 
-    if weighted mean and p99 KL(pi_old || pi_new) pass:
+    if mean KL(pi_old || pi_new) and any enabled p99 guard pass:
         accept
     else:
         restore model and optimizer; retry with a smaller core step
@@ -938,8 +941,8 @@ $$
 Separate positive temperatures for bids and plays add $\alpha\bar H$ to the
 maximized objective. In adaptive mode, each temperature increases below its
 configured target and decreases above it. Forced actions are omitted from this
-constraint. PPO clipping is supplemented by exact full-distribution masked KL
-mean and p99 acceptance guards.
+constraint. PPO clipping is supplemented by an exact full-distribution masked
+mean-KL acceptance guard and an optional weighted-p99 guard.
 
 ### Multiple actor weights and precision
 

@@ -42,6 +42,8 @@ def ppo_config(
     bucket_width=0,
     suit_coef=0.0,
     trick_coef=0.0,
+    policy_kl_cap=1.0,
+    policy_kl_p99_cap=1.0,
 ):
     return SeqTrainingConfig(
         schedule_cells=cells
@@ -59,13 +61,42 @@ def ppo_config(
         ppo_sequence_bucket_width=bucket_width,
         ppo_critic_epochs=critic_epochs,
         microbatch_positions=512,
-        policy_kl_cap=1.0,
-        policy_kl_p99_cap=1.0,
+        policy_kl_cap=policy_kl_cap,
+        policy_kl_p99_cap=policy_kl_p99_cap,
         precision=precision,
         kv_dtype=kv_dtype,
         suit_coef=suit_coef,
         trick_coef=trick_coef,
     )
+
+
+def test_ppo_zero_p99_cap_disables_only_tail_acceptance_guard(monkeypatch):
+    trainer = SeqTrainer(
+        SeqPlumpModel(MODEL),
+        ppo_config(policy_kl_cap=0.6, policy_kl_p99_cap=0.0),
+        device="cpu",
+    )
+    trees, _ = trainer.collect()
+    monkeypatch.setattr(
+        trainer,
+        "_evaluate_ppo_kl",
+        lambda _groups: (0.5, 2.0, 10.0, 20.0),
+    )
+
+    stats = trainer.update(trees)
+
+    assert not stats.rolled_back
+    assert stats.backtracks == 0
+    assert stats.policy_kl == pytest.approx(0.5)
+    assert stats.policy_kl_p99 == pytest.approx(10.0)
+    assert stats.policy_kl_max == pytest.approx(20.0)
+    assert not stats.proposed_mean_exceeded
+    assert not stats.proposed_p99_exceeded
+
+
+def test_negative_p99_cap_is_rejected():
+    with pytest.raises(ValueError, match="policy_kl_p99_cap"):
+        ppo_config(policy_kl_p99_cap=-1.0).validate()
 
 
 def test_ppo_ratio_is_one_before_update_and_gradient_follows_advantage():

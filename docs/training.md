@@ -39,10 +39,11 @@ Every branch child carries its represented old-policy reach. Value, belief,
 and descendant policy losses are weighted by that reach. Cache blocking
 changes estimator variance, not the expected objective.
 
-After Adam proposes an update, KL is measured on every policy row. Both
-weighted mean and weighted p99 caps must pass; the NeuRD preset uses `0.01`
-and `0.05`, respectively. Failed proposals restore the exact model and
-optimizer state and retry at a geometrically smaller learning rate.
+After Adam proposes an update, KL is measured on every policy row. The
+weighted mean cap must pass. A positive weighted-p99 cap adds a second tail
+guard; setting `policy_kl_p99_cap = 0` disables only that acceptance guard and
+retains p95, p99, and max diagnostics. Failed proposals restore the exact
+model and optimizer state and retry at a geometrically smaller learning rate.
 
 The first, nominal Adam proposal is always evaluated over the complete policy
 row set before any reduction. Metrics retain its weighted mean, p95, p99, and
@@ -196,8 +197,9 @@ Entropy is calculated over legal actions and normalized by `log(legal_count)`.
 Forced moves are excluded. Bid and play temperatures are separate. Adaptive
 mode increases a positive temperature when measured normalized entropy falls
 below its configured target and decreases it above target. Full masked
-`KL(pi_old || pi_new)` mean and p99 guards still backtrack or reject an Adam
-proposal independently of PPO ratio clipping. `ppo_behavior_replay_kl` checks
+`KL(pi_old || pi_new)` guards still backtrack or reject an Adam proposal
+independently of PPO ratio clipping. The mean guard is mandatory and the p99
+guard is optional. `ppo_behavior_replay_kl` checks
 the pre-update numerical difference between reduced-precision cached
 collection and full-sequence update replay; it should remain near zero.
 
