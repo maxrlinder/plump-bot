@@ -227,6 +227,17 @@ GPU compute lanes. The production collector therefore remains single-process;
 future rollout work should coalesce ready environments across shapes into
 larger forwards inside that process rather than replicate the model.
 
+Historical rollout waves contain two resident actors: the current model and a
+sampled checkpoint. The collector submits both forwards before copying either
+result to the CPU, because an early `.cpu()` otherwise drains the MPS command
+queue between the two models. Readout heads are evaluated only for the cache
+rows whose seat acts next, and only the bid or play projection required by that
+wave is run. The transformer still advances every observer cache row, so this
+changes neither histories nor action probabilities. At checkpoint 4000, the
+768-game production benchmark measured 19.3 seconds collection and 26.9
+seconds collection-plus-update, down from approximately 25 and 32 seconds,
+with a 1.60 GB rollout peak.
+
 PPO update groups can be coalesced with `ppo_sequence_bucket_width`. Each
 actor/oracle sequence is tail-padded to the next bucket boundary (capped at its
 model's positional capacity), then shapes with the same padded length are

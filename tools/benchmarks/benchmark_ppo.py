@@ -41,6 +41,13 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--warmup", type=int, default=1)
     result.add_argument("--repeats", type=int, default=3)
     result.add_argument("--checkpoint", type=Path)
+    result.add_argument(
+        "--set",
+        dest="overrides",
+        action="append",
+        default=[],
+        metavar="SECTION.KEY=VALUE",
+    )
     return result
 
 
@@ -61,7 +68,10 @@ def synchronize(device: torch.device) -> None:
 
 def main() -> int:
     args = parser().parse_args()
-    overrides = [f"training.deals_per_shape={args.games_per_shape}"]
+    overrides = [
+        f"training.deals_per_shape={args.games_per_shape}",
+        *args.overrides,
+    ]
     if args.precision:
         overrides.append(f'training.precision="{args.precision}"')
     if args.kv_dtype:
@@ -120,6 +130,8 @@ def main() -> int:
             "games_per_sec": games / max(finished - started, 1e-9),
             "policy_rows_per_sec": stats.policy_rows
             / max(finished - started, 1e-9),
+            "forward_rows": trainer.collector.stats.forward_rows,
+            "forward_sec": trainer.collector.stats.forward_sec,
             "rollout_peak_gb": rollout_peak / 1e9,
             "update_peak_gb": stats.peak_update_device_bytes / 1e9,
             "baseline_gb": baseline / 1e9,

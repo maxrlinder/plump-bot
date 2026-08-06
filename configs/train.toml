@@ -39,6 +39,7 @@ auxiliary_learning_rate = 0.000025
 lr_warmup_updates = 100
 epochs = 1
 microbatch_positions = 16384
+use_kv_cache = true
 precision = "fp32"
 policy_objective = "neurd"
 policy_coef = 1.0

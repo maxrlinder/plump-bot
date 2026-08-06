@@ -68,6 +68,7 @@ def test_run_creation_records_config_and_rejects_field_changes(tmp_path):
     assert resolved.training.rollout.opponent_mode == "heuristic_then_historical"
     assert resolved.training.rollout.opponent_fraction == 0.5
     assert resolved.training.rollout.opponent_packing == "concurrent"
+    assert resolved.training.use_kv_cache
     assert resolved.evaluation["training_action_mode"] == "sample"
     assert resolved.evaluation["opponent_switch_consecutive"] == 4
     run = RunDirectory("unit-run", root=tmp_path)
@@ -86,6 +87,11 @@ def test_run_creation_records_config_and_rejects_field_changes(tmp_path):
     assert config_diff(run.recorded_config(), changed.raw) == [
         "training.learning_rate: recorded=0.0002 requested=0.125"
     ]
+
+    cache_free = load_training_config(
+        overrides=["training.use_kv_cache=false"]
+    )
+    assert not cache_free.training.use_kv_cache
 
 
 def test_checkpoint_roundtrip_restores_rng_collector_and_relocates_league(

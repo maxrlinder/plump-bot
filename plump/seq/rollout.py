@@ -40,7 +40,7 @@ from .config import (
     SeqTrainingConfig,
 )
 from .kv import KVCache
-from .model import SeqPlumpModel
+from .model import SeqPlumpModel, SeqStepOutput
 from .policy import SeqLeague, SeqModelPolicy, masked_probabilities
 from .precision import autocast_context
 from .tokens import (
@@ -156,8 +156,7 @@ class _Pending:
 
     seat: int
     policy_id: str
-    bid_logits: np.ndarray
-    card_logits: np.ndarray
+    action_logits: np.ndarray
     value: float
 
 
@@ -1015,7 +1014,7 @@ class SeqRolloutCollector:
             if leaf.env.phase() != phase:
                 raise AssertionError("Wave leaves diverged in phase.")
             logits[index] = (
-                pending.bid_logits if phase == Phase.BIDDING else pending.card_logits
+                pending.action_logits
             )
             if phase == Phase.BIDDING:
                 legal = leaf.env.legal_bid_values()
@@ -1701,31 +1700,64 @@ class SeqRolloutCollector:
                     leaf.history[seat, :prefix_len] = rows
                 policy_id = leaf.slots[seat][0]
                 rows_by_policy.setdefault(policy_id, []).append((leaf, seat, rows))
+        optimized_readout = self.train.policy_objective == "ppo"
+        launched: list[
+            tuple[str, list[tuple[int, SeqLeaf, int]], SeqStepOutput]
+        ] = []
         for policy_id, entries in rows_by_policy.items():
             tokens = torch.from_numpy(
                 np.stack([tokens for _, _, tokens in entries])
+            ).to(self.device)
+            capture_list = [
+                (row, leaf, seat)
+                for row, (leaf, seat, _) in enumerate(entries)
+                if leaf.env.state.current_player == seat
+            ]
+            capture_indices = torch.from_numpy(
+                np.fromiter(
+                    (row for row, _, _ in capture_list),
+                    dtype=np.int64,
+                    count=len(capture_list),
+                )
             ).to(self.device)
             # Root rows were assigned densely in this same iteration order.
             with autocast_context(self.device, self.train.precision):
                 if self.use_cache:
                     output = models[policy_id].forward_prefill(
-                        tokens, self._caches[policy_id], None
+                        tokens,
+                        self._caches[policy_id],
+                        None,
+                        readout_indices=(
+                            capture_indices if optimized_readout else None
+                        ),
+                        phase="bid" if optimized_readout else None,
                     )
                 else:
-                    output = models[policy_id].forward_prefix(tokens)
-            self.stats.forward_rows += len(entries) * prefix_len
-            bid_logits = output.bid_logits.float().cpu().numpy()
-            card_logits = output.card_logits.float().cpu().numpy()
-            values = output.value.float().cpu().numpy()
-            for row, (leaf, seat, _) in enumerate(entries):
-                if leaf.env.state.current_player == seat:
-                    leaf.pending = _Pending(
-                        seat=seat,
-                        policy_id=policy_id,
-                        bid_logits=bid_logits[row],
-                        card_logits=card_logits[row],
-                        value=float(values[row]),
+                    output = models[policy_id].forward_prefix(
+                        tokens,
+                        readout_indices=(
+                            capture_indices if optimized_readout else None
+                        ),
+                        phase="bid" if optimized_readout else None,
                     )
+            self.stats.forward_rows += len(entries) * prefix_len
+            launched.append((policy_id, capture_list, output))
+
+        # Do not read a model back before the other policy has even been
+        # submitted.  On MPS each .cpu() drains the command queue; launching
+        # all resident policies first lets Metal keep useful work queued.
+        for policy_id, capture_list, output in launched:
+            packed = torch.cat(
+                (output.bid_logits, output.value.unsqueeze(-1)), dim=-1
+            ).float().cpu().numpy()
+            for readout_row, (cache_row, leaf, seat) in enumerate(capture_list):
+                source_row = readout_row if optimized_readout else cache_row
+                leaf.pending = _Pending(
+                    seat=seat,
+                    policy_id=policy_id,
+                    action_logits=packed[source_row, :-1],
+                    value=float(packed[source_row, -1]),
+                )
 
     @staticmethod
     def _next_play_slot(events: list[GameEvent]) -> tuple[int, int]:
@@ -1861,9 +1893,26 @@ class SeqRolloutCollector:
                 if self.use_cache
                 else {key: np.stack(rows) for key, rows in token_blocks.items()}
             )
+            optimized_readout = self.train.policy_objective == "ppo"
+            launched: list[
+                tuple[str, list[tuple[int, int, SeqLeaf]], SeqStepOutput]
+            ] = []
             for policy_id, block_array in batches.items():
                 row_count = block_array.shape[0]
                 tokens = torch.from_numpy(block_array).to(self.device)
+                capture_list = captures.get(policy_id, [])
+                indices = torch.from_numpy(
+                    np.fromiter(
+                        (row for row, _, _ in capture_list),
+                        dtype=np.int64,
+                        count=len(capture_list),
+                    )
+                ).to(self.device)
+                phase = (
+                    "bid"
+                    if appends[0][0].env.phase() == Phase.BIDDING
+                    else "play"
+                )
                 with autocast_context(self.device, self.train.precision):
                     if self.use_cache:
                         output = models[policy_id].forward_step(
@@ -1871,36 +1920,38 @@ class SeqRolloutCollector:
                             position + run_start,
                             self._caches[policy_id],
                             None,
+                            readout_indices=(indices if optimized_readout else None),
+                            phase=phase if optimized_readout else None,
                         )
                     else:
-                        output = models[policy_id].forward_prefix(tokens)
-                self._sync()
+                        output = models[policy_id].forward_prefix(
+                            tokens,
+                            readout_indices=(indices if optimized_readout else None),
+                            phase=phase if optimized_readout else None,
+                        )
                 self.stats.forward_rows += row_count * (
                     run_len if self.use_cache else position + run_start + 1
                 )
-                capture_list = captures.get(policy_id)
-                if capture_list:
-                    # via numpy: torch.tensor() on a Python list walks it
-                    # element by element, which is ~1.5x the cost of a numpy
-                    # buffer copy at wave-sized lists.
-                    indices = torch.from_numpy(
-                        np.fromiter(
-                            (row for row, _, _ in capture_list),
-                            dtype=np.int64,
-                            count=len(capture_list),
-                        )
-                    ).to(self.device)
-                    bid_logits = output.bid_logits[indices].float().cpu().numpy()
-                    card_logits = output.card_logits[indices].float().cpu().numpy()
-                    values = output.value[indices].float().cpu().numpy()
-                    for i, (_, seat, leaf) in enumerate(capture_list):
-                        leaf.pending = _Pending(
-                            seat=seat,
-                            policy_id=policy_id,
-                            bid_logits=bid_logits[i],
-                            card_logits=card_logits[i],
-                            value=float(values[i]),
-                        )
+                launched.append((policy_id, capture_list, output))
+
+            self._sync()
+            for policy_id, capture_list, output in launched:
+                action_logits = (
+                    output.bid_logits if phase == "bid" else output.card_logits
+                )
+                packed = torch.cat(
+                    (action_logits, output.value.unsqueeze(-1)), dim=-1
+                ).float().cpu().numpy()
+                for readout_row, (cache_row, seat, leaf) in enumerate(capture_list):
+                    source_row = (
+                        readout_row if optimized_readout else cache_row
+                    )
+                    leaf.pending = _Pending(
+                        seat=seat,
+                        policy_id=policy_id,
+                        action_logits=packed[source_row, :-1],
+                        value=float(packed[source_row, -1]),
+                    )
             self.stats.forward_sec += time.perf_counter() - t_build
             if run_start + run_len == event_count:
                 for leaf, _ in appends:

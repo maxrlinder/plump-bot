@@ -173,6 +173,51 @@ def test_cached_decode_matches_full_forward(kv_heads):
             )
 
 
+def test_rollout_readout_selects_rows_and_only_the_requested_action_head():
+    torch.manual_seed(0)
+    model = SeqPlumpModel(small_config()).eval()
+    tokens = token_batch(4, 3, seeds=[0, 1, 2])
+    prefix_len = 4
+    selected = torch.tensor([2, 0])
+
+    with torch.no_grad():
+        full_cache = model.new_cache(capacity=3)
+        full_slots = torch.tensor(full_cache.alloc(3), dtype=torch.long)
+        full = model.forward_prefill(
+            tokens[:, :prefix_len], full_cache, full_slots
+        )
+
+        selected_cache = model.new_cache(capacity=3)
+        selected_slots = torch.tensor(selected_cache.alloc(3), dtype=torch.long)
+        bid = model.forward_prefill(
+            tokens[:, :prefix_len],
+            selected_cache,
+            selected_slots,
+            readout_indices=selected,
+            phase="bid",
+        )
+        torch.testing.assert_close(bid.hidden, full.hidden[selected])
+        torch.testing.assert_close(bid.bid_logits, full.bid_logits[selected])
+        torch.testing.assert_close(bid.value, full.value[selected])
+        assert bid.card_logits.shape == (2, 0)
+
+        full_play = model.forward_step(
+            tokens[:, prefix_len], prefix_len, full_cache, full_slots
+        )
+        play = model.forward_step(
+            tokens[:, prefix_len],
+            prefix_len,
+            selected_cache,
+            selected_slots,
+            readout_indices=selected,
+            phase="play",
+        )
+        torch.testing.assert_close(play.hidden, full_play.hidden[selected])
+        torch.testing.assert_close(play.card_logits, full_play.card_logits[selected])
+        torch.testing.assert_close(play.value, full_play.value[selected])
+        assert play.bid_logits.shape == (2, 0)
+
+
 @pytest.mark.parametrize("kv_heads", [None, 2])
 @pytest.mark.parametrize("run", [2, 3, 6])
 def test_multi_token_append_matches_stepping_one_at_a_time(kv_heads, run):

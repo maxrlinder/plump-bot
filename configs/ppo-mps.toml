@@ -43,6 +43,7 @@ epochs = 1
 # positions held the measured update peak to ~11.1 GB with no throughput loss;
 # 32,768 positions used ~16.2 GB for the same ~54.5 s total update.
 microbatch_positions = 16384
+use_kv_cache = true
 precision = "bf16"
 policy_objective = "ppo"
 policy_coef = 1.0

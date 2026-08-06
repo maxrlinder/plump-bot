@@ -258,6 +258,7 @@ def resolve_training_config(raw: dict[str, Any]) -> ResolvedTraining:
         bid_hit_coef=float(training_raw["bid_hit_coef"]),
         trick_coef=float(training_raw["trick_coef"]),
         entropy_coef=float(training_raw["entropy_coef"]),
+        use_kv_cache=bool(training_raw.get("use_kv_cache", True)),
         precision=str(training_raw.get("precision", "fp32")),
         kv_dtype=str(rollout_raw["kv_dtype"]),
         snapshot_every=int(run_raw["checkpoint_every"]),

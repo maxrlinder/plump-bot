@@ -403,11 +403,28 @@ class SeqPlumpModel(nn.Module):
         )
         return x + self.pos_embedding(positions)
 
-    def _step_heads(self, hidden: torch.Tensor) -> SeqStepOutput:
+    def _step_heads(
+        self,
+        hidden: torch.Tensor,
+        *,
+        phase: str | None = None,
+    ) -> SeqStepOutput:
+        """Read the heads needed by one decode step.
+
+        Training and general inference keep the default and receive every
+        head.  Rollout waves know whether the next action is a bid or a play,
+        so they can skip the unused (and relatively wide) action projection.
+        Empty logits make an accidental read of the skipped head fail through
+        its shape instead of silently supplying plausible values.
+        """
+
+        if phase not in (None, "bid", "play"):
+            raise ValueError(f"Unknown policy phase {phase!r}.")
+        empty = hidden.new_empty((hidden.shape[0], 0))
         return SeqStepOutput(
             hidden=hidden,
-            bid_logits=self.bid_head(hidden),
-            card_logits=self._card_logits(hidden),
+            bid_logits=self.bid_head(hidden) if phase != "play" else empty,
+            card_logits=self._card_logits(hidden) if phase != "bid" else empty,
             value=self.value_head(hidden).squeeze(-1),
         )
 
@@ -479,6 +496,9 @@ class SeqPlumpModel(nn.Module):
         tokens: torch.Tensor,
         cache: KVCache,
         slots: torch.Tensor | None,
+        *,
+        readout_indices: torch.Tensor | None = None,
+        phase: str | None = None,
     ) -> SeqStepOutput:
         """Encode a fresh prefix [B, T, WIDTH] into empty cache slots."""
 
@@ -486,9 +506,17 @@ class SeqPlumpModel(nn.Module):
         for layer, block in enumerate(self.blocks):
             x = block.forward_cached(x, cache, layer, slots, start=0)
         hidden = self.final_norm(x[:, -1])
-        return self._step_heads(hidden)
+        if readout_indices is not None:
+            hidden = hidden[readout_indices]
+        return self._step_heads(hidden, phase=phase)
 
-    def forward_prefix(self, tokens: torch.Tensor) -> SeqStepOutput:
+    def forward_prefix(
+        self,
+        tokens: torch.Tensor,
+        *,
+        readout_indices: torch.Tensor | None = None,
+        phase: str | None = None,
+    ) -> SeqStepOutput:
         """Cache-free decode: re-encode [B, T, WIDTH] and read the last step.
 
         Heads run only on the final position so this is a like-for-like
@@ -499,7 +527,10 @@ class SeqPlumpModel(nn.Module):
         x = self.embed(tokens)
         for block in self.blocks:
             x = block.forward_full(x)
-        return self._step_heads(self.final_norm(x[:, -1]))
+        hidden = self.final_norm(x[:, -1])
+        if readout_indices is not None:
+            hidden = hidden[readout_indices]
+        return self._step_heads(hidden, phase=phase)
 
     def forward_step(
         self,
@@ -507,6 +538,9 @@ class SeqPlumpModel(nn.Module):
         position: int,
         cache: KVCache,
         slots: torch.Tensor | None,
+        *,
+        readout_indices: torch.Tensor | None = None,
+        phase: str | None = None,
     ) -> SeqStepOutput:
         """Append tokens at ``position`` and read the heads at the last one.
 
@@ -522,7 +556,9 @@ class SeqPlumpModel(nn.Module):
         for layer, block in enumerate(self.blocks):
             x = block.forward_cached(x, cache, layer, slots, start=position)
         hidden = self.final_norm(x[:, -1])
-        return self._step_heads(hidden)
+        if readout_indices is not None:
+            hidden = hidden[readout_indices]
+        return self._step_heads(hidden, phase=phase)
 
 
 class SeqPPOCritic(nn.Module):

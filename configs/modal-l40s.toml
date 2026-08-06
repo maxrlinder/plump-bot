@@ -36,6 +36,7 @@ epochs = 1
 # The L40S update phase runs after KV caches are released, so it can use a
 # larger activation microbatch independently of the rollout cache ceiling.
 microbatch_positions = 131072
+use_kv_cache = true
 policy_objective = "neurd"
 policy_coef = 1.0
 policy_kl_cap = 0.01
