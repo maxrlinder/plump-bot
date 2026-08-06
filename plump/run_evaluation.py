@@ -21,6 +21,14 @@ from plump.seq.policy import SeqModelPolicy
 
 EVALUATION_FORMAT_VERSION = 1
 _INTERVAL_CHECKPOINT = re.compile(r"iter_(\d+)\.pt")
+_SUMMARY_REPORT_KEYS = (
+    "macro_relative_reward",
+    "macro_bid_hit_rate",
+    "macro_raw_score",
+    "relative_reward_ci_low",
+    "relative_reward_ci_high",
+    "rounds",
+)
 
 
 @dataclass(frozen=True)
@@ -83,12 +91,54 @@ def load_evaluation(path: str | Path) -> dict[str, Any]:
     return json.loads(Path(path).read_text())
 
 
+def evaluation_summary_path(path: str | Path) -> Path:
+    return Path(path).with_suffix(".summary.json")
+
+
+def ensure_evaluation_summary(path: str | Path) -> dict[str, Any]:
+    """Read or create the compact protocol/report view used by monitors."""
+
+    path = Path(path)
+    summary_path = evaluation_summary_path(path)
+    try:
+        if summary_path.stat().st_mtime_ns >= path.stat().st_mtime_ns:
+            return load_evaluation(summary_path)
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        pass
+    payload = load_evaluation(path)
+    summary = _evaluation_summary(payload)
+    atomic_write_json(summary_path, summary)
+    return summary
+
+
+def _evaluation_summary(payload: dict[str, Any]) -> dict[str, Any]:
+    summary = {
+        key: payload[key]
+        for key in (
+            "format_version",
+            "run",
+            "iteration",
+            "checkpoint",
+            "opponent",
+            "protocol",
+            "evaluated_at",
+            "elapsed_sec",
+        )
+        if key in payload
+    }
+    report = payload.get("report", payload)
+    summary["report"] = {
+        key: report[key] for key in _SUMMARY_REPORT_KEYS if key in report
+    }
+    return summary
+
+
 def result_matches_protocol(
     path: str | Path,
     protocol: EvaluationProtocol,
 ) -> bool:
     try:
-        value = load_evaluation(path)
+        value = ensure_evaluation_summary(path)
     except (FileNotFoundError, json.JSONDecodeError, OSError):
         return False
     return (
@@ -147,6 +197,9 @@ def evaluate_checkpoint(
             elapsed_sec=time.perf_counter() - started,
         )
         atomic_write_json(output, payload)
+        atomic_write_json(
+            evaluation_summary_path(output), _evaluation_summary(payload)
+        )
         return payload, True
     finally:
         del policy

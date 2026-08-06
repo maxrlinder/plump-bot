@@ -198,6 +198,9 @@ def resolve_training_config(raw: dict[str, Any]) -> ResolvedTraining:
         ppo_self_play_seats=str(
             training_raw.get("ppo_self_play_seats", "all")
         ),
+        ppo_opponent_action_mode=str(
+            training_raw.get("ppo_opponent_action_mode", "sample")
+        ),
         ppo_sequence_bucket_width=int(
             training_raw.get("ppo_sequence_bucket_width", 0)
         ),
@@ -260,6 +263,10 @@ def resolve_training_config(raw: dict[str, Any]) -> ResolvedTraining:
         snapshot_every=int(run_raw["checkpoint_every"]),
         league_max_snapshots=int(training_raw["league_max_snapshots"]),
         league_min_iteration=int(training_raw["league_min_iteration"]),
+        league_pool_size=int(training_raw.get("league_pool_size", 1)),
+        league_recent_fraction=float(
+            training_raw.get("league_recent_fraction", 0.5)
+        ),
         eval_every=int(evaluation_raw["every"]),
         checkpoint_every=int(run_raw["checkpoint_every"]),
         seed=int(training_raw["seed"]),
@@ -271,14 +278,10 @@ def resolve_training_config(raw: dict[str, Any]) -> ResolvedTraining:
         raise ValueError(
             "evaluation.training_action_mode must be 'argmax' or 'sample'."
         )
-    if (
-        training.rollout.opponent_mode == "heuristic_then_historical"
-        and action_mode != "sample"
-    ):
-        raise ValueError(
-            "heuristic_then_historical requires "
-            "evaluation.training_action_mode='sample'."
-        )
+    for key in ("best_action_mode", "opponent_switch_action_mode"):
+        mode = str(evaluation_raw.get(key, "argmax"))
+        if mode not in ("argmax", "sample"):
+            raise ValueError(f"evaluation.{key} must be 'argmax' or 'sample'.")
     if (
         training.rollout.opponent_mode == "heuristic_then_historical"
         and int(evaluation_raw["every"]) <= 0

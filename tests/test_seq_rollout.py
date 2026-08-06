@@ -13,6 +13,7 @@ import pytest
 import torch
 
 from plump.rewards import compute_relative_rewards
+from plump.state import Phase
 from plump.seq.config import (
     NEXT_BID,
     SLOT_REL_PLAYER,
@@ -409,14 +410,17 @@ def options_collector(
     play_mode="all_legal",
     seed=0,
     model_config: SeqModelConfig = MODEL_CONFIG,
+    training_overrides=None,
 ):
     torch.manual_seed(seed)
     model = SeqPlumpModel(model_config).eval()
+    training_options = dict(training_overrides or {})
     train = SeqTrainingConfig(
         schedule_cells=tuple(cells),
         branch_rule=BranchRuleConfig(bid_top_k=4, play_mode=play_mode),
         branch_budget=BranchBudgetConfig(branch_rate=branch_rate),
         rollout=options,
+        **training_options,
     )
     return SeqRolloutCollector(model, train, device="cpu")
 
@@ -542,6 +546,43 @@ def test_opponent_fraction_apportions_the_whole_update_exactly():
     assert sum(cell.games for cell in cells) == 48
     assert sum(counts) == 24
     assert counts == [1] * 24
+
+
+def test_ppo_non_focal_neural_seat_uses_argmax_not_sample():
+    collector = options_collector(
+        cells=[GameScheduleCell(hand_size=3, num_players=3)],
+        options=RolloutOptions(),
+        training_overrides={
+            "policy_objective": "ppo",
+            "ppo_self_play_seats": "focal",
+            "ppo_opponent_action_mode": "argmax",
+        },
+    )
+    captured = []
+    collector._advance_leaf = lambda leaf, action, *args: captured.append(action)
+    leaf = SimpleNamespace(
+        env=SimpleNamespace(current_player=lambda: 1),
+        tree=SimpleNamespace(focal=0, arm="self"),
+    )
+    probabilities = np.zeros(collector.model_config.bid_count, dtype=np.float32)
+    probabilities[2] = 0.8
+    probabilities[5] = 0.2
+
+    collector._decide_and_step(
+        leaf,
+        Phase.BIDDING,
+        probabilities,
+        5,
+        [2, 5],
+        0,
+        [],
+        [],
+        {},
+        {},
+        set(),
+    )
+
+    assert captured[0].bid == 2
 
 
 def test_bid_split_matches_unsplit_tree():

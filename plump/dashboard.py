@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import csv
-import json
 import math
 import re
 import tomllib
@@ -16,6 +15,8 @@ matplotlib.use("Agg")
 
 import matplotlib.pyplot as plt
 import numpy as np
+
+from plump.run_evaluation import ensure_evaluation_summary
 
 Field = tuple[str, str]
 DEFAULT_SMOOTH_WINDOW = 50
@@ -298,7 +299,7 @@ def _evaluation_points(
         )
         for path in paths:
             try:
-                payload = json.loads(path.read_text())
+                payload = ensure_evaluation_summary(path)
                 report = payload.get("report", payload)
                 protocol = payload.get("protocol", {})
                 greedy = bool(
@@ -322,7 +323,7 @@ def _evaluation_points(
                         report.get("relative_reward_ci_high", math.nan)
                     ),
                 }
-            except (KeyError, TypeError, ValueError, json.JSONDecodeError, OSError):
+            except (KeyError, TypeError, ValueError, OSError):
                 continue
     return [points[key] for key in sorted(points)]
 

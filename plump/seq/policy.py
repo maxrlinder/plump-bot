@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import random
 from collections.abc import Collection
 from dataclasses import dataclass
@@ -279,11 +280,17 @@ class SeqLeagueSnapshot:
 
 
 class SeqLeague:
-    """Uniform draw over recent saved schema-v6 snapshots."""
+    """Uniform pools over eligible saved schema-v6 snapshots."""
 
-    def __init__(self, max_snapshots: int, min_iteration: int = 0):
+    def __init__(
+        self,
+        max_snapshots: int,
+        min_iteration: int = 0,
+        recent_fraction: float = 0.5,
+    ):
         self.max_snapshots = max_snapshots
         self.min_iteration = min_iteration
+        self.recent_fraction = recent_fraction
         self.snapshots: list[SeqLeagueSnapshot] = []
         self._policies: dict[str, SeqModelPolicy] = {}
 
@@ -306,7 +313,10 @@ class SeqLeague:
     ) -> list[SeqLeagueSnapshot]:
         if iteration is None:
             return list(self.snapshots)
-        lower = (iteration + 1) // 2
+        lower = max(
+            self.min_iteration,
+            math.ceil(iteration * self.recent_fraction),
+        )
         return [
             snapshot
             for snapshot in self.snapshots
@@ -331,7 +341,37 @@ class SeqLeague:
             self._policies[snapshot.snapshot_id] = SeqModelPolicy.from_checkpoint(
                 snapshot.path,
                 device=device,
-                greedy=False,
+                greedy=True,
                 name=snapshot.snapshot_id,
             )
         return snapshot.snapshot_id, self._policies[snapshot.snapshot_id]
+
+    def draw_pool(
+        self,
+        rng: random.Random,
+        count: int,
+        *,
+        iteration: int | None = None,
+        device: str | torch.device | None = None,
+    ) -> list[tuple[str, SeqModelPolicy]]:
+        """Uniformly choose and preload distinct opponents for one update."""
+
+        eligible = self.eligible_snapshots(iteration)
+        if not eligible:
+            raise LookupError("No historical snapshot is eligible.")
+        selected = rng.sample(eligible, k=min(count, len(eligible)))
+        pool: list[tuple[str, SeqModelPolicy]] = []
+        for snapshot in selected:
+            if snapshot.snapshot_id not in self._policies:
+                self._policies[snapshot.snapshot_id] = (
+                    SeqModelPolicy.from_checkpoint(
+                        snapshot.path,
+                        device=device,
+                        greedy=True,
+                        name=snapshot.snapshot_id,
+                    )
+                )
+            pool.append(
+                (snapshot.snapshot_id, self._policies[snapshot.snapshot_id])
+            )
+        return pool

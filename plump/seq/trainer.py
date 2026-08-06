@@ -763,7 +763,9 @@ class SeqTrainer:
                     lr=train_config.ppo_entropy_learning_rate,
                 )
         self.league = SeqLeague(
-            train_config.league_max_snapshots, train_config.league_min_iteration
+            train_config.league_max_snapshots,
+            train_config.league_min_iteration,
+            train_config.league_recent_fraction,
         )
         self.iteration = 0
         self.opponent_phase = train_config.rollout.initial_opponent

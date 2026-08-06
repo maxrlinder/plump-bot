@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import dataclasses
+import random
 
 import numpy as np
 import pytest
@@ -635,6 +636,37 @@ def test_league_uses_only_the_newest_half_of_training_history():
         100,
         101,
     ]
+
+
+def test_league_can_keep_all_history_since_a_fixed_iteration(monkeypatch):
+    league = SeqLeague(
+        max_snapshots=20,
+        min_iteration=35,
+        recent_fraction=0.0,
+    )
+    for iteration in (25, 35, 40, 50, 75, 100):
+        league.add(f"iter_{iteration}", f"/tmp/{iteration}.pt", iteration)
+    assert [snapshot.iteration for snapshot in league.eligible_snapshots(100)] == [
+        35,
+        40,
+        50,
+        75,
+        100,
+    ]
+
+    loaded = []
+
+    def fake_load(path, **kwargs):
+        loaded.append((path, kwargs["greedy"]))
+        return object()
+
+    monkeypatch.setattr(
+        SeqModelPolicy, "from_checkpoint", staticmethod(fake_load)
+    )
+    pool = league.draw_pool(random.Random(4), 5, iteration=100, device="cpu")
+    assert len({snapshot_id for snapshot_id, _ in pool}) == 5
+    assert len(loaded) == 5
+    assert all(greedy for _, greedy in loaded)
 
 
 def test_league_opponents_join_collection(tmp_path):

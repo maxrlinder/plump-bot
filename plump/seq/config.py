@@ -840,6 +840,9 @@ class SeqTrainingConfig:
     ppo_clip_ratio: float = 0.1
     ppo_trainable_policies: int = 1
     ppo_self_play_seats: Literal["focal", "all"] = "all"
+    # The focal stays an on-policy sample. This separately controls neural
+    # seats that do not contribute PPO rows (self-play and historical rivals).
+    ppo_opponent_action_mode: Literal["sample", "argmax"] = "sample"
     # Round actor/oracle sequence lengths up to this many positions and merge
     # compatible PPO shape groups. 0 keeps exact per-shape batches. Padding is
     # appended after every selected causal position and cannot affect logits.
@@ -999,6 +1002,12 @@ class SeqTrainingConfig:
     # League.
     league_max_snapshots: int = 8
     league_min_iteration: int = 0
+    # Distinct eligible opponents preloaded for each collect(). Historical
+    # batches are distributed round-robin across this uniformly sampled pool.
+    league_pool_size: int = 1
+    # 0 keeps every checkpoint since league_min_iteration; 0.5 retains the
+    # legacy recent-half eligibility window.
+    league_recent_fraction: float = 0.5
     snapshot_every: int = 200
 
     # Cadence and bookkeeping.
@@ -1056,6 +1065,10 @@ class SeqTrainingConfig:
             )
         if self.ppo_self_play_seats not in ("focal", "all"):
             raise ValueError("ppo_self_play_seats must be 'focal' or 'all'.")
+        if self.ppo_opponent_action_mode not in ("sample", "argmax"):
+            raise ValueError(
+                "ppo_opponent_action_mode must be 'sample' or 'argmax'."
+            )
         if self.ppo_sequence_bucket_width < 0:
             raise ValueError("ppo_sequence_bucket_width must be >= 0.")
         if self.ppo_critic_mode not in PPO_CRITIC_MODES:
@@ -1079,6 +1092,10 @@ class SeqTrainingConfig:
             raise ValueError("ppo_bid_entropy_target must be in [0, 1].")
         if not 0.0 <= self.ppo_play_entropy_target <= 1.0:
             raise ValueError("ppo_play_entropy_target must be in [0, 1].")
+        if self.league_pool_size < 1:
+            raise ValueError("league_pool_size must be >= 1.")
+        if not 0.0 <= self.league_recent_fraction <= 1.0:
+            raise ValueError("league_recent_fraction must be in [0, 1].")
         if self.precision not in ("fp32", "fp16", "bf16"):
             raise ValueError("precision must be 'fp32', 'fp16', or 'bf16'.")
         if self.kv_dtype not in ("fp32", "fp16", "bf16"):

@@ -5,13 +5,11 @@ from __future__ import annotations
 import argparse
 import csv
 import json
-import os
 import random
 import re
-import subprocess
+import shutil
 import sys
 import time
-from collections import deque
 from pathlib import Path
 from typing import Any
 
@@ -24,9 +22,10 @@ from plump.gui.app import run as run_gui
 from plump.run_evaluation import (
     EvaluationProtocol,
     discover_interval_checkpoints,
+    ensure_evaluation_summary,
     evaluate_checkpoint,
     evaluation_output,
-    load_evaluation,
+    result_matches_protocol,
 )
 from plump.run_config import (
     DEFAULT_CONFIG_PATH,
@@ -164,6 +163,14 @@ def build_parser() -> argparse.ArgumentParser:
     train.add_argument("--iterations", type=int)
     train.add_argument("--device")
     train.add_argument(
+        "--resume-checkpoint",
+        default="latest",
+        help=(
+            "checkpoint selector for an existing run (latest, best, or an "
+            "iteration); reporting artifacts newer than it are discarded"
+        ),
+    )
+    train.add_argument(
         "--from-checkpoint",
         type=Path,
         help="start a new run from a compatible schema-v6 checkpoint",
@@ -260,6 +267,20 @@ def build_parser() -> argparse.ArgumentParser:
     evaluate.add_argument("--poll-seconds", type=float, default=10.0)
     evaluate.set_defaults(handler=evaluate_command)
 
+    monitor = subparsers.add_parser(
+        "monitor",
+        help=(
+            "evaluate due checkpoints, apply argmax selection/gates, and "
+            "refresh dashboard.png"
+        ),
+    )
+    monitor.add_argument("run")
+    monitor.add_argument("--device")
+    monitor.add_argument("--deals", type=int)
+    monitor.add_argument("--batch-size", type=int)
+    monitor.add_argument("--force", action="store_true")
+    monitor.set_defaults(handler=monitor_command)
+
     analyze = subparsers.add_parser(
         "analyze",
         help="write run-scoped card-representation analyses",
@@ -304,111 +325,6 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
 
-class _BackgroundEvaluator:
-    """Serialize paired checkpoint evaluations without blocking updates."""
-
-    def __init__(self, run: RunDirectory, *, device: str) -> None:
-        self.run = run
-        self.device = device
-        self.pending: deque[int] = deque()
-        self.process: subprocess.Popen | None = None
-        self.active_iteration: int | None = None
-        self.log_path = run.path / "evaluation.log"
-
-    def enqueue(self, iteration: int) -> None:
-        if iteration == self.active_iteration or iteration in self.pending:
-            return
-        self.pending.append(iteration)
-        self._start_next()
-
-    def poll(self) -> list[tuple[int, int]]:
-        completed: list[tuple[int, int]] = []
-        while self.process is not None:
-            returncode = self.process.poll()
-            if returncode is None:
-                break
-            assert self.active_iteration is not None
-            completed.append((self.active_iteration, returncode))
-            self.process = None
-            self.active_iteration = None
-            self._start_next()
-        return completed
-
-    def finish(self) -> list[tuple[int, int]]:
-        completed: list[tuple[int, int]] = []
-        while self.process is not None or self.pending:
-            completed.extend(self.poll())
-            if self.process is not None:
-                time.sleep(0.1)
-        return completed
-
-    def terminate(self) -> None:
-        self.pending.clear()
-        if self.process is None:
-            return
-        if self.process.poll() is None:
-            self.process.terminate()
-            try:
-                self.process.wait(timeout=5.0)
-            except subprocess.TimeoutExpired:
-                self.process.kill()
-                self.process.wait()
-        self.process = None
-        self.active_iteration = None
-
-    def _start_next(self) -> None:
-        if self.process is not None or not self.pending:
-            return
-        iteration = self.pending.popleft()
-        command = (
-            sys.executable,
-            "-m",
-            "plump.cli",
-            "evaluate",
-            self.run.name,
-            "--checkpoint",
-            str(iteration),
-            "--action-mode",
-            "both",
-            "--device",
-            self.device,
-        )
-        environment = os.environ.copy()
-        environment["PLUMP_RUNS_DIR"] = str(self.run.root)
-        with self.log_path.open("a") as log:
-            self.process = subprocess.Popen(
-                command,
-                cwd=Path.cwd(),
-                env=environment,
-                stdout=log,
-                stderr=subprocess.STDOUT,
-            )
-        self.active_iteration = iteration
-
-
-def _report_background_evaluations(
-    run: RunDirectory,
-    completed: list[tuple[int, int]],
-) -> None:
-    for iteration, returncode in completed:
-        if returncode == 0:
-            _emit(run, f"Background paired evaluation {iteration} completed.")
-            try:
-                render_dashboard(
-                    run.metrics,
-                    run.dashboard,
-                    title=f"Plump schema-v6 · {run.name}",
-                )
-            except (FileNotFoundError, ValueError) as error:
-                _emit(run, f"Evaluation dashboard refresh deferred: {error}")
-        else:
-            _emit(
-                run,
-                f"Background paired evaluation {iteration} failed with "
-                f"exit code {returncode}; see evaluation.log.",
-            )
-
-
 def _restore_evaluation_state(run: RunDirectory, trainer: SeqTrainer) -> None:
     try:
         state = json.loads(run.evaluation_state.read_text())
@@ -417,32 +333,41 @@ def _restore_evaluation_state(run: RunDirectory, trainer: SeqTrainer) -> None:
             return
         if iteration >= trainer.last_heuristic_eval_iteration:
             trainer.last_heuristic_eval_iteration = iteration
-            trainer.heuristic_eval_win_streak = int(state["win_streak"])
-            trainer.opponent_phase = str(state["opponent_phase"])
+            if (
+                trainer.train.rollout.opponent_mode
+                == "heuristic_then_historical"
+            ):
+                trainer.heuristic_eval_win_streak = int(state["win_streak"])
+                trainer.opponent_phase = str(state["opponent_phase"])
+            else:
+                trainer.heuristic_eval_win_streak = 0
+                trainer.opponent_phase = (
+                    trainer.train.rollout.initial_opponent
+                )
     except (FileNotFoundError, KeyError, TypeError, ValueError, json.JSONDecodeError):
         return
 
 
-def _consume_completed_evaluations(
+def _apply_completed_evaluations(
     run: RunDirectory,
-    trainer: SeqTrainer,
     *,
+    opponent_mode: str,
     switch_reward: float,
     switch_consecutive: int,
-) -> bool:
-    """Apply completed paired reports in order; never waits for missing files."""
+    maximum_iteration: int,
+    best_action_mode: str = "argmax",
+    gate_action_mode: str = "argmax",
+) -> dict[str, Any]:
+    """Rebuild best/gate state from completed paired reports."""
 
-    switched = False
     candidates: list[int] = []
     for directory in run.evaluations.glob("iter_*"):
         match = re.fullmatch(r"iter_(\d+)", directory.name)
         if match is not None:
             candidates.append(int(match.group(1)))
+    paired: list[tuple[int, float, float, float, float, Path]] = []
     for iteration in sorted(candidates):
-        if (
-            iteration <= trainer.last_heuristic_eval_iteration
-            or iteration > trainer.iteration
-        ):
+        if iteration > maximum_iteration:
             continue
         sample_path = evaluation_output(
             run, iteration, "heuristic", greedy=False
@@ -453,8 +378,8 @@ def _consume_completed_evaluations(
         if not sample_path.is_file() or not argmax_path.is_file():
             continue
         try:
-            sample = load_evaluation(sample_path)["report"]
-            argmax = load_evaluation(argmax_path)["report"]
+            sample = ensure_evaluation_summary(sample_path)["report"]
+            argmax = ensure_evaluation_summary(argmax_path)["report"]
             sample_reward = float(sample["macro_relative_reward"])
             sample_bid = float(sample["macro_bid_hit_rate"])
             argmax_reward = float(argmax["macro_relative_reward"])
@@ -465,31 +390,89 @@ def _consume_completed_evaluations(
         checkpoint = run.interval_checkpoint(iteration)
         if not checkpoint.is_file():
             continue
-        if iteration > 0:
-            switched = trainer.record_heuristic_evaluation(
+        paired.append(
+            (
+                iteration,
                 sample_reward,
-                threshold=switch_reward,
-                consecutive=switch_consecutive,
-            ) or switched
-        trainer.last_heuristic_eval_iteration = iteration
-        best = run.best_metric()
-        if best is None or sample_reward > best:
-            run.promote_best(checkpoint, iteration, sample_reward)
-        atomic_write_json(
-            run.evaluation_state,
-            {
-                "last_heuristic_eval_iteration": iteration,
-                "win_streak": trainer.heuristic_eval_win_streak,
-                "opponent_phase": trainer.opponent_phase,
-            },
+                sample_bid,
+                argmax_reward,
+                argmax_bid,
+                checkpoint,
+            )
         )
-        _emit(
-            run,
-            f"Applied eval {iteration} | sample reward={sample_reward:.4f} "
-            f"bid_hit={sample_bid:.4f} | argmax reward={argmax_reward:.4f} "
-            f"bid_hit={argmax_bid:.4f} | anchor {trainer.opponent_phase}.",
+
+    reward_index = {"sample": 1, "argmax": 3}
+    if best_action_mode not in reward_index or gate_action_mode not in reward_index:
+        raise ValueError("best/gate action modes must be 'sample' or 'argmax'.")
+    phase = (
+        "heuristic"
+        if opponent_mode == "heuristic_then_historical"
+        else opponent_mode
+    )
+    streak = 0
+    for row in paired:
+        iteration = row[0]
+        gate_reward = row[reward_index[gate_action_mode]]
+        if iteration <= 0 or phase != "heuristic":
+            continue
+        streak = streak + 1 if gate_reward > switch_reward else 0
+        if streak >= switch_consecutive:
+            phase = "historical"
+
+    best_iteration: int | None = None
+    best_reward: float | None = None
+    if paired:
+        best_row = max(paired, key=lambda row: row[reward_index[best_action_mode]])
+        best_iteration = best_row[0]
+        best_reward = best_row[reward_index[best_action_mode]]
+        best_checkpoint = best_row[5]
+        best_manifest: dict[str, Any] = {}
+        try:
+            best_manifest = json.loads(
+                (run.checkpoints / "best.json").read_text()
+            )
+        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            pass
+        if (
+            best_manifest.get("action_mode") != best_action_mode
+            or best_manifest.get("opponent") != "heuristic"
+            or int(best_manifest.get("iteration", -1)) != best_iteration
+            or float(best_manifest.get("metric", float("-inf"))) != best_reward
+        ):
+            run.promote_best(
+                best_checkpoint,
+                best_iteration,
+                best_reward,
+                action_mode=best_action_mode,
+                opponent="heuristic",
+            )
+
+    state = {
+        "last_heuristic_eval_iteration": paired[-1][0] if paired else -1,
+        "win_streak": streak,
+        "opponent_phase": phase,
+        "selection_action_mode": best_action_mode,
+        "gate_action_mode": gate_action_mode,
+        "best_iteration": best_iteration,
+        "best_metric": best_reward,
+    }
+    try:
+        previous_state = json.loads(run.evaluation_state.read_text())
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        previous_state = None
+    state_changed = previous_state != state
+    if state_changed:
+        atomic_write_json(run.evaluation_state, state)
+    if paired and state_changed:
+        iteration, sample_reward, sample_bid, argmax_reward, argmax_bid, _ = paired[-1]
+        print(
+            f"Applied paired evals through {iteration} | "
+            f"sample reward={sample_reward:.4f} bid_hit={sample_bid:.4f} | "
+            f"argmax reward={argmax_reward:.4f} bid_hit={argmax_bid:.4f} | "
+            f"best={best_iteration} ({best_reward:.4f}) | anchor {phase}.",
+            flush=True,
         )
-    return switched
+    return state
 
 
 def train_command(args: argparse.Namespace) -> int:
@@ -505,6 +488,8 @@ def train_command(args: argparse.Namespace) -> int:
         raise ValueError("--from-checkpoint requires a new run name.")
     if not existed and args.reconfigure:
         raise ValueError("--reconfigure requires an existing run.")
+    if not existed and args.resume_checkpoint != "latest":
+        raise ValueError("--resume-checkpoint requires an existing run.")
     if args.reset_league and args.from_checkpoint is None:
         raise ValueError("--reset-league requires --from-checkpoint.")
     if args.prepare_only and existed:
@@ -553,12 +538,15 @@ def train_command(args: argparse.Namespace) -> int:
         )
         trainer.resolved_config = resolved.raw
         if existed:
-            checkpoint = run.resolve_checkpoint("latest")
+            checkpoint = run.resolve_checkpoint(args.resume_checkpoint)
             trainer.load_checkpoint(
                 checkpoint,
                 allow_training_config_mismatch=bool(reconfiguration_differences),
             )
-            discarded = _truncate_metrics_after(run.metrics, trainer.iteration)
+            discarded, stale_evaluations = _discard_reporting_after(
+                run, trainer.iteration
+            )
+            run.record_latest(checkpoint, trainer.iteration)
             _emit(
                 run,
                 f"Resumed {run.name} from {checkpoint.name} "
@@ -569,6 +557,12 @@ def train_command(args: argparse.Namespace) -> int:
                     run,
                     f"Discarded {discarded} metric rows newer than the "
                     "resumed checkpoint.",
+                )
+            if stale_evaluations:
+                _emit(
+                    run,
+                    f"Removed {stale_evaluations} stale evaluation directories "
+                    "newer than the resumed checkpoint.",
                 )
             if reconfiguration_differences:
                 stem = f"resume_{trainer.iteration:06d}_reconfigured"
@@ -648,131 +642,78 @@ def train_command(args: argparse.Namespace) -> int:
         )
 
         evaluation = resolved.evaluation
-        switch_reward = float(evaluation.get("opponent_switch_reward", 0.0))
         switch_consecutive = int(
             evaluation.get("opponent_switch_consecutive", 1)
         )
         target = int(resolved.run["iterations"])
         checkpoint_every = int(resolved.run["checkpoint_every"])
-        dashboard_every = int(resolved.run["dashboard_every"])
-        evaluation_every = int(evaluation["every"])
-        background_evaluator = _BackgroundEvaluator(run, device=device)
         _restore_evaluation_state(run, trainer)
-        _consume_completed_evaluations(
-            run,
-            trainer,
-            switch_reward=switch_reward,
-            switch_consecutive=switch_consecutive,
-        )
-
-        if trainer.iteration == 0 and evaluation_every > 0:
-            background_evaluator.enqueue(0)
-            _emit(run, "Queued background sample+argmax evaluation 0.")
-
-        try:
-            for iteration in range(trainer.iteration + 1, target + 1):
-                _report_background_evaluations(
-                    run, background_evaluator.poll()
-                )
-                opponent_switched = _consume_completed_evaluations(
-                    run,
-                    trainer,
-                    switch_reward=switch_reward,
-                    switch_consecutive=switch_consecutive,
-                )
-                trainer.iteration = iteration
-                started = time.perf_counter()
-                trees, summary = trainer.collect()
-                stats = trainer.update(trees)
-                collector = trainer.collector.stats
-
-                total = time.perf_counter() - started
-                row = _metric_row(
-                    trainer,
-                    summary,
-                    stats,
-                    collector,
-                    total,
-                    elapsed_before + total,
-                    {},
-                )
-                _append_metric(run.metrics, row)
-                elapsed_before += total
-
-                evaluation_due = (
-                    evaluation_every > 0 and iteration % evaluation_every == 0
-                )
-                checkpoint_due = (
-                    checkpoint_every > 0 and iteration % checkpoint_every == 0
-                )
-                if checkpoint_due or evaluation_due or iteration == target:
-                    checkpoint = run.interval_checkpoint(iteration)
-                    snapshot_id = f"iter_{iteration}"
-                    trainer.league.add(snapshot_id, str(checkpoint), iteration)
-                    try:
-                        trainer.save_checkpoint(checkpoint)
-                    except Exception:
-                        trainer.league.snapshots = [
-                            snap
-                            for snap in trainer.league.snapshots
-                            if snap.snapshot_id != snapshot_id
-                        ]
-                        raise
-                    run.record_latest(checkpoint, iteration)
-                    if evaluation_due:
-                        background_evaluator.enqueue(iteration)
-                        _emit(
-                            run,
-                            f"Queued background sample+argmax evaluation "
-                            f"{iteration}.",
-                        )
-
-                if dashboard_every > 0 and (
-                    iteration % dashboard_every == 0 or iteration == target
-                ):
-                    try:
-                        render_dashboard(
-                            run.metrics,
-                            run.dashboard,
-                            title=f"Plump schema-v6 · {run.name}",
-                        )
-                    except Exception as error:
-                        _emit(run, f"Dashboard refresh failed: {error}")
-
-                message = (
-                    f"iter {iteration:5d} | {total:6.1f}s "
-                    f"(collect {summary.collect_sec:.1f} "
-                    f"update {stats.update_sec:.1f}) "
-                    f"| leaves {summary.leaves:5d} positions {stats.positions:6d} "
-                    f"| bid F/N {summary.bid_hit_focal:.3f}/"
-                    f"{summary.bid_hit_non_focal:.3f} "
-                    f"| kl {stats.policy_kl:.5f} "
-                    f"| step {stats.step_scale:.3f}"
-                )
-                if stats.backtracks:
-                    message += f" ({stats.backtracks} backtracks)"
-                if stats.rolled_back:
-                    message += " ROLLBACK"
-                if trainer.opponent_phase == "heuristic":
-                    message += (
-                        f" | gate {trainer.heuristic_eval_win_streak}/"
-                        f"{switch_consecutive}"
-                    )
-                if opponent_switched:
-                    message += " | HEURISTIC GATE PASSED; SWITCHED TO HISTORY"
-                _emit(run, message)
-
-            _report_background_evaluations(
-                run, background_evaluator.finish()
+        for iteration in range(trainer.iteration + 1, target + 1):
+            previous_phase = trainer.opponent_phase
+            _restore_evaluation_state(run, trainer)
+            opponent_switched = (
+                previous_phase == "heuristic"
+                and trainer.opponent_phase == "historical"
             )
-            _consume_completed_evaluations(
-                run,
+            trainer.iteration = iteration
+            started = time.perf_counter()
+            trees, summary = trainer.collect()
+            stats = trainer.update(trees)
+            collector = trainer.collector.stats
+
+            total = time.perf_counter() - started
+            row = _metric_row(
                 trainer,
-                switch_reward=switch_reward,
-                switch_consecutive=switch_consecutive,
+                summary,
+                stats,
+                collector,
+                total,
+                elapsed_before + total,
+                {},
             )
-        finally:
-            background_evaluator.terminate()
+            _append_metric(run.metrics, row)
+            elapsed_before += total
+
+            checkpoint_due = (
+                checkpoint_every > 0 and iteration % checkpoint_every == 0
+            )
+            if checkpoint_due or iteration == target:
+                checkpoint = run.interval_checkpoint(iteration)
+                snapshot_id = f"iter_{iteration}"
+                trainer.league.add(snapshot_id, str(checkpoint), iteration)
+                try:
+                    trainer.save_checkpoint(checkpoint)
+                except Exception:
+                    trainer.league.snapshots = [
+                        snap
+                        for snap in trainer.league.snapshots
+                        if snap.snapshot_id != snapshot_id
+                    ]
+                    raise
+                run.record_latest(checkpoint, iteration)
+
+            message = (
+                f"iter {iteration:5d} | {total:6.1f}s "
+                f"(collect {summary.collect_sec:.1f} "
+                f"update {stats.update_sec:.1f}) "
+                f"| leaves {summary.leaves:5d} positions {stats.positions:6d} "
+                f"| bid F/N {summary.bid_hit_focal:.3f}/"
+                f"{summary.bid_hit_non_focal:.3f} "
+                f"| kl {stats.policy_kl:.5f} "
+                f"| step {stats.step_scale:.3f}"
+            )
+            if stats.backtracks:
+                message += f" ({stats.backtracks} backtracks)"
+            if stats.rolled_back:
+                message += " ROLLBACK"
+            if trainer.opponent_phase == "heuristic":
+                message += (
+                    f" | gate {trainer.heuristic_eval_win_streak}/"
+                    f"{switch_consecutive}"
+                )
+            if opponent_switched:
+                message += " | ARGMAX HEURISTIC GATE PASSED; SWITCHED TO HISTORY"
+            _emit(run, message)
 
         run.update_metadata(
             status="complete",
@@ -918,6 +859,148 @@ def evaluate_command(args: argparse.Namespace) -> int:
         if not args.watch:
             return 0
         time.sleep(args.poll_seconds)
+
+
+def monitor_command(args: argparse.Namespace) -> int:
+    """One restartable evaluation/dashboard pass for the shell watcher."""
+
+    run = RunDirectory(args.run)
+    resolved = resolve_training_config(run.recorded_config())
+    evaluation = resolved.evaluation
+    device = args.device or str(best_seq_device())
+    deals = int(evaluation["deals"] if args.deals is None else args.deals)
+    batch_size = int(
+        min(int(evaluation["batch_size"]), 64)
+        if args.batch_size is None
+        else args.batch_size
+    )
+    if deals < 1 or batch_size < 1:
+        raise ValueError("evaluation deals and batch size must be positive.")
+
+    maximum_iteration = _latest_manifest_iteration(run)
+    every = int(evaluation["every"])
+    checkpoints = []
+    if every > 0:
+        checkpoints = [
+            checkpoint
+            for checkpoint in discover_interval_checkpoints(run)
+            if (
+                (iteration := _interval_iteration(checkpoint))
+                <= maximum_iteration
+                and (iteration == 0 or iteration % every == 0)
+            )
+        ]
+
+    hand_sizes = tuple(
+        sorted({cell.hand_size for cell in resolved.training.schedule_cells})
+    )
+    protocols = tuple(
+        EvaluationProtocol(
+            opponent="heuristic",
+            player_counts=resolved.training.player_counts,
+            hand_sizes=hand_sizes,
+            deals_per_configuration=deals,
+            deal_seed=int(evaluation["seed"]),
+            action_seed=int(evaluation.get("action_seed", 17)),
+            bootstrap_samples=int(evaluation.get("bootstrap_samples", 2000)),
+            batch_size=batch_size,
+            greedy=greedy,
+        )
+        for greedy in (False, True)
+    )
+    pending = [
+        (checkpoint, protocol)
+        for checkpoint in checkpoints
+        for protocol in protocols
+        if args.force
+        or not result_matches_protocol(
+            evaluation_output(
+                run,
+                _interval_iteration(checkpoint),
+                protocol.opponent,
+                greedy=protocol.greedy,
+            ),
+            protocol,
+        )
+    ]
+    created_any = False
+    if pending:
+        bank = DealBank.generate(
+            player_counts=protocols[0].player_counts,
+            hand_sizes=protocols[0].hand_sizes,
+            deals_per_configuration=protocols[0].deals_per_configuration,
+            seed=protocols[0].deal_seed,
+        )
+        for checkpoint, protocol in pending:
+            payload, created = evaluate_checkpoint(
+                run,
+                checkpoint,
+                protocol=protocol,
+                deal_bank=bank,
+                device=device,
+                force=args.force,
+            )
+            if created:
+                created_any = True
+                report = payload["report"]
+                mode = "argmax" if protocol.greedy else "sample"
+                print(
+                    f"{checkpoint.name} [{mode}] evaluated | "
+                    f"reward={float(report['macro_relative_reward']):.4f} "
+                    f"bid_hit={float(report['macro_bid_hit_rate']):.4f}",
+                    flush=True,
+                )
+
+    _apply_completed_evaluations(
+        run,
+        opponent_mode=resolved.training.rollout.opponent_mode,
+        switch_reward=float(evaluation.get("opponent_switch_reward", 0.0)),
+        switch_consecutive=int(
+            evaluation.get("opponent_switch_consecutive", 1)
+        ),
+        maximum_iteration=maximum_iteration,
+        best_action_mode=str(evaluation.get("best_action_mode", "argmax")),
+        gate_action_mode=str(
+            evaluation.get("opponent_switch_action_mode", "argmax")
+        ),
+    )
+    last_metric_iteration = _last_metric_iteration(run.metrics)
+    monitor_state_path = run.evaluations / "monitor.json"
+    try:
+        monitor_state = json.loads(monitor_state_path.read_text())
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        monitor_state = {}
+    last_dashboard_iteration = int(
+        monitor_state.get("dashboard_iteration", -1)
+    )
+    dashboard_every = int(resolved.run.get("dashboard_every", 0))
+    dashboard_due = (
+        not run.dashboard.is_file()
+        or created_any
+        or (
+            dashboard_every > 0
+            and last_metric_iteration >= last_dashboard_iteration + dashboard_every
+        )
+    )
+    if dashboard_due:
+        rows = render_dashboard(
+            run.metrics,
+            run.dashboard,
+            title=f"Plump schema-v6 · {run.name}",
+        )
+        atomic_write_json(
+            monitor_state_path,
+            {
+                "dashboard_iteration": last_metric_iteration,
+                "latest_checkpoint_iteration": maximum_iteration,
+            },
+        )
+        print(
+            f"Wrote {run.dashboard} from {rows} rows through checkpoint "
+            f"{maximum_iteration}.",
+            flush=True,
+        )
+    return 0
 
 
 def analyze_command(args: argparse.Namespace) -> int:
@@ -1204,6 +1287,16 @@ def _recorded_elapsed(path: Path) -> float:
     return float(rows[-1].get("elapsed_sec") or 0.0)
 
 
+def _last_metric_iteration(path: Path) -> int:
+    if not path.is_file():
+        return -1
+    with path.open(newline="") as handle:
+        last = None
+        for last in csv.DictReader(handle):
+            pass
+    return -1 if last is None else int(float(last.get("iteration") or -1))
+
+
 def _truncate_metrics_after(path: Path, iteration: int) -> int:
     """Atomically discard reporting rows newer than a resumed checkpoint."""
 
@@ -1236,6 +1329,53 @@ def _truncate_metrics_after(path: Path, iteration: int) -> int:
         if temporary.exists():
             temporary.unlink()
     return discarded
+
+
+def _discard_reporting_after(
+    run: RunDirectory, iteration: int
+) -> tuple[int, int]:
+    """Drop stale metric/evaluation rows when resuming an older checkpoint."""
+
+    metric_rows = _truncate_metrics_after(run.metrics, iteration)
+    evaluation_directories = 0
+    for directory in run.evaluations.glob("iter_*"):
+        match = re.fullmatch(r"iter_(\d+)", directory.name)
+        if match is None or int(match.group(1)) <= iteration:
+            continue
+        shutil.rmtree(directory)
+        evaluation_directories += 1
+    # Rebuild this tiny derived state from the surviving evaluation rows. This
+    # also makes selection/gate method changes take effect on the next monitor
+    # pass rather than carrying forward stale sampled-reward semantics.
+    run.evaluation_state.unlink(missing_ok=True)
+    (run.evaluations / "monitor.json").unlink(missing_ok=True)
+    try:
+        best = json.loads((run.checkpoints / "best.json").read_text())
+        best_is_future = int(best.get("iteration", -1)) > iteration
+    except (FileNotFoundError, json.JSONDecodeError, OSError, ValueError):
+        best_is_future = False
+    if best_is_future:
+        (run.checkpoints / "best.json").unlink(missing_ok=True)
+        (run.checkpoints / "best.pt").unlink(missing_ok=True)
+    return metric_rows, evaluation_directories
+
+
+def _interval_iteration(checkpoint: Path) -> int:
+    match = re.fullmatch(r"iter_(\d+)\.pt", checkpoint.name)
+    if match is None:
+        raise ValueError(f"Not an interval checkpoint: {checkpoint}")
+    return int(match.group(1))
+
+
+def _latest_manifest_iteration(run: RunDirectory) -> int:
+    try:
+        return int(
+            json.loads((run.checkpoints / "latest.json").read_text())["iteration"]
+        )
+    except (FileNotFoundError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+        raise FileNotFoundError(
+            f"No valid latest checkpoint manifest in {run.checkpoints}"
+        ) from None
 
 
 def _file_signature(path: Path) -> tuple[int, int] | None:

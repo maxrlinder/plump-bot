@@ -41,7 +41,7 @@ from .config import (
 )
 from .kv import KVCache
 from .model import SeqPlumpModel
-from .policy import SeqLeague, masked_probabilities
+from .policy import SeqLeague, SeqModelPolicy, masked_probabilities
 from .precision import autocast_context
 from .tokens import (
     TOKEN_WIDTH,
@@ -348,6 +348,8 @@ class SeqRolloutCollector:
         # collect() calls so the walk continues rather than restarting.
         self._seat_cursor: dict[int, int] = {}
         self._policy_cursor = 0
+        self._historical_pool: list[tuple[str, SeqModelPolicy]] = []
+        self._historical_cursor = 0
         self._loop_row_cap = self._row_cap()
         self._split_plan: Optional[tuple[int, int]] = None
         self._split_done: set[int] = set()
@@ -405,6 +407,19 @@ class SeqRolloutCollector:
         trees: list[SeqTree] = []
         self._total_leaves = 0
         phase = opponent_phase or self.train.rollout.initial_opponent
+        self._historical_pool = []
+        self._historical_cursor = 0
+        if (
+            phase == "historical"
+            and league is not None
+            and league.has_snapshots(iteration)
+        ):
+            self._historical_pool = league.draw_pool(
+                rng,
+                self.train.league_pool_size,
+                iteration=iteration,
+                device=self.device,
+            )
         opponent_counts = self._opponent_games_by_cell(phase)
         for cell_index, cell in enumerate(self.train.schedule_cells):
             opponent_games = opponent_counts[cell_index]
@@ -572,14 +587,11 @@ class SeqRolloutCollector:
 
         models: dict[str, SeqPlumpModel] = dict(self._trainable_model_map)
         opponent_id: Optional[str] = None
-        if (
-            "historical" in arms
-            and league is not None
-            and league.has_snapshots(iteration)
-        ):
-            opponent_id, opponent_policy = league.draw(
-                rng, iteration=iteration, device=self.device
-            )
+        if "historical" in arms and self._historical_pool:
+            opponent_id, opponent_policy = self._historical_pool[
+                self._historical_cursor % len(self._historical_pool)
+            ]
+            self._historical_cursor += 1
             models[OPPONENT] = opponent_policy.model
         elif "historical" in arms:
             # A brand-new run may request historical play before its first
@@ -1050,6 +1062,11 @@ class SeqRolloutCollector:
         ):
             learn_actor = True
         if not learn_actor:
+            if (
+                self.train.policy_objective == "ppo"
+                and self.train.ppo_opponent_action_mode == "argmax"
+            ):
+                sampled = int(probs.argmax())
             self._advance_leaf(
                 leaf, self._action_for(actor, phase, sampled), appends, alive_next
             )

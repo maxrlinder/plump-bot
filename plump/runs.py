@@ -143,9 +143,11 @@ class RunDirectory:
         checkpoint: Path,
         iteration: int,
         metric: float,
+        **metadata: Any,
     ) -> None:
         manifest = checkpoint_manifest(checkpoint, iteration)
         manifest["metric"] = metric
+        manifest.update(metadata)
         atomic_write_json(self.checkpoints / "best.json", manifest)
 
     def promote_best(
@@ -153,6 +155,7 @@ class RunDirectory:
         checkpoint: Path,
         iteration: int,
         metric: float,
+        **metadata: Any,
     ) -> Path:
         """Atomically expose an already-written interval checkpoint as best."""
 
@@ -164,7 +167,7 @@ class RunDirectory:
             except OSError:
                 shutil.copy2(checkpoint, temporary)
             temporary.replace(best)
-            self.record_best(best, iteration, metric)
+            self.record_best(best, iteration, metric, **metadata)
         finally:
             if temporary.exists():
                 temporary.unlink()

@@ -8,6 +8,7 @@ from plump.run_evaluation import (
     checkpoint_iteration,
     discover_interval_checkpoints,
     evaluation_output,
+    evaluation_summary_path,
     result_matches_protocol,
 )
 from plump.runs import RunDirectory, atomic_write_json
@@ -59,6 +60,7 @@ def test_cached_result_requires_identical_protocol(tmp_path):
     )
 
     assert result_matches_protocol(output, protocol)
+    assert evaluation_summary_path(output).is_file()
     assert not result_matches_protocol(
         output,
         EvaluationProtocol(

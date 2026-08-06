@@ -649,11 +649,12 @@ Only focal decisions create policy-loss rows and counterfactual branches.
 Across games, focal seats and bidding positions are randomized so the same
 policy learns to act from every role.
 
-The opponent arm initially uses the heuristic. Every 100 updates, the sampled
-policy is evaluated against it on a fixed deal bank. After four consecutive
-evaluations with positive mean relative reward, the anchor permanently changes
-to recent historical checkpoints. This avoids spending the rest of training
-specializing against one deterministic opponent after it has been beaten.
+The opponent arm initially uses the heuristic. Every 100 updates, both sampled
+and deterministic-argmax policies are evaluated against it on a fixed deal
+bank. After four consecutive argmax evaluations with positive mean relative
+reward, the anchor permanently changes to recent historical checkpoints. This
+avoids spending the rest of training specializing against one deterministic
+opponent after it has been beaten.
 
 For one update, opponents and $\pi_{\text{old}}$ are frozen. In self-play the
 gradient does not differentiate through the opponents' sampled actions; it
@@ -961,11 +962,16 @@ and loss accumulation are explicitly FP32.
 
 The `ppo-oracle-mps-768-v2` profile collects 32 independent games for each of the
 24 `(players, cards)` shapes, or 768 games per update. Half are shared-actor
-self-play and half use the heuristic or historical anchor. Thus each arm has
-384 games and each player-count bucket has 256 games. All shared-actor seats
-contribute policy rows in self-play; only the focal actor contributes policy
-rows in anchor games. The larger Monte Carlo batch reduces estimator variance
-but does not change the PPO objective above.
+self-play and half use historical opponents. Thus each arm has 384 games and
+each player-count bucket has 256 games. Exactly one focal actor contributes
+policy rows in every game. It samples from the behavior policy; every
+non-focal current or historical actor takes argmax. The larger Monte Carlo
+batch reduces estimator variance but does not change the PPO objective above.
+
+Five distinct historical checkpoints are sampled uniformly once per update
+from the retained range beginning at iteration 3500, preloaded, and assigned
+round-robin across historical batches. This preserves a mixed hard-opponent
+distribution without loading a model at every action.
 
 At update time, sequences are tail-padded to length buckets of width 32 and
 concatenated. At 768 games this turns the 24 per-shape groups into three actor
@@ -976,14 +982,14 @@ only at stored decision rows; unused token positions do not enter the PPO
 loss. The production microbatch ceiling remains 16,384 positions because a
 larger ceiling raised memory use without a repeatable throughput gain.
 
-The run writes dashboard metrics every five updates and checkpoints and
-evaluates every 100 updates, approximately every 31 minutes at the measured
-18.7 seconds per update. Every automatic evaluation runs both the sampled
-policy and deterministic argmax on the same deal bank in a background process,
-yielding reward and bid accuracy for each while updates continue. Sampled
-reward alone controls `best` and the four-win
-heuristic-to-history gate. These intervals affect observability and recovery,
-not the estimator.
+The trainer checkpoints every 100 updates. A separate restartable monitor
+evaluates every 200 updates and refreshes the dashboard every five metric rows.
+Every automatic evaluation runs both sampled and deterministic-argmax policies
+on the same deal bank, yielding reward and bid accuracy for each while updates
+continue. Argmax reward controls `best` and, when that curriculum is enabled,
+the heuristic-to-history gate. The active adaptive normalized-entropy targets
+are 0.70 for bidding and 0.40 for play. These reporting intervals affect
+observability and recovery, not the estimator.
 
 The PPO implementation is in `plump/seq/ppo.py`; the default critic is
 `SeqPPOOracleCritic` in `plump/seq/model.py`; dispatch, optimization, entropy

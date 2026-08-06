@@ -128,8 +128,10 @@ a linear readout cannot express two decision boundaries.
 `training.policy_objective="ppo"` selects an independent, branch-free path;
 the NeuRD and sampled-mirror implementations remain unchanged and selectable.
 Each deal has exactly one sampled leaf. In self-play, every seat is a learned
-trajectory by default; against the heuristic or a historical policy, only the
-focal current-policy seat is learned.
+trajectory only when `ppo_self_play_seats="all"`. The active profile uses
+`ppo_self_play_seats="focal"`: one current-policy seat samples and contributes
+PPO rows in every game, while all other neural seats take legal-action argmax.
+This includes both current-policy self-play rivals and historical rivals.
 
 For game `g`, let `C_g` be its learned seats. Every learned decision has weight
 `1 / (number_of_games * C_g)`. The loss is not divided by the number of
@@ -248,53 +250,50 @@ so a wide tree gets the full cache budget. `rollout.opponent_fraction`,
 `rollout.opponent_packing`, `rollout.deals_per_batch`, and
 `rollout.parallel_deals_max_hand_size` configure these behaviors.
 
-The current local PPO production profile instead uses 32 independent games for
+The current local PPO production profile uses 32 independent games for
 each of the 24 `(players, cards)` shapes: 768 complete games/update, split into
-384 self-play and 384 anchor games. Equivalently, each player-count bucket gets
-256 games across its eight hand sizes. PPO never branches; in self-play all
-seats controlled by the shared actor produce policy rows, while an anchor game
-learns only from its focal actor. `deals_per_batch=128` is only a rollout wave
+384 self-play and 384 historical games. Equivalently, each player-count bucket
+gets 256 games across its eight hand sizes. PPO never branches and exactly one
+focal seat per game contributes policy rows. The focal samples on-policy;
+every non-focal seat uses argmax. `deals_per_batch=128` is only a rollout wave
 capacity and does not change the 768-game objective batch.
 
-The anchor initially consists of deterministic heuristic opponents. Heuristic
-seats run through the batched wave scheduler but consume no neural forward or
-KV-cache rows; only the focal current policy is encoded. Automatic evaluation
-always runs both reproducible policy sampling and deterministic argmax against
-the same fixed deal bank in a separate checkpoint process. Training queues the
-job and immediately collects the next update. After sampled mean relative
-reward is above `evaluation.opponent_switch_reward` for
-`evaluation.opponent_switch_consecutive` consecutive evaluations, the anchor
-switches permanently to historical league opponents. The phase and streak are
-checkpointed. Only historical checkpoints with iteration in
-`[ceil(current / 2), current]` are eligible for sampling.
+At the start of each update, five distinct checkpoints are sampled uniformly
+from every retained checkpoint at iteration 3500 or later. They are preloaded
+and assigned round-robin across historical batches, so a single checkpoint
+cannot dominate an update. The current-policy arm and historical arm each
+receive exactly half of the fixed game budget.
 
-For the active 768-game MPS run, paired background evaluation and interval
-checkpointing both occur every 100 updates. The measured update cycle is about
-18.7 seconds, so this is roughly 31 minutes. Dashboard rendering remains every
-five updates. A fresh, random initialization with that profile is:
+Training saves every 100 updates. Evaluation is due every 200 updates and
+always runs both reproducible policy sampling and deterministic argmax against
+the fixed heuristic deal bank. Both best-checkpoint selection and any optional
+heuristic-to-history gate use argmax reward by default.
+
+Evaluation and dashboard rendering are not part of the trainer process. The
+pipeline launches `tools/watch_evaluation_dashboard.sh`, which starts a fresh
+`plump monitor` process on each polling pass. Consequently evaluator,
+selection, and dashboard code/config can change without restarting training.
+Compact `*.summary.json` sidecars keep each fresh pass below a second in the
+no-new-checkpoint case; the full per-round evaluation reports remain intact.
+Launch the two detached processes together with:
 
 ```bash
-uv run plump train ppo-oracle-mps-768-v2 --config configs/ppo-mps.toml \
-  --set training.deals_per_shape=32 \
-  --set run.checkpoint_every=100 \
-  --set evaluation.every=100
+tools/run_training_pipeline.sh ppo-oracle-mps-768-v2 configs/ppo-mps.toml \
+  --reconfigure --reconfigure-reason "focal PPO versus argmax league"
 ```
 
-Omitting `--from-checkpoint` creates and records `iter_000000.pt` before the
-first update. When evaluation is enabled, that checkpoint is immediately
-queued for evaluation against the heuristic in both sample and argmax modes
-using the configured deal bank; update one does not wait for it. The two
-rewards plus two bid accuracies supply four random-policy points on the
-dashboard. Sampled reward initializes `best`, but deliberately does not
-advance the
-heuristic-switch win streak. A matching cached result is reused if an
-iteration-zero run is resumed. The resolved overrides are copied into the
-run's `config.toml`.
+Omitting `--from-checkpoint` creates and records `iter_000000.pt`; the monitor
+then supplies its sample and argmax baselines independently. Matching cached
+results are reused.
 
 An existing run can adopt an explicitly changed configuration with
 `plump train RUN --config ... --reconfigure --reconfigure-reason ...`. This
 writes a config-compatible resume checkpoint and archives the previous config
 before continuing; ordinary resume still rejects accidental config drift.
+`--resume-checkpoint ITERATION` can intentionally rewind within a run. Metric
+rows and evaluation directories newer than that checkpoint, plus derived
+monitor/gate state, are automatically removed before continuation; interval
+checkpoint files themselves are retained.
 
 NeuRD follows [Neural Replicator
 Dynamics](https://arxiv.org/abs/1906.00190). The candidate correction is a

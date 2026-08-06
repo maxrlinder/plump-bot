@@ -9,10 +9,13 @@ import torch
 
 from plump.cli import (
     METRIC_COLUMNS,
+    _apply_completed_evaluations,
+    _discard_reporting_after,
     _ensure_metrics_header,
     _truncate_metrics_after,
     main,
 )
+from plump.runs import RunDirectory
 
 TINY_OVERRIDES = (
     "run.iterations=1",
@@ -126,6 +129,82 @@ def test_resume_discards_only_post_checkpoint_metric_rows(tmp_path):
     assert _truncate_metrics_after(metrics, 50) == 0
 
 
+def test_resume_discards_stale_evaluation_rows_and_derived_state(tmp_path):
+    run = RunDirectory("stale", root=tmp_path)
+    run.evaluations.mkdir(parents=True)
+    run.checkpoints.mkdir()
+    with run.metrics.open("w", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=("iteration",))
+        writer.writeheader()
+        writer.writerows({"iteration": value} for value in (1, 2, 3))
+    (run.evaluations / "iter_000001").mkdir()
+    (run.evaluations / "iter_000003").mkdir()
+    run.evaluation_state.write_text("{}")
+    (run.evaluations / "monitor.json").write_text("{}")
+    (run.checkpoints / "best.json").write_text(
+        json.dumps({"iteration": 3})
+    )
+    (run.checkpoints / "best.pt").write_bytes(b"stale")
+
+    rows, directories = _discard_reporting_after(run, 2)
+
+    assert (rows, directories) == (1, 1)
+    assert (run.evaluations / "iter_000001").is_dir()
+    assert not (run.evaluations / "iter_000003").exists()
+    assert not run.evaluation_state.exists()
+    assert not (run.evaluations / "monitor.json").exists()
+    assert not (run.checkpoints / "best.json").exists()
+    assert not (run.checkpoints / "best.pt").exists()
+
+
+def test_checkpoint_selection_and_curriculum_gate_use_argmax(tmp_path):
+    run = RunDirectory("argmax-state", root=tmp_path)
+    run.evaluations.mkdir(parents=True)
+    run.checkpoints.mkdir()
+    for iteration, sample_reward, argmax_reward in (
+        (1, 1.0, -0.2),
+        (2, 0.9, -0.1),
+    ):
+        checkpoint = run.interval_checkpoint(iteration)
+        checkpoint.write_bytes(f"checkpoint-{iteration}".encode())
+        directory = run.evaluations / f"iter_{iteration:06d}"
+        directory.mkdir()
+        (directory / "heuristic_sample.json").write_text(
+            json.dumps(
+                {
+                    "report": {
+                        "macro_relative_reward": sample_reward,
+                        "macro_bid_hit_rate": 0.5,
+                    }
+                }
+            )
+        )
+        (directory / "heuristic.json").write_text(
+            json.dumps(
+                {
+                    "report": {
+                        "macro_relative_reward": argmax_reward,
+                        "macro_bid_hit_rate": 0.4,
+                    }
+                }
+            )
+        )
+
+    state = _apply_completed_evaluations(
+        run,
+        opponent_mode="heuristic_then_historical",
+        switch_reward=0.0,
+        switch_consecutive=2,
+        maximum_iteration=2,
+    )
+
+    best = json.loads((run.checkpoints / "best.json").read_text())
+    assert best["iteration"] == 2
+    assert best["action_mode"] == "argmax"
+    assert state["opponent_phase"] == "heuristic"
+    assert state["win_streak"] == 0
+
+
 def test_cli_tiny_run_resume_and_mismatch(tmp_path, monkeypatch, capsys):
     monkeypatch.setenv("PLUMP_RUNS_DIR", str(tmp_path))
 
@@ -217,7 +296,7 @@ def test_cli_prepare_only_forks_for_unavailable_device_and_resets_league(
     assert payload["league"] == []
 
 
-def test_fresh_run_evaluates_iteration_zero_before_training(
+def test_monitor_evaluates_initial_checkpoint_outside_training(
     tmp_path, monkeypatch, capsys
 ):
     monkeypatch.setenv("PLUMP_RUNS_DIR", str(tmp_path))
@@ -232,6 +311,11 @@ def test_fresh_run_evaluates_iteration_zero_before_training(
     )
 
     assert main(args) == 0
+    training_output = capsys.readouterr().out
+    assert "eval" not in next(
+        line for line in training_output.splitlines() if "iter     1" in line
+    )
+    assert main(["monitor", "initial-eval", "--device", "cpu"]) == 0
 
     run = tmp_path / "initial-eval"
     baseline = (
@@ -256,15 +340,11 @@ def test_fresh_run_evaluates_iteration_zero_before_training(
     assert not row["eval_bid_hit_argmax"]
     best = json.loads((run / "checkpoints" / "best.json").read_text())
     assert best["iteration"] in (0, 1)
+    assert best["action_mode"] == "argmax"
     output = capsys.readouterr().out
-    update_line = next(line for line in output.splitlines() if "iter     1" in line)
-    assert "Queued background sample+argmax evaluation 0" in output
-    assert "Background paired evaluation 0 completed" in output
-    assert "Applied eval 0 | sample reward=" in output
-    assert "eval" not in update_line
-    assert output.index("iter     1") < output.index(
-        "Background paired evaluation 0 completed"
-    )
+    assert "iter_000000.pt [sample] evaluated" in output
+    assert "iter_000000.pt [argmax] evaluated" in output
+    assert "Applied paired evals through 1" in output
 
 
 def test_cli_reconfigure_writes_resume_checkpoint_and_config_audit(
