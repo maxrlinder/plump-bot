@@ -85,3 +85,17 @@ cosine-similarity heatmaps, and cross-validated suit/rank probe plots. A
 
 Outputs are always scoped to `runs/<name>/analysis/<checkpoint>/`; source
 directories never contain generated PNGs.
+
+To track that geometry over every interval checkpoint, run:
+
+```bash
+uv run --group analysis plump analyze RUN --history
+```
+
+This writes `analysis/card_geometry_history.png`, a longitudinal input/output
+comparison of MDS stress, PCA concentration, suit accuracy and nearest-suit
+structure, rank MAE and nearest-rank gap, permutation p-values, and cosine
+distances for all/same-suit/same-rank/nearest card pairs. The accompanying CSV
+and JSON retain every scalar. The JSON is also an incremental cache: rerunning
+the command analyzes only new or replaced checkpoints unless `--force` is
+given.

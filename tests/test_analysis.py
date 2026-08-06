@@ -100,3 +100,64 @@ def test_analysis_loads_seq_checkpoint_and_scopes_every_output(
         == "exact-card+rank+suit"
     )
     assert (output / "report.json").is_file()
+
+
+def test_history_analysis_writes_scalars_plot_and_reuses_cache(
+    tmp_path,
+    monkeypatch,
+):
+    config = SeqModelConfig(
+        d_model=16,
+        n_layers=1,
+        n_heads=2,
+        n_kv_heads=1,
+        d_ff=32,
+    )
+    model = SeqPlumpModel(config)
+    checkpoint = tmp_path / "run" / "checkpoints" / "iter_000003.pt"
+    checkpoint.parent.mkdir(parents=True)
+    torch.save(
+        {
+            "schema_version": SEQ_SCHEMA_VERSION,
+            "iteration": 3,
+            "model_config": asdict(config),
+            "model_state_dict": model.state_dict(),
+        },
+        checkpoint,
+    )
+    output = tmp_path / "run" / "analysis"
+
+    report = card_geometry.analyze_checkpoint_history(
+        [checkpoint],
+        output,
+        permutations=2,
+        dpi=20,
+    )
+
+    assert len(report["checkpoints"]) == 1
+    row = report["checkpoints"][0]
+    assert row["iteration"] == 3
+    assert set(row["representations"]) == {"input", "action-head"}
+    for source in row["representations"].values():
+        assert set(source) == set(card_geometry.HISTORY_METRIC_FIELDS)
+    assert (output / "card_geometry_history.png").read_bytes().startswith(
+        b"\x89PNG\r\n\x1a\n"
+    )
+    assert (output / "card_geometry_history.csv").is_file()
+    assert (output / "card_geometry_history.json").is_file()
+
+    def fail_if_recomputed(*_args, **_kwargs):
+        raise AssertionError("matching checkpoint should come from history cache")
+
+    monkeypatch.setattr(
+        card_geometry,
+        "_checkpoint_history_metrics",
+        fail_if_recomputed,
+    )
+    cached = card_geometry.analyze_checkpoint_history(
+        [checkpoint],
+        output,
+        permutations=2,
+        dpi=20,
+    )
+    assert cached["checkpoints"] == report["checkpoints"]

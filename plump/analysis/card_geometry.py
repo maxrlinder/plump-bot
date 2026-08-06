@@ -8,6 +8,10 @@ effective exact-card + rank + suit output row. Scalar biases are excluded.
 
 from __future__ import annotations
 
+import csv
+import io
+import json
+import re
 from pathlib import Path
 
 import matplotlib
@@ -21,7 +25,7 @@ from sklearn.manifold import MDS
 from umap import UMAP
 
 from plump.cards import RANK_LABELS, SUIT_SYMBOLS, Suit
-from plump.runs import atomic_write_json
+from plump.runs import atomic_write_json, atomic_write_text
 from plump.seq.policy import SeqModelPolicy
 
 from .card_pca import (
@@ -30,6 +34,7 @@ from .card_pca import (
     action_head_card_vectors,
     cards,
     input_card_vectors,
+    pca,
     save_pca,
 )
 
@@ -100,14 +105,9 @@ def scatter_cards(ax, coordinates: np.ndarray) -> None:
     ax.legend(fontsize=8, loc="best")
 
 
-def plot_mds(
-    distances: np.ndarray,
-    representation_title: str,
-    iteration_label: str,
-    output: Path,
-    seed: int,
-    dpi: int,
-) -> float:
+def fit_mds(distances: np.ndarray, seed: int) -> tuple[np.ndarray, float]:
+    """Fit the deterministic report MDS and return coordinates plus stress."""
+
     estimator = MDS(
         n_components=2,
         metric_mds=True,
@@ -121,17 +121,29 @@ def plot_mds(
         n_jobs=1,
     )
     coordinates = estimator.fit_transform(distances)
+    return coordinates, float(estimator.stress_)
+
+
+def plot_mds(
+    distances: np.ndarray,
+    representation_title: str,
+    iteration_label: str,
+    output: Path,
+    seed: int,
+    dpi: int,
+) -> float:
+    coordinates, stress = fit_mds(distances, seed)
     fig, ax = plt.subplots(figsize=(10, 8), constrained_layout=True)
     scatter_cards(ax, coordinates)
     ax.set_title(
         f"{representation_title} cosine MDS — {iteration_label}\n"
-        f"normalized stress {estimator.stress_:.3f}",
+        f"normalized stress {stress:.3f}",
         fontsize=14,
     )
     ax.set_xlabel("MDS dimension 1")
     ax.set_ylabel("MDS dimension 2")
     save_figure(fig, output, dpi)
-    return float(estimator.stress_)
+    return stress
 
 
 def plot_umap(
@@ -327,6 +339,26 @@ def probe_metrics(
     return observed_suit_accuracy, baseline_suit, observed_rank_mae, baseline_rank
 
 
+def probe_p_values(
+    suit_accuracy: float,
+    suit_baseline: np.ndarray,
+    rank_mae: float,
+    rank_baseline: np.ndarray,
+) -> tuple[float, float]:
+    """Plus-one permutation p-values for the two directional probes."""
+
+    permutations = len(suit_baseline)
+    if len(rank_baseline) != permutations or permutations < 1:
+        raise ValueError("Probe baselines must have equal positive length.")
+    suit_p = (1 + np.count_nonzero(suit_baseline >= suit_accuracy)) / (
+        permutations + 1
+    )
+    rank_p = (1 + np.count_nonzero(rank_baseline <= rank_mae)) / (
+        permutations + 1
+    )
+    return float(suit_p), float(rank_p)
+
+
 def plot_probe_baselines(
     vectors: np.ndarray,
     representation_title: str,
@@ -339,11 +371,11 @@ def plot_probe_baselines(
     suit_accuracy, suit_baseline, rank_mae, rank_baseline = probe_metrics(
         vectors, permutations, seed
     )
-    suit_p = (1 + np.count_nonzero(suit_baseline >= suit_accuracy)) / (
-        permutations + 1
-    )
-    rank_p = (1 + np.count_nonzero(rank_baseline <= rank_mae)) / (
-        permutations + 1
+    suit_p, rank_p = probe_p_values(
+        suit_accuracy,
+        suit_baseline,
+        rank_mae,
+        rank_baseline,
     )
 
     fig, axes = plt.subplots(1, 2, figsize=(13, 5.5), constrained_layout=True)
@@ -469,4 +501,374 @@ def analyze_checkpoint(
         }
 
     atomic_write_json(output_dir / "report.json", report)
+    return report
+
+
+HISTORY_METRIC_FIELDS = (
+    "mds_normalized_stress",
+    "pca_first_component_explained",
+    "pca_first_four_explained",
+    "suit_probe_accuracy",
+    "suit_probe_p",
+    "rank_probe_mae",
+    "rank_probe_p",
+    "nearest_same_suit",
+    "mean_nearest_rank_gap",
+    "mean_cosine_distance",
+    "mean_same_suit_cosine_distance",
+    "mean_same_rank_cosine_distance",
+    "mean_nearest_cosine_distance",
+)
+
+
+def _history_checkpoint_signature(checkpoint: Path) -> dict[str, int | str]:
+    stat = checkpoint.stat()
+    return {
+        "name": checkpoint.name,
+        "size": stat.st_size,
+        "mtime_ns": stat.st_mtime_ns,
+    }
+
+
+def _card_distance_metrics(distances: np.ndarray) -> dict[str, float]:
+    deck = cards()
+    count = len(deck)
+    upper = np.triu(np.ones((count, count), dtype=bool), k=1)
+    suits = np.asarray([card.suit for card in deck], dtype=object)
+    ranks = np.asarray([int(card.rank) for card in deck], dtype=np.int64)
+    same_suit = upper & (suits[:, None] == suits[None, :])
+    same_rank = upper & (ranks[:, None] == ranks[None, :])
+    nearest = distances.copy()
+    np.fill_diagonal(nearest, np.inf)
+    return {
+        "mean_cosine_distance": float(distances[upper].mean()),
+        "mean_same_suit_cosine_distance": float(distances[same_suit].mean()),
+        "mean_same_rank_cosine_distance": float(distances[same_rank].mean()),
+        "mean_nearest_cosine_distance": float(nearest.min(axis=1).mean()),
+    }
+
+
+def _representation_history_metrics(
+    model,
+    source: str,
+    *,
+    permutations: int,
+    seed: int,
+) -> dict[str, float]:
+    if source == "input":
+        raw_vectors = input_card_vectors(model)
+    elif source == "action-head":
+        raw_vectors = action_head_card_vectors(model)
+    else:
+        raise ValueError(f"Unknown card representation: {source}")
+    projection = pca(raw_vectors)
+    vectors = normalized_card_vectors(model, source)
+    distances = cosine_distances(vectors)
+    _, stress = fit_mds(distances, seed)
+    suit_accuracy, suit_baseline, rank_mae, rank_baseline = probe_metrics(
+        vectors,
+        permutations,
+        seed,
+    )
+    suit_p, rank_p = probe_p_values(
+        suit_accuracy,
+        suit_baseline,
+        rank_mae,
+        rank_baseline,
+    )
+    explained = tuple(float(value) for value in projection.explained_variance)
+    metrics = {
+        "mds_normalized_stress": stress,
+        "pca_first_component_explained": explained[0],
+        "pca_first_four_explained": float(sum(explained[:4])),
+        "suit_probe_accuracy": suit_accuracy,
+        "suit_probe_p": suit_p,
+        "rank_probe_mae": rank_mae,
+        "rank_probe_p": rank_p,
+        "nearest_same_suit": projection.nearest_suit_fraction,
+        "mean_nearest_rank_gap": projection.nearest_rank_gap,
+    }
+    metrics.update(_card_distance_metrics(distances))
+    return metrics
+
+
+def _checkpoint_history_metrics(
+    checkpoint: Path,
+    *,
+    permutations: int,
+    seed: int,
+) -> dict:
+    policy = SeqModelPolicy.from_checkpoint(
+        checkpoint,
+        device="cpu",
+        greedy=True,
+    )
+    match = re.fullmatch(r"iter_(\d+)\.pt", checkpoint.name)
+    if match is None:
+        payload = torch.load(checkpoint, map_location="cpu", weights_only=False)
+        iteration = int(payload.get("iteration", 0))
+    else:
+        iteration = int(match.group(1))
+    representations = {
+        source: _representation_history_metrics(
+            policy.model,
+            source,
+            permutations=permutations,
+            seed=seed,
+        )
+        for source in ("input", "action-head")
+    }
+    return {
+        "iteration": iteration,
+        "checkpoint": str(checkpoint),
+        "signature": _history_checkpoint_signature(checkpoint),
+        "representations": representations,
+    }
+
+
+def _plot_history(
+    checkpoints: list[dict],
+    output: Path,
+    *,
+    permutations: int,
+    dpi: int,
+) -> None:
+    figure, axes = plt.subplots(
+        5,
+        2,
+        figsize=(16, 19),
+        sharex="col",
+        constrained_layout=True,
+    )
+    sources = (
+        ("input", "Effective card input embedding"),
+        ("action-head", "Effective card action output embedding"),
+    )
+    for column, (source, title) in enumerate(sources):
+        iterations = np.asarray(
+            [row["iteration"] for row in checkpoints], dtype=np.float64
+        )
+
+        def values(field: str) -> np.ndarray:
+            return np.asarray(
+                [row["representations"][source][field] for row in checkpoints],
+                dtype=np.float64,
+            )
+
+        ax = axes[0, column]
+        ax.plot(
+            iterations,
+            values("mds_normalized_stress"),
+            marker="o",
+            markersize=3,
+            label="MDS normalized stress ↓",
+        )
+        ax.plot(
+            iterations,
+            values("pca_first_four_explained"),
+            marker="o",
+            markersize=3,
+            label="PCA variance, first 4 ↑",
+        )
+        ax.set_title(title, fontsize=13)
+        ax.set_ylabel("Geometry summary")
+        ax.set_ylim(bottom=0)
+
+        ax = axes[1, column]
+        ax.plot(
+            iterations,
+            values("suit_probe_accuracy"),
+            marker="o",
+            markersize=3,
+            label="Suit probe accuracy ↑",
+        )
+        ax.plot(
+            iterations,
+            values("nearest_same_suit"),
+            marker="o",
+            markersize=3,
+            label="Nearest card has same suit ↑",
+        )
+        ax.axhline(
+            0.25,
+            color="#777777",
+            linestyle=":",
+            linewidth=1,
+            label="Suit chance (25%)",
+        )
+        ax.set_ylabel("Suit structure")
+        ax.set_ylim(0, 1.02)
+
+        ax = axes[2, column]
+        ax.plot(
+            iterations,
+            values("rank_probe_mae"),
+            marker="o",
+            markersize=3,
+            label="Rank probe MAE ↓",
+        )
+        ax.plot(
+            iterations,
+            values("mean_nearest_rank_gap"),
+            marker="o",
+            markersize=3,
+            label="Nearest-card rank gap ↓",
+        )
+        ax.set_ylabel("Rank difference")
+        ax.set_ylim(bottom=0)
+
+        ax = axes[3, column]
+        ax.plot(
+            iterations,
+            values("suit_probe_p"),
+            marker="o",
+            markersize=3,
+            label="Suit permutation p ↓",
+        )
+        ax.plot(
+            iterations,
+            values("rank_probe_p"),
+            marker="o",
+            markersize=3,
+            label="Rank permutation p ↓",
+        )
+        ax.axhline(
+            0.05,
+            color="#777777",
+            linestyle=":",
+            linewidth=1,
+            label="p = 0.05",
+        )
+        ax.set_yscale("log")
+        ax.set_ylabel("Permutation p-value")
+
+        ax = axes[4, column]
+        distance_fields = (
+            ("mean_cosine_distance", "All card pairs"),
+            ("mean_same_suit_cosine_distance", "Same-suit pairs"),
+            ("mean_same_rank_cosine_distance", "Same-rank pairs"),
+            ("mean_nearest_cosine_distance", "Nearest card"),
+        )
+        for field, label in distance_fields:
+            ax.plot(
+                iterations,
+                values(field),
+                marker="o",
+                markersize=3,
+                label=label,
+            )
+        ax.set_ylabel("Cosine distance ↓")
+        ax.set_xlabel("Training iteration")
+        ax.set_ylim(bottom=0)
+
+        for row in range(5):
+            axes[row, column].grid(alpha=0.2)
+            axes[row, column].legend(fontsize=8, loc="best")
+
+    figure.suptitle(
+        "Card-representation geometry across checkpoints\n"
+        f"{len(checkpoints)} checkpoints · {permutations} probe permutations",
+        fontsize=15,
+    )
+    save_figure(figure, output, dpi)
+
+
+def _history_csv(checkpoints: list[dict]) -> str:
+    buffer = io.StringIO()
+    fieldnames = ("iteration", "representation", *HISTORY_METRIC_FIELDS)
+    writer = csv.DictWriter(buffer, fieldnames=fieldnames)
+    writer.writeheader()
+    for checkpoint in checkpoints:
+        for source in ("input", "action-head"):
+            writer.writerow(
+                {
+                    "iteration": checkpoint["iteration"],
+                    "representation": source,
+                    **checkpoint["representations"][source],
+                }
+            )
+    return buffer.getvalue()
+
+
+def analyze_checkpoint_history(
+    checkpoints: list[str | Path],
+    output_dir: str | Path,
+    *,
+    seed: int = 42,
+    permutations: int = 1000,
+    dpi: int = 180,
+    force: bool = False,
+) -> dict:
+    """Compute and plot card-geometry scalars across interval checkpoints.
+
+    The JSON report doubles as an incremental cache. A later invocation only
+    evaluates new or replaced checkpoints when seed and permutation settings
+    match, which keeps this useful while a run is still producing snapshots.
+    """
+
+    if permutations < 1:
+        raise ValueError("permutations must be at least 1")
+    paths = sorted(
+        (Path(path).expanduser().resolve() for path in checkpoints),
+        key=lambda path: path.name,
+    )
+    if not paths:
+        raise ValueError("History analysis requires at least one checkpoint.")
+    missing = [path for path in paths if not path.is_file()]
+    if missing:
+        raise FileNotFoundError(missing[0])
+
+    output_dir = Path(output_dir).expanduser().resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    json_output = output_dir / "card_geometry_history.json"
+    csv_output = output_dir / "card_geometry_history.csv"
+    plot_output = output_dir / "card_geometry_history.png"
+
+    cached: dict[tuple[str, int, int], dict] = {}
+    if not force and json_output.is_file():
+        try:
+            previous = json.loads(json_output.read_text())
+            if (
+                int(previous.get("seed", -1)) == seed
+                and int(previous.get("permutations", -1)) == permutations
+            ):
+                for row in previous.get("checkpoints", []):
+                    signature = row["signature"]
+                    key = (
+                        str(signature["name"]),
+                        int(signature["size"]),
+                        int(signature["mtime_ns"]),
+                    )
+                    cached[key] = row
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError, OSError):
+            cached = {}
+
+    rows: list[dict] = []
+    for checkpoint in paths:
+        signature = _history_checkpoint_signature(checkpoint)
+        key = (
+            str(signature["name"]),
+            int(signature["size"]),
+            int(signature["mtime_ns"]),
+        )
+        row = cached.get(key)
+        if row is None:
+            row = _checkpoint_history_metrics(
+                checkpoint,
+                permutations=permutations,
+                seed=seed,
+            )
+        rows.append(row)
+    rows.sort(key=lambda row: int(row["iteration"]))
+
+    _plot_history(rows, plot_output, permutations=permutations, dpi=dpi)
+    atomic_write_text(csv_output, _history_csv(rows))
+    report = {
+        "format_version": 1,
+        "seed": seed,
+        "permutations": permutations,
+        "checkpoints": rows,
+        "outputs": [str(plot_output), str(csv_output), str(json_output)],
+    }
+    atomic_write_json(json_output, report)
     return report

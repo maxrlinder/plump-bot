@@ -269,6 +269,19 @@ def build_parser() -> argparse.ArgumentParser:
     analyze.add_argument("--seed", type=int, default=42)
     analyze.add_argument("--permutations", type=int, default=1000)
     analyze.add_argument("--dpi", type=int, default=180)
+    analyze.add_argument(
+        "--history",
+        action="store_true",
+        help=(
+            "compute cached scalar card-geometry diagnostics across every "
+            "interval checkpoint and write a longitudinal graph"
+        ),
+    )
+    analyze.add_argument(
+        "--force",
+        action="store_true",
+        help="with --history, recompute checkpoints already present in the cache",
+    )
     analyze.set_defaults(handler=analyze_command)
 
     play = subparsers.add_parser("play", help="launch the local browser GUI")
@@ -908,9 +921,29 @@ def evaluate_command(args: argparse.Namespace) -> int:
 
 
 def analyze_command(args: argparse.Namespace) -> int:
-    from plump.analysis.card_geometry import analyze_checkpoint
+    from plump.analysis.card_geometry import (
+        analyze_checkpoint,
+        analyze_checkpoint_history,
+    )
 
     run = RunDirectory(args.run)
+    if args.history:
+        checkpoints = discover_interval_checkpoints(run)
+        report = analyze_checkpoint_history(
+            checkpoints,
+            run.analysis,
+            seed=args.seed,
+            permutations=args.permutations,
+            dpi=args.dpi,
+            force=args.force,
+        )
+        print(
+            f"Wrote card-geometry history for "
+            f"{len(report['checkpoints'])} checkpoints to "
+            f"{run.analysis / 'card_geometry_history.png'}.",
+            flush=True,
+        )
+        return 0
     checkpoint = run.resolve_checkpoint(args.checkpoint)
     output = run.analysis / _checkpoint_output_name(checkpoint)
     report = analyze_checkpoint(
