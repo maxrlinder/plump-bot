@@ -9,6 +9,7 @@ import numpy as np
 
 from plump.dashboard import (
     DEFAULT_SMOOTH_WINDOW,
+    _current_entropy_targets,
     _current_kl_caps,
     _duration,
     _evaluation_points,
@@ -27,6 +28,18 @@ def test_dashboard_omits_disabled_p99_cap_but_keeps_mean_cap(tmp_path):
     )
 
     assert _current_kl_caps(metrics) == (0.004, None)
+
+
+def test_dashboard_reads_current_entropy_targets(tmp_path):
+    metrics = tmp_path / "metrics.csv"
+    metrics.touch()
+    (tmp_path / "config.toml").write_text(
+        "[training]\n"
+        "ppo_bid_entropy_target = 0.5\n"
+        "ppo_play_entropy_target = 0.4\n"
+    )
+
+    assert _current_entropy_targets(metrics) == (0.5, 0.4)
 
 
 def test_dashboard_renders_sparse_partial_and_resumed_rows(tmp_path):

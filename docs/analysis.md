@@ -13,10 +13,14 @@ The top-left graph combines run-scoped checkpoint evaluations against the
 heuristic with any older inline evaluation rows. Sidecar reports take
 precedence and show separate deterministic-argmax and policy-sampled relative
 reward/confidence bands plus bid accuracy. The remaining panels show rollout
-outcomes, value and belief learning, entropy and KL, branch/data volume,
-pre-clip gradient norms, wall-time breakdown, cache pressure, device memory,
-and rollback state. Learning rate is hidden unless `--include-learning-rate`
-is passed. Sparse evaluation results and resumed CSV files are supported.
+outcomes, value and belief learning, entropy and KL, pre-clip gradient norms,
+wall-time breakdown, and rollback state. The former memory panel shows
+normalized bid/play entropy against their current targets on its left axis and
+the corresponding adaptive coefficients on a logarithmic right axis. The
+footer reports iterations and ETA to the next evaluation using mean update
+time since the latest checkpoint. Learning rate is hidden unless
+`--include-learning-rate` is passed. Sparse evaluation results and resumed CSV
+files are supported.
 New automatic evaluations always contribute four exact observations: sampled and
 argmax relative reward plus sampled and argmax bid accuracy.
 

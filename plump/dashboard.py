@@ -138,21 +138,13 @@ def render_dashboard(
         title="Wall time",
         ylabel="seconds",
     )
-    _dual_lines(
+    _entropy_controller(
         axes[2, 2],
         iteration,
         rows,
-        left=(
-            ("peak_cache_rows", "rows used"),
-            ("cache_rows_allocated", "rows reserved"),
-        ),
-        right=(("peak_device_gb", "device high-water"),),
+        metrics_path=metrics_path,
         smooth=smooth,
-        title="Memory",
-        left_label="KV-cache rows",
-        right_label="device GB",
     )
-    _mark_cache_cap_hits(axes[2, 2], iteration, rows)
     _mark_policy_rollbacks(axes[0, 2], iteration, rows)
     _lines(
         axes[3, 0],
@@ -920,6 +912,89 @@ def _current_kl_caps(metrics_path: Path) -> tuple[float, float | None] | None:
     if mean_cap <= 0 or p99_cap < 0:
         return None
     return mean_cap, p99_cap if p99_cap > 0 else None
+
+
+def _current_entropy_targets(metrics_path: Path) -> tuple[float, float] | None:
+    """Read the current normalized bid/play entropy targets."""
+
+    config_path = metrics_path.parent / "config.toml"
+    try:
+        with config_path.open("rb") as handle:
+            training = tomllib.load(handle)["training"]
+        bid = float(training["ppo_bid_entropy_target"])
+        play = float(training["ppo_play_entropy_target"])
+    except (KeyError, OSError, TypeError, ValueError, tomllib.TOMLDecodeError):
+        return None
+    if not (0.0 <= bid <= 1.0 and 0.0 <= play <= 1.0):
+        return None
+    return bid, play
+
+
+def _entropy_controller(
+    ax,
+    iteration: np.ndarray,
+    rows: list[dict[str, str]],
+    *,
+    metrics_path: Path,
+    smooth: int,
+) -> None:
+    """Plot phase-specific entropy and its adaptive regularization strength."""
+
+    right_ax = ax.twinx()
+    entropy_handles = _plot_fields(
+        ax,
+        iteration,
+        rows,
+        (
+            ("entropy_bid_normalized", "bid entropy"),
+            ("entropy_play_normalized", "play entropy"),
+        ),
+        smooth=smooth,
+        omit_zero=True,
+    )
+    alpha_handles = _plot_fields(
+        right_ax,
+        iteration,
+        rows,
+        (
+            ("entropy_alpha_bid", "bid adaptive α"),
+            ("entropy_alpha_play", "play adaptive α"),
+        ),
+        smooth=smooth,
+        omit_zero=True,
+        color_offset=2,
+    )
+    target_handles = []
+    targets = _current_entropy_targets(metrics_path)
+    if targets is not None:
+        for target, color, phase in zip(targets, ("C0", "C1"), ("bid", "play")):
+            target_handles.append(
+                ax.axhline(
+                    target,
+                    linewidth=1.0,
+                    linestyle=":",
+                    color=color,
+                    alpha=0.8,
+                    label=f"current {phase} target ({target:g})",
+                )
+            )
+
+    ax.set_title("Phase entropy and adaptive coefficients")
+    handles = [*entropy_handles, *alpha_handles, *target_handles]
+    if entropy_handles or target_handles:
+        ax.set_ylabel("normalized entropy")
+        ax.set_ylim(0.0, 1.0)
+    if alpha_handles:
+        right_ax.set_ylabel("adaptive α (log scale)")
+        right_ax.set_yscale("log")
+        right_ax.grid(False)
+    else:
+        right_ax.set_yticks([])
+        right_ax.spines["right"].set_visible(False)
+    if handles:
+        ax.legend(handles=handles, fontsize=7, loc="best")
+    else:
+        _no_data(ax)
 
 
 def _dual_lines(
