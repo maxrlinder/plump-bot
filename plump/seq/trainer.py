@@ -2549,18 +2549,36 @@ class SeqTrainer:
                     self.critic.initialize_from_actor(self.model)
                 else:
                     self.critic.backbone.load_state_dict(self.model.state_dict())
-            for phase, value in payload.get("entropy_log_alpha", {}).items():
-                if phase in self.log_entropy_alpha:
-                    self.log_entropy_alpha[phase].data.copy_(
-                        torch.as_tensor(value, device=self.device)
+            # The adaptive temperatures are dual/controller state for one
+            # particular entropy constraint, not learned policy state. Reusing
+            # their accumulated pressure after changing a target makes the old
+            # constraint dominate the new run for hundreds of updates. Keep
+            # them only when the complete controller specification matches;
+            # otherwise retain the freshly initialized coefficient/optimizer.
+            entropy_fields = (
+                "ppo_entropy_mode",
+                "ppo_entropy_coef",
+                "ppo_entropy_learning_rate",
+                "ppo_bid_entropy_target",
+                "ppo_play_entropy_target",
+            )
+            compatible_entropy = isinstance(source_training, dict) and all(
+                source_training.get(field) == getattr(self.train, field)
+                for field in entropy_fields
+            )
+            if compatible_entropy:
+                for phase, value in payload.get("entropy_log_alpha", {}).items():
+                    if phase in self.log_entropy_alpha:
+                        self.log_entropy_alpha[phase].data.copy_(
+                            torch.as_tensor(value, device=self.device)
+                        )
+                if (
+                    self.entropy_optimizer is not None
+                    and "entropy_optimizer_state_dict" in payload
+                ):
+                    self.entropy_optimizer.load_state_dict(
+                        payload["entropy_optimizer_state_dict"]
                     )
-            if (
-                self.entropy_optimizer is not None
-                and "entropy_optimizer_state_dict" in payload
-            ):
-                self.entropy_optimizer.load_state_dict(
-                    payload["entropy_optimizer_state_dict"]
-                )
         self.iteration = int(payload.get("iteration", 0))
         self.optimizer_steps = int(payload.get("optimizer_steps", 0))
         curriculum = payload.get("opponent_curriculum_state", {})

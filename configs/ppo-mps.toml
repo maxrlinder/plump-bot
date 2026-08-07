@@ -52,8 +52,8 @@ policy_kl_p99_cap = 0.0
 
 ppo_clip_ratio = 0.10
 ppo_trainable_policies = 1
-ppo_self_play_seats = "focal"
-ppo_opponent_action_mode = "argmax"
+ppo_self_play_seats = "all"
+ppo_opponent_action_mode = "sample"
 ppo_sequence_bucket_width = 32
 ppo_critic_mode = "oracle"
 ppo_critic_learning_rate = 0.0003
@@ -62,7 +62,7 @@ ppo_advantage_normalize = true
 ppo_entropy_mode = "adaptive"
 ppo_entropy_coef = 0.01
 ppo_entropy_learning_rate = 0.001
-ppo_bid_entropy_target = 0.70
+ppo_bid_entropy_target = 0.50
 ppo_play_entropy_target = 0.40
 
 # Legacy-objective parameters are inert under PPO but retained so this file can
@@ -101,7 +101,9 @@ cache_budget_gb = 4.0
 auto_deals_per_batch = false
 deals_per_batch = 128
 max_deals_per_batch = 128
-opponent_mode = "historical"
+# Keep a permanent fixed-policy anchor: half current-policy self-play and half
+# focal-policy games against the deterministic heuristic.
+opponent_mode = "heuristic"
 opponent_fraction = 0.5
 opponent_packing = "concurrent"
 # On M5 Pro, BF16 transformer compute plus FP16 cached attention is the fastest

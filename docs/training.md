@@ -263,17 +263,23 @@ so a wide tree gets the full cache budget. `rollout.opponent_fraction`,
 
 The current local PPO production profile uses 32 independent games for
 each of the 24 `(players, cards)` shapes: 768 complete games/update, split into
-384 self-play and 384 historical games. Equivalently, each player-count bucket
-gets 256 games across its eight hand sizes. PPO never branches and exactly one
-focal seat per game contributes policy rows. The focal samples on-policy;
-every non-focal seat uses argmax. `deals_per_batch=128` is only a rollout wave
-capacity and does not change the 768-game objective batch.
+384 self-play and 384 deterministic-heuristic anchor games. Equivalently, each
+player-count bucket gets 256 games across its eight hand sizes. PPO never
+branches. Every seat in a self-play game samples on-policy and contributes PPO
+gradients; only the focal sampled seat learns in a heuristic game.
+`deals_per_batch=128` is only a rollout wave capacity and does not change the
+768-game objective batch.
 
-At the start of each update, five distinct checkpoints are sampled uniformly
-from every retained checkpoint at iteration 3500 or later. They are preloaded
-and assigned round-robin across historical batches, so a single checkpoint
-cannot dominate an update. The current-policy arm and historical arm each
-receive exactly half of the fixed game budget.
+Changing an adaptive entropy target resets its temperature and temperature
+optimizer to `ppo_entropy_coef`. Those are controller state for the previous
+constraint, not actor weights; carrying a wound-up temperature into a new
+target can impose the old entropy floor for hundreds of updates.
+
+When historical mode is selected, five distinct checkpoints are sampled
+uniformly from every retained checkpoint at iteration 3500 or later. They are
+preloaded and assigned round-robin across historical batches, so a single
+checkpoint cannot dominate an update. The active local profile instead keeps
+the heuristic as a permanent fixed anchor.
 
 Training saves every 100 updates. Evaluation is due every 200 updates and
 always runs both reproducible policy sampling and deterministic argmax against
@@ -290,7 +296,7 @@ Launch the two detached processes together with:
 
 ```bash
 tools/run_training_pipeline.sh ppo-oracle-mps-768-v2 configs/ppo-mps.toml \
-  --reconfigure --reconfigure-reason "focal PPO versus argmax league"
+  --reconfigure --reconfigure-reason "all-seat PPO plus heuristic anchor"
 ```
 
 Omitting `--from-checkpoint` creates and records `iter_000000.pt`; the monitor

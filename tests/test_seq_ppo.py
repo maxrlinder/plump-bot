@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import math
+from dataclasses import replace
+
 import numpy as np
 import pytest
 import torch
@@ -199,6 +202,34 @@ def test_ppo_checkpoint_round_trips_actor_pool_critic_and_entropy(tmp_path):
     for expected, actual in zip(trainer.models, restored.models):
         for left, right in zip(expected.parameters(), actual.parameters()):
             assert torch.equal(left, right)
+
+
+def test_entropy_target_reconfiguration_resets_adaptive_controller(tmp_path):
+    source_config = ppo_config()
+    source = SeqTrainer(SeqPlumpModel(MODEL), source_config, device="cpu")
+    source.log_entropy_alpha["bid"].data.fill_(math.log(0.3))
+    source.log_entropy_alpha["play"].data.fill_(math.log(0.2))
+    path = tmp_path / "source.pt"
+    source.save_checkpoint(path)
+
+    changed_config = replace(
+        source_config,
+        ppo_bid_entropy_target=0.5,
+        ppo_play_entropy_target=0.4,
+    )
+    restored = SeqTrainer(
+        SeqPlumpModel(MODEL), changed_config, device="cpu"
+    )
+    restored.load_checkpoint(path, allow_training_config_mismatch=True)
+
+    assert restored._entropy_alpha("bid") == pytest.approx(
+        changed_config.ppo_entropy_coef
+    )
+    assert restored._entropy_alpha("play") == pytest.approx(
+        changed_config.ppo_entropy_coef
+    )
+    assert restored.entropy_optimizer is not None
+    assert restored.entropy_optimizer.state == {}
 
 
 def test_oracle_critic_has_one_sequence_per_game_and_exact_seat_ties():
