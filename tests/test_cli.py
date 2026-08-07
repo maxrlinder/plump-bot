@@ -204,6 +204,17 @@ def test_checkpoint_selection_and_curriculum_gate_use_argmax(tmp_path):
     assert state["opponent_phase"] == "heuristic"
     assert state["win_streak"] == 0
 
+    fixed_anchor_state = _apply_completed_evaluations(
+        run,
+        opponent_mode="heuristic",
+        switch_reward=0.0,
+        switch_consecutive=1,
+        maximum_iteration=2,
+        gate_action_mode="sample",
+    )
+    assert fixed_anchor_state["opponent_phase"] == "heuristic"
+    assert fixed_anchor_state["win_streak"] == 0
+
 
 def test_cli_tiny_run_resume_and_mismatch(tmp_path, monkeypatch, capsys):
     monkeypatch.setenv("PLUMP_RUNS_DIR", str(tmp_path))

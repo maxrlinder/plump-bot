@@ -404,20 +404,18 @@ def _apply_completed_evaluations(
     reward_index = {"sample": 1, "argmax": 3}
     if best_action_mode not in reward_index or gate_action_mode not in reward_index:
         raise ValueError("best/gate action modes must be 'sample' or 'argmax'.")
-    phase = (
-        "heuristic"
-        if opponent_mode == "heuristic_then_historical"
-        else opponent_mode
-    )
+    curriculum_enabled = opponent_mode == "heuristic_then_historical"
+    phase = "heuristic" if curriculum_enabled else opponent_mode
     streak = 0
-    for row in paired:
-        iteration = row[0]
-        gate_reward = row[reward_index[gate_action_mode]]
-        if iteration <= 0 or phase != "heuristic":
-            continue
-        streak = streak + 1 if gate_reward > switch_reward else 0
-        if streak >= switch_consecutive:
-            phase = "historical"
+    if curriculum_enabled:
+        for row in paired:
+            iteration = row[0]
+            gate_reward = row[reward_index[gate_action_mode]]
+            if iteration <= 0 or phase != "heuristic":
+                continue
+            streak = streak + 1 if gate_reward > switch_reward else 0
+            if streak >= switch_consecutive:
+                phase = "historical"
 
     best_iteration: int | None = None
     best_reward: float | None = None
@@ -706,7 +704,11 @@ def train_command(args: argparse.Namespace) -> int:
                 message += f" ({stats.backtracks} backtracks)"
             if stats.rolled_back:
                 message += " ROLLBACK"
-            if trainer.opponent_phase == "heuristic":
+            if (
+                trainer.train.rollout.opponent_mode
+                == "heuristic_then_historical"
+                and trainer.opponent_phase == "heuristic"
+            ):
                 message += (
                     f" | gate {trainer.heuristic_eval_win_streak}/"
                     f"{switch_consecutive}"
