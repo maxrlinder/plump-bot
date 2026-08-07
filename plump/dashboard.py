@@ -196,8 +196,22 @@ def render_dashboard(
     rollbacks = int(sum(_finite(_series(rows, "rolled_back"))))
     footer = [
         f"iteration {int(_number(last, 'iteration'))}",
-        f"optimizer steps {int(_number(last, 'optimizer_steps'))}",
     ]
+    evaluation_eta = _next_evaluation_eta(rows, metrics_path)
+    if evaluation_eta is not None:
+        next_iteration, remaining, pace, checkpoint_iteration = evaluation_eta
+        footer.append(f"next eval {next_iteration} in {remaining} iters")
+        if math.isfinite(pace):
+            basis = (
+                f" since ckpt {checkpoint_iteration}"
+                if checkpoint_iteration is not None
+                else ""
+            )
+            footer.append(
+                f"ETA {_duration(remaining * pace)} "
+                f"@ {pace:.1f}s/iter{basis}"
+            )
+    footer.append(f"optimizer steps {int(_number(last, 'optimizer_steps'))}")
     if include_learning_rate:
         footer.append(f"LR {_number(last, 'learning_rate'):.2e}")
     footer.extend(
@@ -337,6 +351,71 @@ def _legacy_evaluation_mode(config_path: Path) -> str:
         return "sample" if mode == "sample" else "argmax"
     except (KeyError, OSError, TypeError, ValueError, tomllib.TOMLDecodeError):
         return "argmax"
+
+
+def _next_evaluation_eta(
+    rows: list[dict[str, str]],
+    metrics_path: Path,
+) -> tuple[int, int, float, int | None] | None:
+    """Return next eval cadence and ETA from pace after the latest checkpoint."""
+
+    config_path = metrics_path.parent / "config.toml"
+    try:
+        with config_path.open("rb") as handle:
+            config = tomllib.load(handle)
+        evaluation_every = int(config["evaluation"]["every"])
+        checkpoint_every = int(config["run"]["checkpoint_every"])
+        target_iteration = int(config["run"].get("iterations", 0))
+        current_iteration = int(_number(rows[-1], "iteration"))
+    except (
+        IndexError,
+        KeyError,
+        OSError,
+        TypeError,
+        ValueError,
+        tomllib.TOMLDecodeError,
+    ):
+        return None
+    if evaluation_every <= 0:
+        return None
+
+    next_iteration = (
+        current_iteration // evaluation_every + 1
+    ) * evaluation_every
+    if target_iteration > 0 and next_iteration > target_iteration:
+        return None
+    remaining = next_iteration - current_iteration
+
+    checkpoint_iterations: list[int] = []
+    for path in (metrics_path.parent / "checkpoints").glob("iter_*.pt"):
+        match = re.fullmatch(r"iter_(\d+)\.pt", path.name)
+        if match is not None and int(match.group(1)) <= current_iteration:
+            checkpoint_iterations.append(int(match.group(1)))
+    checkpoint_iteration: int | None = (
+        max(checkpoint_iterations) if checkpoint_iterations else None
+    )
+    if checkpoint_iteration is None and checkpoint_every > 0:
+        checkpoint_iteration = (
+            current_iteration // checkpoint_every
+        ) * checkpoint_every
+
+    iterations = _series(rows, "iteration")
+    times = _series(rows, "total_sec")
+    valid = np.isfinite(iterations) & np.isfinite(times) & (times > 0)
+    if checkpoint_iteration is not None:
+        since_checkpoint = valid & (iterations > checkpoint_iteration)
+        if since_checkpoint.any():
+            valid = since_checkpoint
+        elif checkpoint_every > 0:
+            # When rendering exactly on a checkpoint, use the interval that
+            # just completed rather than estimating from no observations.
+            valid &= (
+                (iterations > checkpoint_iteration - checkpoint_every)
+                & (iterations <= checkpoint_iteration)
+            )
+    pace_values = times[valid]
+    pace = float(pace_values.mean()) if pace_values.size else math.nan
+    return next_iteration, remaining, pace, checkpoint_iteration
 
 
 def _checkpoint_evaluation(

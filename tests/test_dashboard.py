@@ -13,6 +13,7 @@ from plump.dashboard import (
     _duration,
     _evaluation_points,
     _has_signal,
+    _next_evaluation_eta,
     _smooth,
     render_dashboard,
 )
@@ -173,6 +174,24 @@ def test_dashboard_formats_elapsed_time_compactly():
     assert _duration(42.0) == "42s"
     assert _duration(90.0) == "1.5m"
     assert _duration(7200.0) == "2.0h"
+
+
+def test_dashboard_estimates_next_eval_from_pace_since_checkpoint(tmp_path):
+    metrics = tmp_path / "metrics.csv"
+    (tmp_path / "config.toml").write_text(
+        "[run]\niterations = 500\ncheckpoint_every = 100\n"
+        "[evaluation]\nevery = 200\n"
+    )
+    checkpoints = tmp_path / "checkpoints"
+    checkpoints.mkdir()
+    (checkpoints / "iter_000100.pt").touch()
+    rows = [
+        {"iteration": "100", "total_sec": "10"},
+        {"iteration": "101", "total_sec": "20"},
+        {"iteration": "102", "total_sec": "30"},
+    ]
+
+    assert _next_evaluation_eta(rows, metrics) == (200, 98, 25.0, 100)
 
 
 def test_dashboard_uses_trailing_fifty_iteration_means_by_default():
