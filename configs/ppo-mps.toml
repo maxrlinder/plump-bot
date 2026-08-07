@@ -1,5 +1,5 @@
 [run]
-iterations = 6000
+iterations = 16000
 checkpoint_every = 100
 dashboard_every = 5
 device = "auto"
