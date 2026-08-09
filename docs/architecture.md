@@ -92,12 +92,10 @@ eligible decision through seven cards and tapers geometrically to rate `0.5`
 at ten cards under a fixed cache-row budget.
 
 The NeuRD preset contains 24 self-play deals and 24 anchor deals. The active
-local PPO profile instead contains 384 of each: 32 games for every one of the
-24 player/hand shapes. The anchor starts as the deterministic heuristic and
-changes to recent historical checkpoints after four consecutive positive
-sampled-policy evaluations. Heuristic games share the wave scheduler with
-self-play but allocate model state only for the focal learner, so opponent
-actions add no transformer forwards or KV rows.
+local PPO profile instead contains 768 current-policy self-play games: 32 games
+for every one of the 24 player/hand shapes. Every seat samples from and updates
+the shared actor. The deterministic heuristic remains available to the
+separate evaluator but is not used during collection.
 
 Bids use five distinct policy-mass strata and plays use four. If no more than
 that many actions are legal, every action is evaluated. Otherwise actions are

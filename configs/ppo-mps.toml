@@ -101,10 +101,11 @@ cache_budget_gb = 4.0
 auto_deals_per_batch = false
 deals_per_batch = 128
 max_deals_per_batch = 128
-# Keep a permanent fixed-policy anchor: half current-policy self-play and half
-# focal-policy games against the deterministic heuristic.
-opponent_mode = "heuristic"
-opponent_fraction = 0.5
+# Use the entire fixed 768-game budget for current-policy self-play. Every seat
+# samples on-policy and contributes PPO gradients; evaluation remains against
+# the deterministic heuristic independently of rollout opponent selection.
+opponent_mode = "off"
+opponent_fraction = 0.0
 opponent_packing = "concurrent"
 # On M5 Pro, BF16 transformer compute plus FP16 cached attention is the fastest
 # measured pair. BF16 cache was 17% slower and full FP16 compute 26% slower.

@@ -261,14 +261,14 @@ so a wide tree gets the full cache budget. `rollout.opponent_fraction`,
 `rollout.opponent_packing`, `rollout.deals_per_batch`, and
 `rollout.parallel_deals_max_hand_size` configure these behaviors.
 
-The current local PPO production profile uses 32 independent games for
-each of the 24 `(players, cards)` shapes: 768 complete games/update, split into
-384 self-play and 384 deterministic-heuristic anchor games. Equivalently, each
-player-count bucket gets 256 games across its eight hand sizes. PPO never
-branches. Every seat in a self-play game samples on-policy and contributes PPO
-gradients; only the focal sampled seat learns in a heuristic game.
-`deals_per_batch=128` is only a rollout wave capacity and does not change the
-768-game objective batch.
+The current local PPO production profile uses 32 independent self-play games
+for each of the 24 `(players, cards)` shapes: 768 complete games/update, with
+256 games in each player-count bucket across its eight hand sizes. PPO never
+branches. Every seat samples on-policy and contributes PPO gradients.
+Compared with the former 384-self/384-heuristic mix, this keeps the number of
+environment trajectories fixed while increasing actor decision rows from
+12,480 to 19,968 per update. `deals_per_batch=128` is only a rollout wave
+capacity and does not change the 768-game objective batch.
 
 Changing an adaptive entropy target resets its temperature and temperature
 optimizer to `ppo_entropy_coef`. Those are controller state for the previous
@@ -278,8 +278,9 @@ target can impose the old entropy floor for hundreds of updates.
 When historical mode is selected, five distinct checkpoints are sampled
 uniformly from every retained checkpoint at iteration 3500 or later. They are
 preloaded and assigned round-robin across historical batches, so a single
-checkpoint cannot dominate an update. The active local profile instead keeps
-the heuristic as a permanent fixed anchor.
+checkpoint cannot dominate an update. The active local profile uses only
+current-policy self-play for training rollouts; heuristic play is retained as
+the fixed evaluation benchmark.
 
 Training saves every 100 updates. Evaluation is due every 200 updates and
 always runs both reproducible policy sampling and deterministic argmax against
@@ -296,7 +297,7 @@ Launch the two detached processes together with:
 
 ```bash
 tools/run_training_pipeline.sh ppo-oracle-mps-768-v2 configs/ppo-mps.toml \
-  --reconfigure --reconfigure-reason "all-seat PPO plus heuristic anchor"
+  --reconfigure --reconfigure-reason "all-seat current-policy self-play"
 ```
 
 Omitting `--from-checkpoint` creates and records `iter_000000.pt`; the monitor
