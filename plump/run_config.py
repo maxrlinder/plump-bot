@@ -214,6 +214,9 @@ def resolve_training_config(raw: dict[str, Any]) -> ResolvedTraining:
         ppo_advantage_normalize=bool(
             training_raw.get("ppo_advantage_normalize", True)
         ),
+        ppo_actor_auxiliary_detach_hidden=bool(
+            training_raw.get("ppo_actor_auxiliary_detach_hidden", False)
+        ),
         ppo_entropy_mode=str(
             training_raw.get("ppo_entropy_mode", "adaptive")
         ),

@@ -191,6 +191,12 @@ by the policy loss. Each game has unit auxiliary mass, split across learned
 seats and then evenly across that observer's genuine token positions; padding
 has zero weight. This keeps auxiliary loss scale independent of sequence
 length without changing the deliberately length-weighted policy objective.
+The active MPS profile sets `ppo_actor_auxiliary_detach_hidden=true`: suit and
+final-trick readouts consume `hidden.detach()`, so their losses update only the
+auxiliary-head optimizer group. Embeddings, transformer blocks, final
+normalization, and bid/card action heads receive gradients only from the PPO
+policy/entropy objective. This option does not detach or freeze the separate
+oracle critic.
 For ten-card games, metrics report opponent-suit bit accuracy and exact
 per-seat final-trick accuracy immediately before the observer's first, fifth,
 and ninth play—after that observer has played 0, 4, and 8 cards.

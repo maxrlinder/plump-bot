@@ -59,6 +59,10 @@ ppo_critic_mode = "oracle"
 ppo_critic_learning_rate = 0.0003
 ppo_critic_epochs = 4
 ppo_advantage_normalize = true
+# Actor suit/final-trick heads are diagnostic probes: train their readout
+# parameters without letting those objectives reshape the policy trunk.
+# The independent oracle critic remains end-to-end trainable.
+ppo_actor_auxiliary_detach_hidden = true
 ppo_entropy_mode = "adaptive"
 ppo_entropy_coef = 0.01
 ppo_entropy_learning_rate = 0.001

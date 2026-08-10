@@ -631,7 +631,17 @@ Although the auxiliary readout parameters have their own optimizer group,
 their gradients also pass through the shared transformer. They can help the
 policy representation, but they are another reason the neural update is not a
 literal tabular policy-improvement proof. The KL guard observes their net
-effect on the policy.
+effect on the policy. This describes the counterfactual preset. The active PPO
+preset instead enables `ppo_actor_auxiliary_detach_hidden`: observer suit and
+final-trick heads receive $\operatorname{stopgrad}(h)$, so
+
+$$
+\frac{\partial L_{\text{actor-aux}}}{\partial h}=0.
+$$
+
+Those readout heads learn whatever is already decodable from the policy hidden
+state, but cannot reshape embeddings, transformer blocks, normalization, or
+action heads. PPO's independent oracle critic remains end-to-end trainable.
 
 ## 11. What one counterfactual local update contains
 
@@ -923,6 +933,9 @@ L_{aux}=\frac{1}{G}\sum_g\frac{1}{|C_g|}
 \sum_{i\in C_g}\frac{1}{L_{g,i}}\sum_{t=1}^{L_{g,i}}
 \ell_{aux}(h_{g,i,t}).
 $$
+
+With the active head-only setting, the loss value is unchanged but its input is
+treated as $\operatorname{stopgrad}(h_{g,i,t})$ for differentiation.
 
 Thus each game contributes equal auxiliary mass while longer games retain
 their requested larger policy mass. For ten-card games, evaluation of these

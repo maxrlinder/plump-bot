@@ -1318,6 +1318,11 @@ class SeqTrainer:
                 tokens = torch.from_numpy(group.tokens[start:stop]).to(self.device)
                 with autocast_context(self.device, self.train.precision):
                     hidden = model.forward_hidden(tokens)
+                auxiliary_hidden = (
+                    hidden.detach()
+                    if self.train.ppo_actor_auxiliary_detach_hidden
+                    else hidden
+                )
                 loss = torch.zeros((), device=self.device, dtype=torch.float32)
 
                 position_weight = torch.from_numpy(
@@ -1327,9 +1332,11 @@ class SeqTrainer:
 
                 if self.train.suit_coef > 0:
                     with autocast_context(self.device, self.train.precision):
-                        suit_logits = model.suit_presence_head(hidden).view(
-                            hidden.shape[0],
-                            hidden.shape[1],
+                        suit_logits = model.suit_presence_head(
+                            auxiliary_hidden
+                        ).view(
+                            auxiliary_hidden.shape[0],
+                            auxiliary_hidden.shape[1],
                             model.config.belief_opponents,
                             4,
                         )
@@ -1361,9 +1368,11 @@ class SeqTrainer:
 
                 if self.train.trick_coef > 0:
                     with autocast_context(self.device, self.train.precision):
-                        trick_logits = model.trick_count_head(hidden).view(
-                            hidden.shape[0],
-                            hidden.shape[1],
+                        trick_logits = model.trick_count_head(
+                            auxiliary_hidden
+                        ).view(
+                            auxiliary_hidden.shape[0],
+                            auxiliary_hidden.shape[1],
                             model.config.max_players,
                             model.config.bid_count,
                         )

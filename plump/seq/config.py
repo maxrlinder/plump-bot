@@ -856,6 +856,10 @@ class SeqTrainingConfig:
     ppo_critic_learning_rate: float = 3e-4
     ppo_critic_epochs: int = 4
     ppo_advantage_normalize: bool = True
+    # Head-only actor auxiliaries probe what the policy trunk already encodes
+    # without steering that representation. The independent PPO critic keeps
+    # its ordinary end-to-end gradients regardless of this setting.
+    ppo_actor_auxiliary_detach_hidden: bool = False
     # Entropy is normalized by log(number of legal actions), separately for
     # bids and plays. Forced decisions have no entropy target. In adaptive
     # mode, a learned positive temperature tracks the configured floor.

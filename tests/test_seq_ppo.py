@@ -45,6 +45,7 @@ def ppo_config(
     bucket_width=0,
     suit_coef=0.0,
     trick_coef=0.0,
+    detach_actor_auxiliary=False,
     policy_kl_cap=1.0,
     policy_kl_p99_cap=1.0,
 ):
@@ -63,6 +64,7 @@ def ppo_config(
         ppo_trainable_policies=actors,
         ppo_sequence_bucket_width=bucket_width,
         ppo_critic_epochs=critic_epochs,
+        ppo_actor_auxiliary_detach_hidden=detach_actor_auxiliary,
         microbatch_positions=512,
         policy_kl_cap=policy_kl_cap,
         policy_kl_p99_cap=policy_kl_p99_cap,
@@ -287,6 +289,7 @@ def test_ppo_actor_beliefs_and_oracle_trick_head_train_with_ten_card_stages():
         cells=(GameScheduleCell(hand_size=10, num_players=3, games=1),),
         suit_coef=0.1,
         trick_coef=0.1,
+        detach_actor_auxiliary=True,
     )
     trainer = SeqTrainer(SeqPlumpModel(MODEL), config, device="cpu")
     trees, _ = trainer.collect()
@@ -324,6 +327,45 @@ def test_ppo_actor_beliefs_and_oracle_trick_head_train_with_ten_card_stages():
     assert trainer.model.suit_presence_head.weight.grad is not None
     assert trainer.model.trick_count_head.weight.grad is not None
     assert trainer.critic.backbone.trick_count_head.weight.grad is not None
+    assert trainer.critic.backbone.final_norm.weight.grad is not None
+
+
+@pytest.mark.parametrize(
+    ("detach_actor_auxiliary", "expect_trunk_gradient"),
+    ((False, True), (True, False)),
+)
+def test_ppo_actor_auxiliary_hidden_detachment_isolates_policy_trunk(
+    detach_actor_auxiliary,
+    expect_trunk_gradient,
+):
+    config = replace(
+        ppo_config(
+            cells=(GameScheduleCell(hand_size=10, num_players=3, games=1),),
+            suit_coef=0.1,
+            trick_coef=0.1,
+            detach_actor_auxiliary=detach_actor_auxiliary,
+        ),
+        policy_coef=0.0,
+        ppo_entropy_mode="off",
+    )
+    trainer = SeqTrainer(SeqPlumpModel(MODEL), config, device="cpu")
+    trees, _ = trainer.collect()
+    batch = build_ppo_training_batch(trees, MODEL, config)
+    trainer.optimizer.zero_grad(set_to_none=True)
+
+    trainer._ppo_actor_backward(batch.policy_groups)
+
+    for head in (
+        trainer.model.suit_presence_head,
+        trainer.model.trick_count_head,
+    ):
+        assert head.weight.grad is not None
+        assert torch.count_nonzero(head.weight.grad) > 0
+    trunk_grad = trainer.model.final_norm.weight.grad
+    has_trunk_gradient = (
+        trunk_grad is not None and bool(torch.count_nonzero(trunk_grad))
+    )
+    assert has_trunk_gradient is expect_trunk_gradient
 
 
 def test_ppo_length_bucketing_merges_shapes_and_preserves_causal_readouts():

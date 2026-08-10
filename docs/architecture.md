@@ -76,7 +76,10 @@ The oracle also has a trainable feasibility-masked final-trick head on the
 same absolute-seat axis. Its suit-presence head stays frozen: every owner's
 remaining suits are directly recoverable from the perfect-information card
 prefix and public plays, so that task would be trivial. The observer-limited
-actor retains both nontrivial belief heads.
+actor retains both nontrivial belief heads. In the active PPO profile they are
+head-only probes: their inputs are detached from the actor hidden-state graph,
+so their losses train readout parameters without steering the policy trunk or
+action heads. The oracle critic is a separate network and keeps full gradients.
 
 Update-time sequences are tail-padded into configurable length buckets. With
 width 32, the 24 player/hand shapes coalesce into three actor lengths and four
