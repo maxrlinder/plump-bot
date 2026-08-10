@@ -288,7 +288,7 @@ checkpoint cannot dominate an update. The active local profile uses only
 current-policy self-play for training rollouts; heuristic play is retained as
 the fixed evaluation benchmark.
 
-Training saves every 100 updates. Evaluation is due every 200 updates and
+Training saves every 100 updates. Evaluation is due every 300 updates and
 always runs both reproducible policy sampling and deterministic argmax against
 the fixed heuristic deal bank. Both best-checkpoint selection and any optional
 heuristic-to-history gate use argmax reward by default.

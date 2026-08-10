@@ -992,7 +992,7 @@ loss. The production microbatch ceiling remains 16,384 positions because a
 larger ceiling raised memory use without a repeatable throughput gain.
 
 The trainer checkpoints every 100 updates. A separate restartable monitor
-evaluates every 200 updates and refreshes the dashboard every five metric rows.
+evaluates every 300 updates and refreshes the dashboard every five metric rows.
 Every automatic evaluation runs both sampled and deterministic-argmax policies
 on the same deal bank, yielding reward and bid accuracy for each while updates
 continue. The heuristic remains the evaluation benchmark even though it is no
