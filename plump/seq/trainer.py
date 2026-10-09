@@ -64,6 +64,11 @@ from .model import (
     load_seq_model_state_dict,
 )
 from .policy import SeqLeague, best_seq_device
+from .metal_trunk import (
+    DualTrunkPass,
+    metal_trunk_requested,
+    unsupported_reason as metal_trunk_unsupported_reason,
+)
 from .precision import autocast_context
 from .ppo import (
     PPO_BELIEF_STAGES,
@@ -1048,6 +1053,21 @@ class SeqTrainer:
                     list(self.log_entropy_alpha.values()),
                     lr=train_config.ppo_entropy_learning_rate,
                 )
+        # Fused Metal trunk: a runtime switch (PLUMP_METAL_TRUNK=1), not a
+        # training-config key, because it changes how the trunk is computed
+        # rather than what is trained -- results match the PyTorch path within
+        # bf16 rounding -- and a config key would make every existing
+        # checkpoint refuse to resume.
+        self.metal_trunk_enabled = (
+            metal_trunk_requested()
+            and self.device.type == "mps"
+            and train_config.precision == "bf16"
+            and metal_trunk_unsupported_reason(self.model.config) is None
+        )
+        if self.metal_trunk_enabled:
+            for trunk_model in (*self.models, getattr(self.critic, "backbone", None)):
+                if trunk_model is not None:
+                    trunk_model.enable_metal_trunk()
         self.league = SeqLeague(
             train_config.league_max_snapshots,
             train_config.league_min_iteration,
@@ -1754,17 +1774,48 @@ class SeqTrainer:
     def _auxiliary_budget_active(self) -> bool:
         return self.train.ppo_auxiliary_grad_fraction > 0
 
+    def _dual_trunk_backward(self, model: SeqPlumpModel, tokens: torch.Tensor) -> bool:
+        """Whether this microbatch's two objectives share one fused backward.
+
+        Only worth it when the budget keeps the halves separate (otherwise
+        they are summed and differentiated once anyway) and both reach the
+        trunk (a detached auxiliary half never does).
+        """
+
+        return (
+            self._auxiliary_budget_active()
+            and not self.train.ppo_actor_auxiliary_detach_hidden
+            and model.uses_metal_trunk(tokens)
+        )
+
     def _backward_actor_losses(
-        self, auxiliary_loss: torch.Tensor, policy_loss: torch.Tensor
+        self,
+        auxiliary_loss: torch.Tensor,
+        policy_loss: torch.Tensor,
+        dual: DualTrunkPass | None = None,
     ) -> None:
         """Backward one microbatch, keeping the two objectives separable.
 
         Without a budget the halves are summed and differentiated once. With
         one, request each gradient directly and accumulate it in its own
-        buffers. The shared trunk still receives two backwards, but there is
-        no intermediate parameter.grad allocation or first-microbatch clone.
+        buffers. Through autograd the shared trunk receives two backwards;
+        a ``DualTrunkPass`` runs one fused trunk backward for both halves and
+        hands back the same two gradient lists.
         """
 
+        if dual is not None:
+            auxiliary, policy = dual.gradients(
+                [auxiliary_loss, policy_loss], self._actor_parameters
+            )
+            if auxiliary is not None:
+                self._auxiliary_grads = self._accumulate_actor_grads(
+                    self._auxiliary_grads, auxiliary
+                )
+            if policy is not None:
+                self._policy_grads = self._accumulate_actor_grads(
+                    self._policy_grads, policy
+                )
+            return
         if not self._auxiliary_budget_active():
             total = auxiliary_loss + policy_loss
             if total.requires_grad:
@@ -1891,8 +1942,13 @@ class SeqTrainer:
                 chunks, ppo_rows_by_chunk(group, chunks)
             ):
                 tokens = torch.from_numpy(group.tokens[start:stop]).to(self.device)
+                dual = None
                 with autocast_context(self.device, self.train.precision):
-                    hidden = model.forward_hidden(tokens)
+                    if self._dual_trunk_backward(model, tokens):
+                        dual = DualTrunkPass(model, model.metal_trunk, tokens)
+                        hidden = dual.hidden
+                    else:
+                        hidden = model.forward_hidden(tokens)
                 auxiliary_hidden = (
                     hidden.detach()
                     if self.train.ppo_actor_auxiliary_detach_hidden
@@ -2371,7 +2427,7 @@ class SeqTrainer:
                     totals["logit_shift"].append(
                         (weight * logit_shift).sum().detach()
                     )
-                self._backward_actor_losses(loss, policy_objective)
+                self._backward_actor_losses(loss, policy_objective, dual)
 
         reduced = {
             key: math.fsum(float(value) for value in values)

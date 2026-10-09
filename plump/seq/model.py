@@ -29,6 +29,12 @@ from .config import (
     SeqModelConfig,
 )
 from .kv import KVCache
+from .metal_trunk import (
+    MAX_LENGTH as METAL_TRUNK_MAX_LENGTH,
+    MetalTrunk,
+    run_trunk as run_metal_trunk,
+    trunk_parameters as metal_trunk_parameters,
+)
 
 # Auxiliary heads, selectable one by one in forward_full: a caller whose loss
 # weights one at zero should not pay for its forward or its backward.
@@ -402,6 +408,9 @@ class SeqPlumpModel(nn.Module):
         super().__init__()
         self._card_input_weight_cache: torch.Tensor | None = None
         self._card_output_weight_cache: torch.Tensor | None = None
+        # Optional fused Metal trunk (plump.seq.metal_trunk), switched on by
+        # the trainer. A plain attribute: it holds no state of its own.
+        self.metal_trunk = None
         config.validate()
         self.config = config
         d = config.d_model
@@ -1166,8 +1175,28 @@ class SeqPlumpModel(nn.Module):
         """Full causal trunk without materializing any readout head."""
 
         x = self.embed(tokens)
+        if self.uses_metal_trunk(tokens):
+            return run_metal_trunk(self, self.metal_trunk, tokens, x)
         x = self._run_blocks_full(tokens, x)
         return self.final_norm(x)
+
+    def enable_metal_trunk(self) -> None:
+        """Route bf16 MPS trunk forwards (and their backwards) through Metal."""
+
+        self.metal_trunk = MetalTrunk(self.config, eps=self.final_norm.eps)
+
+    def uses_metal_trunk(self, tokens: torch.Tensor) -> bool:
+        """The fused kernels hard-code bf16 GEMMs, so they only stand in for
+        the trunk under bf16 autocast on MPS; anything else (fp32 training,
+        CPU evaluation) keeps the PyTorch path."""
+
+        return (
+            self.metal_trunk is not None
+            and tokens.device.type == "mps"
+            and tokens.shape[1] <= METAL_TRUNK_MAX_LENGTH
+            and torch.is_autocast_enabled("mps")
+            and torch.get_autocast_dtype("mps") == torch.bfloat16
+        )
 
     def policy_logits(self, hidden: torch.Tensor, phase: str) -> torch.Tensor:
         """Evaluate only the requested action head on selected hidden rows."""
@@ -1391,10 +1420,27 @@ class SeqPlumpModel(nn.Module):
             embed_positions = write_positions.clamp(
                 max=self.config.max_seq_len - 1
             )
+        x = self.embed(tokens, start=embed_positions)
+        if (
+            slots is None
+            and self.uses_metal_trunk(tokens)
+            and self.metal_trunk.decode_supported(cache)
+        ):
+            ple, values = self._prepare_layer_conditioning(
+                tokens, x, embed_positions
+            )
+            # Final-norm output for every appended token; a row's padding
+            # past its own run is computed and dropped, as below.
+            normed = self.metal_trunk.decode(
+                x, ple, values, cache, positions, metal_trunk_parameters(self)
+            )
+            if readout_offsets is None:
+                return normed[:, -1]
+            rows = torch.arange(normed.shape[0], device=normed.device)
+            return normed[rows, readout_offsets]
         # Every row's own next write is at its current length, so the read has
         # to cover the longest row in the batch plus the whole run.
         span = min(int(positions.max()) + length, cache.max_len)
-        x = self.embed(tokens, start=embed_positions)
         x = self._run_blocks_cached(
             tokens,
             x,
