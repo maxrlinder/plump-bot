@@ -19,7 +19,11 @@ from plump.seq.config import (
     SeqModelConfig,
     SeqTrainingConfig,
 )
-from plump.seq.model import STRUCTURED_CARD_OUTPUT_KEYS, SeqPlumpModel
+from plump.seq.model import (
+    RANK_BOUNDARY_HEAD_KEYS,
+    STRUCTURED_CARD_OUTPUT_KEYS,
+    SeqPlumpModel,
+)
 from plump.seq.policy import SeqLeague, SeqModelPolicy
 from plump.seq.tokens import IGNORE_LABEL
 from plump.seq.trainer import (
@@ -73,6 +77,33 @@ def test_group_weights_normalize_to_one():
     assert policy_weight_total == pytest.approx(1.0)
 
 
+def test_counterfactual_dense_losses_start_after_card_tokens():
+    trainer = make_trainer(
+        dense_supervision_start="bidding",
+        value_positions="all",
+    )
+    trees, _ = trainer.collect()
+    groups = build_training_groups(trees, MODEL_CONFIG, trainer.train)
+
+    assert sum(float(group.position_weight.sum()) for group in groups) == (
+        pytest.approx(1.0)
+    )
+    assert sum(float(group.value_weight.sum()) for group in groups) == (
+        pytest.approx(1.0)
+    )
+    for group in groups:
+        start = MODEL_CONFIG.actor_post_deal_position(group.hand_size)
+        assert np.all(group.position_weight[:, :start] == 0)
+        assert np.all(group.value_weight[:, :start] == 0)
+        nonzero_rows, nonzero_positions = np.nonzero(group.position_weight)
+        assert nonzero_rows.size > 0
+        assert np.all(nonzero_positions >= start)
+        assert np.array_equal(
+            group.value_weight > 0,
+            group.position_weight > 0,
+        )
+
+
 def test_value_weights_match_focal_policy_rows_only():
     trainer = make_trainer(branch_depth_exponent=-0.5)
     trees, _ = trainer.collect()
@@ -122,7 +153,7 @@ def test_rollout_summary_separates_focal_and_non_focal_outcomes():
 def test_update_produces_finite_losses_and_changes_weights():
     # Trick count on as well, so every label path stays exercised even though
     # the default objective leaves it at zero.
-    trainer = make_trainer(trick_coef=0.25)
+    trainer = make_trainer(trick_coef=0.25, next_winner_coef=0.25)
     trees, summary = trainer.collect()
     assert summary.trees == len(trees)
     before = [p.detach().clone() for p in trainer.model.parameters()]
@@ -134,9 +165,11 @@ def test_update_produces_finite_losses_and_changes_weights():
     assert np.isfinite(stats.value_correlation)
     assert stats.value_rows == stats.policy_rows
     assert np.isfinite(stats.loss_trick)
+    assert np.isfinite(stats.loss_next_winner)
     assert np.isfinite(stats.loss_suit)
     assert np.isfinite(stats.loss_bid_hit)
     assert stats.loss_trick > 0.0
+    assert stats.loss_next_winner > 0.0
     assert stats.loss_suit > 0.0
     assert stats.loss_bid_hit > 0.0
     assert stats.loss_value_zero > 0.0
@@ -168,12 +201,15 @@ def test_kl_cap_rolls_back_the_epoch():
 def test_update_with_belief_losses_disabled_is_policy_value_only():
     """NeuRD plus value only: disabled auxiliary heads never run."""
 
-    trainer = make_trainer(suit_coef=0.0, trick_coef=0.0, bid_hit_coef=0.0)
+    trainer = make_trainer(
+        suit_coef=0.0, trick_coef=0.0, bid_hit_coef=0.0, next_winner_coef=0.0
+    )
     trees, _ = trainer.collect()
     before = [p.detach().clone() for p in trainer.model.parameters()]
     stats = trainer.update(trees)
     assert stats.loss_suit == 0.0
     assert stats.loss_trick == 0.0
+    assert stats.loss_next_winner == 0.0
     assert stats.loss_bid_hit == 0.0
     assert np.isfinite(stats.loss_value)
     assert np.isfinite(stats.loss_policy)
@@ -396,7 +432,7 @@ def test_kl_backtracking_accepts_a_smaller_adam_step(monkeypatch):
     assert attempted_lrs[-1][1] == pytest.approx(trainer.train.auxiliary_lr)
 
 
-def test_core_and_auxiliary_gradients_are_clipped_independently(monkeypatch):
+def test_the_actor_is_clipped_as_a_single_parameter_group(monkeypatch):
     trainer = make_trainer(trick_coef=0.25)
     trees, _ = trainer.collect()
     calls = []
@@ -410,13 +446,17 @@ def test_core_and_auxiliary_gradients_are_clipped_independently(monkeypatch):
     monkeypatch.setattr(torch.nn.utils, "clip_grad_norm_", record)
     stats = trainer.update(trees)
 
-    assert len(calls) == 2
-    assert calls[0].isdisjoint(calls[1])
-    assert calls[0] | calls[1] == {
-        id(parameter) for parameter in trainer.model.parameters()
-    }
+    # One clip, covering every actor parameter: no part of the model can be
+    # rescaled independently of the rest.
+    assert len(calls) == 1
+    assert calls[0] == {id(parameter) for parameter in trainer.model.parameters()}
     assert np.isfinite(stats.core_grad_norm)
-    assert np.isfinite(stats.auxiliary_grad_norm)
+    # The component norms are still reported, as pre-clip diagnostics.
+    assert stats.embedding_grad_norm > 0.0
+    assert stats.auxiliary_grad_norm > 0.0
+    # Sub-norms of one global norm, so neither can exceed it.
+    assert stats.embedding_grad_norm <= stats.core_grad_norm + 1e-4
+    assert stats.auxiliary_grad_norm <= stats.core_grad_norm + 1e-4
 
 
 def test_proven_early_p99_rejection_matches_full_backtracking(monkeypatch):
@@ -551,16 +591,29 @@ def test_pre_structured_card_output_checkpoint_migrates_model_and_adam(tmp_path)
     payload.pop("model_format_version")
 
     optimizer = payload["optimizer_state_dict"]
-    new_output_ids = optimizer["param_groups"][0]["params"][-2:]
-    old_core_ids = optimizer["param_groups"][0]["params"][:-2]
-    current_auxiliary_ids = optimizer["param_groups"][1]["params"]
-    old_auxiliary_ids = [
-        parameter_id - 2 for parameter_id in current_auxiliary_ids
-    ]
-    identifier_map = {
-        **{parameter_id: parameter_id for parameter_id in old_core_ids},
-        **dict(zip(current_auxiliary_ids, old_auxiliary_ids)),
+    named = dict(trainer.model.named_parameters())
+    live_core = trainer.optimizer.param_groups[0]["params"]
+    serialized_core = optimizer["param_groups"][0]["params"]
+    id_by_parameter = {
+        id(parameter): parameter_id
+        for parameter, parameter_id in zip(live_core, serialized_core)
     }
+    new_output_ids = {
+        id_by_parameter[id(named[key])] for key in STRUCTURED_CARD_OUTPUT_KEYS
+    }
+    old_core_ids = [
+        parameter_id
+        for parameter_id in serialized_core
+        if parameter_id not in new_output_ids
+    ]
+    current_auxiliary_ids = optimizer["param_groups"][1]["params"]
+    kept_ids = [*old_core_ids, *current_auxiliary_ids]
+    identifier_map = {
+        parameter_id: migrated_id
+        for migrated_id, parameter_id in enumerate(kept_ids)
+    }
+    old_core_ids = [identifier_map[value] for value in old_core_ids]
+    old_auxiliary_ids = [identifier_map[value] for value in current_auxiliary_ids]
     optimizer["state"] = {
         identifier_map[parameter_id]: state
         for parameter_id, state in optimizer["state"].items()
@@ -585,6 +638,42 @@ def test_pre_structured_card_output_checkpoint_migrates_model_and_adam(tmp_path)
     policy = SeqModelPolicy.from_checkpoint(old, device="cpu")
     assert torch.count_nonzero(policy.model.card_rank_output_embedding.weight) == 0
     assert torch.count_nonzero(policy.model.card_suit_output_embedding.weight) == 0
+
+
+def test_pre_rank_boundary_checkpoint_keeps_existing_adam_and_random_head(tmp_path):
+    trainer = make_trainer(lr_warmup_updates=0)
+    trees, _ = trainer.collect()
+    trainer.update(trees)
+    current = tmp_path / "current.pt"
+    trainer.save_checkpoint(current)
+    payload = torch.load(current, map_location="cpu", weights_only=False)
+
+    for key in RANK_BOUNDARY_HEAD_KEYS:
+        del payload["model_state_dict"][key]
+    payload["model_format_version"] = 2
+    optimizer = payload["optimizer_state_dict"]
+    rank_parameter_ids = optimizer["param_groups"][1]["params"][-2:]
+    optimizer["param_groups"][1]["params"] = optimizer["param_groups"][1][
+        "params"
+    ][:-2]
+    for parameter_id in rank_parameter_ids:
+        optimizer["state"].pop(parameter_id, None)
+
+    old = tmp_path / "format2.pt"
+    torch.save(payload, old)
+    fresh = make_trainer(lr_warmup_updates=0)
+    random_head = {
+        key: fresh.model.state_dict()[key].clone()
+        for key in RANK_BOUNDARY_HEAD_KEYS
+    }
+    fresh.load_checkpoint(old)
+
+    for key, expected in payload["model_state_dict"].items():
+        torch.testing.assert_close(fresh.model.state_dict()[key], expected)
+    for key, expected in random_head.items():
+        torch.testing.assert_close(fresh.model.state_dict()[key], expected)
+    assert fresh.model.rank_boundary_head.weight not in fresh.optimizer.state
+    assert fresh.model.rank_boundary_head.bias not in fresh.optimizer.state
 
 
 def test_inclusion_exponent_changes_the_gradient_it_does_not_break_it():

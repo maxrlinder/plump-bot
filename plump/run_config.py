@@ -74,6 +74,19 @@ def resolve_training_config(raw: dict[str, Any]) -> ResolvedTraining:
         d_ff=int(model_raw["d_ff"]),
         trick_win_token=bool(model_raw["trick_win_token"]),
         turn_token=str(model_raw["turn_token"]),
+        per_layer_embedding_dim=int(
+            model_raw.get("per_layer_embedding_dim", 0)
+        ),
+        value_embedding_mode=str(
+            model_raw.get("value_embedding_mode", "off")
+        ),
+        embedding_rms_norm=bool(model_raw.get("embedding_rms_norm", False)),
+        card_embedding_mode=str(
+            model_raw.get("card_embedding_mode", "dense")
+        ),
+        absolute_position_embedding=bool(
+            model_raw.get("absolute_position_embedding", True)
+        ),
     )
 
     training_raw = raw["training"]
@@ -175,6 +188,12 @@ def resolve_training_config(raw: dict[str, Any]) -> ResolvedTraining:
             opponent_fraction=opponent_fraction,
             opponent_packing=opponent_packing,
             bid_position_mode=str(rollout_raw.get("bid_position_mode", "cycle")),
+            merged_waves=bool(rollout_raw.get("merged_waves", False)),
+            merged_max_rows=(
+                None
+                if rollout_raw.get("merged_max_rows") is None
+                else int(rollout_raw["merged_max_rows"])
+            ),
         ),
         learning_rate=float(training_raw["learning_rate"]),
         core_learning_rate=(
@@ -191,7 +210,19 @@ def resolve_training_config(raw: dict[str, Any]) -> ResolvedTraining:
         epochs=int(training_raw["epochs"]),
         microbatch_positions=int(training_raw["microbatch_positions"]),
         policy_objective=str(training_raw["policy_objective"]),
+        updates_per_collect=int(training_raw.get("updates_per_collect", 1)),
+        distill_teacher_checkpoint=str(
+            training_raw.get("distill_teacher_checkpoint", "")
+        ),
+        distill_rollout_policy=str(
+            training_raw.get("distill_rollout_policy", "student")
+        ),
+        distill_policy_coef=float(training_raw.get("distill_policy_coef", 1.0)),
+        distill_value_coef=float(training_raw.get("distill_value_coef", 1.0)),
+        distill_aux_coef=float(training_raw.get("distill_aux_coef", 1.0)),
+        distill_temperature=float(training_raw.get("distill_temperature", 1.0)),
         ppo_clip_ratio=float(training_raw.get("ppo_clip_ratio", 0.1)),
+        ppo_trust_region=bool(training_raw.get("ppo_trust_region", True)),
         ppo_trainable_policies=int(
             training_raw.get("ppo_trainable_policies", 1)
         ),
@@ -204,6 +235,11 @@ def resolve_training_config(raw: dict[str, Any]) -> ResolvedTraining:
         ppo_sequence_bucket_width=int(
             training_raw.get("ppo_sequence_bucket_width", 0)
         ),
+        ppo_critic_sequence_bucket_width=(
+            None
+            if training_raw.get("ppo_critic_sequence_bucket_width") is None
+            else int(training_raw["ppo_critic_sequence_bucket_width"])
+        ),
         ppo_critic_mode=str(
             training_raw.get("ppo_critic_mode", "oracle")
         ),
@@ -211,11 +247,27 @@ def resolve_training_config(raw: dict[str, Any]) -> ResolvedTraining:
             training_raw.get("ppo_critic_learning_rate", 3e-4)
         ),
         ppo_critic_epochs=int(training_raw.get("ppo_critic_epochs", 4)),
+        ppo_advantage_estimator=str(
+            training_raw.get("ppo_advantage_estimator", "monte_carlo")
+        ),
+        ppo_gae_lambda=float(training_raw.get("ppo_gae_lambda", 0.95)),
         ppo_advantage_normalize=bool(
             training_raw.get("ppo_advantage_normalize", True)
         ),
         ppo_actor_auxiliary_detach_hidden=bool(
             training_raw.get("ppo_actor_auxiliary_detach_hidden", False)
+        ),
+        ppo_actor_value_coef=float(
+            training_raw.get("ppo_actor_value_coef", 0.0)
+        ),
+        ppo_auxiliary_grad_fraction=float(
+            training_raw.get("ppo_auxiliary_grad_fraction", 0.0)
+        ),
+        ppo_auxiliary_positions=str(
+            training_raw.get("ppo_auxiliary_positions", "policy")
+        ),
+        dense_supervision_start=str(
+            training_raw.get("dense_supervision_start", "sequence")
         ),
         ppo_entropy_mode=str(
             training_raw.get("ppo_entropy_mode", "adaptive")
@@ -229,6 +281,27 @@ def resolve_training_config(raw: dict[str, Any]) -> ResolvedTraining:
         ),
         ppo_play_entropy_target=float(
             training_raw.get("ppo_play_entropy_target", 0.60)
+        ),
+        ppo_entropy_target_schedule=str(
+            training_raw.get("ppo_entropy_target_schedule", "constant")
+        ),
+        ppo_entropy_schedule_start_iteration=int(
+            training_raw.get("ppo_entropy_schedule_start_iteration", 0)
+        ),
+        ppo_entropy_schedule_end_iteration=int(
+            training_raw.get("ppo_entropy_schedule_end_iteration", 0)
+        ),
+        ppo_bid_entropy_target_end=float(
+            training_raw.get(
+                "ppo_bid_entropy_target_end",
+                training_raw.get("ppo_bid_entropy_target", 0.65),
+            )
+        ),
+        ppo_play_entropy_target_end=float(
+            training_raw.get(
+                "ppo_play_entropy_target_end",
+                training_raw.get("ppo_play_entropy_target", 0.60),
+            )
         ),
         policy_coef=float(training_raw["policy_coef"]),
         policy_kl_cap=float(training_raw["policy_kl_cap"]),
@@ -258,8 +331,15 @@ def resolve_training_config(raw: dict[str, Any]) -> ResolvedTraining:
         value_reward_scale=float(training_raw.get("value_reward_scale", 5.0)),
         value_coef=float(training_raw["value_coef"]),
         suit_coef=float(training_raw["suit_coef"]),
+        rank_boundary_coef=float(
+            training_raw.get("rank_boundary_coef", 0.0)
+        ),
         bid_hit_coef=float(training_raw["bid_hit_coef"]),
         trick_coef=float(training_raw["trick_coef"]),
+        next_winner_coef=float(training_raw.get("next_winner_coef", 0.0)),
+        oracle_card_order_coef=float(
+            training_raw.get("oracle_card_order_coef", 0.0)
+        ),
         entropy_coef=float(training_raw["entropy_coef"]),
         use_kv_cache=bool(training_raw.get("use_kv_cache", True)),
         precision=str(training_raw.get("precision", "fp32")),

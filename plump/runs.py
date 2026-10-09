@@ -42,6 +42,8 @@ class RunDirectory:
         self.checkpoints = self.path / "checkpoints"
         self.evaluations = self.path / "evaluations"
         self.analysis = self.path / "analysis"
+        self.tournaments = self.path / "tournaments"
+        self.tournament_dashboard = self.tournaments / "dashboard.png"
         self.metrics = self.path / "metrics.csv"
         self.dashboard = self.path / "dashboard.png"
         self.evaluation_dashboard = self.path / "dashboard-eval.png"

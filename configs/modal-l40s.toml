@@ -12,6 +12,8 @@ n_kv_heads = 2
 d_ff = 1152
 trick_win_token = true
 turn_token = "bid"
+per_layer_embedding_dim = 0
+value_embedding_mode = "off"
 
 [training]
 seed = 0
@@ -57,11 +59,14 @@ kl_backtrack_factor = 0.5
 branch_depth_exponent = -0.5
 value_objective = "mse"
 value_positions = "policy"
+dense_supervision_start = "sequence"
 value_reward_scale = 5.0
 value_coef = 0.5
 suit_coef = 0.05
+rank_boundary_coef = 0.0
 bid_hit_coef = 0.0
 trick_coef = 0.05
+oracle_card_order_coef = 0.0
 entropy_coef = 0.0
 league_max_snapshots = 8
 league_min_iteration = 0

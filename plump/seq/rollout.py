@@ -50,6 +50,7 @@ from .tokens import (
     emits_token,
     event_token,
     prefix_tokens,
+    set_na_patterns,
     set_remaining_hand,
     turn_token,
     turn_token_for_phase,
@@ -184,6 +185,10 @@ class SeqLeaf:
     terminal_value: Optional[float] = None
     terminal_rewards: Optional[dict[int, float]] = None
     covered_until: int = 0
+    # Tokens this leaf has written to its own cache rows. A lockstep loop reads
+    # this off the wave's shared counter; a merged loop cannot, because its
+    # rows hold games of different shapes at different lengths.
+    cache_length: int = 0
     # Cache-free mode only: [num_players, max_len, TOKEN_WIDTH] token history
     # re-encoded from scratch at every decision.
     history: Optional[np.ndarray] = None
@@ -420,7 +425,11 @@ class SeqRolloutCollector:
                 device=self.device,
             )
         opponent_counts = self._opponent_games_by_cell(phase)
-        for cell_index, cell in enumerate(self.train.schedule_cells):
+        if self.merged_waves_available(opponent_counts):
+            trees = self._collect_merged(rng)
+            self._finish_collect(trees, started)
+            return trees
+        for cell_index, cell in enumerate(self.train.collection_schedule_cells):
             opponent_games = opponent_counts[cell_index]
             arms = [
                 (
@@ -459,6 +468,10 @@ class SeqRolloutCollector:
                 trees.extend(batch)
                 remaining -= deals
                 offset += deals
+        self._finish_collect(trees, started)
+        return trees
+
+    def _finish_collect(self, trees: list[SeqTree], started: float) -> None:
         self.stats.collect_sec = time.perf_counter() - started
         self.stats.bytes_per_row = self._bytes_per_row()
         self.stats.cache_rows_allocated = sum(
@@ -467,12 +480,11 @@ class SeqRolloutCollector:
         self.stats.trees = len(trees)
         self.stats.leaves = sum(tree.leaf_total for tree in trees)
         self.stats.decisions = sum(tree.decision_total for tree in trees)
-        return trees
 
     def _opponent_games_by_cell(self, phase: str) -> list[int]:
         """Largest-remainder split of the fixed schedule into self/anchor games."""
 
-        cells = self.train.schedule_cells
+        cells = self.train.collection_schedule_cells
         if phase == "off" or self.train.rollout.opponent_fraction <= 0.0:
             return [0] * len(cells)
         fraction = self.train.rollout.opponent_fraction
@@ -877,6 +889,468 @@ class SeqRolloutCollector:
         for cache in self._caches.values():
             cache.reset()
         self._split_plan = None
+
+    # ------------------------------------------------------------------ #
+    # Merged waves: one continuously-batched loop over the whole schedule #
+    # ------------------------------------------------------------------ #
+
+    def merged_waves_available(self, opponent_counts: list[int]) -> bool:
+        """Whether this iteration can run as one continuously-batched loop.
+
+        Merging rests on two invariants the general wave loop does not keep:
+        every live row belongs to the single current policy, and the live rows
+        are a dense prefix of the pool. Branching, bid splits, heuristic and
+        historical arms and a multi-policy pool each break one of them, so the
+        answer is a predicate rather than a validation error -- a run that
+        turns branching back on simply stops merging.
+        """
+
+        options = self.train.rollout
+        return (
+            options.merged_waves
+            and self.use_cache
+            and self.train.policy_objective == "ppo"
+            and len(self.trainable_models) == 1
+            and not any(opponent_counts)
+        )
+
+    @staticmethod
+    def _decision_waves(num_players: int, hand_size: int) -> int:
+        """Waves a deal of this shape survives.
+
+        Every seat bids, then every seat plays each trick except the last: once
+        one hand is down to a single card every remaining play is forced and
+        ``_advance_leaf`` runs the tail out without a decision. So P bids plus
+        P * (H - 1) plays. Only the *order* this induces matters -- it is what
+        lets games retire from the tail of the pool and keeps the live rows
+        dense -- and ``_compact_live`` repairs the layout if a shape ever
+        retires out of turn.
+        """
+
+        return num_players * hand_size
+
+    def _new_self_tree(
+        self,
+        num_players: int,
+        hand_size: int,
+        env: PlumpEnv,
+        bidding_start: int,
+        focal: int,
+    ) -> SeqTree:
+        policy_count = len(self.trainable_models)
+        offset = self._policy_cursor % policy_count
+        self._policy_cursor += 1
+        return SeqTree(
+            arm="self",
+            focal=focal,
+            num_players=num_players,
+            hand_size=hand_size,
+            bidding_start_player=bidding_start,
+            initial_hands={
+                player: list(hand)
+                for player, hand in env.state.current_round.initial_hands.items()
+            },
+            seat_policy_ids={
+                seat: self._current_policy_id((offset + seat) % policy_count)
+                for seat in range(num_players)
+            },
+        )
+
+    def _collect_merged(self, rng: random.Random) -> list[SeqTree]:
+        """Deal the whole schedule, then decode it in as few loops as fit."""
+
+        started = time.perf_counter()
+        entries: list[tuple[SeqTree, PlumpEnv, tuple]] = []
+        for cell in self.train.collection_schedule_cells:
+            num_players = self._sample_players(cell, rng)
+            cost = self.stats.by_shape.setdefault(
+                (num_players, cell.hand_size), ShapeCost()
+            )
+            cost.deals += cell.games
+            cost.batches += 1
+            for _ in range(cell.games):
+                env, start, seed = self._new_deal(num_players, cell.hand_size, rng)
+                focal = self._focal_seat(cell, num_players, rng, start)
+                tree = self._new_self_tree(
+                    num_players, cell.hand_size, env, start, focal
+                )
+                entries.append(
+                    (tree, env, random.Random(seed ^ 0x5EED).getstate())
+                )
+        self.stats.games += len(entries)
+
+        # Longest-lived games first. Every leaf of a shape retires on the same
+        # wave, so descending retirement order makes the live set a dense
+        # prefix of the pool -- which is what keeps the merged read a zero-copy
+        # slice instead of a per-row gather (measured 1.65x at width 2048).
+        entries.sort(
+            key=lambda entry: -self._decision_waves(
+                entry[0].num_players, entry[0].hand_size
+            )
+        )
+
+        cap = self.train.rollout.merged_max_rows or self._row_cap()
+        chunk: list[tuple[SeqTree, PlumpEnv, tuple]] = []
+        rows = 0
+        for entry in entries:
+            players = entry[0].num_players
+            if chunk and rows + players > cap:
+                self._run_merged_loop(chunk)
+                chunk, rows = [], 0
+            chunk.append(entry)
+            rows += players
+        if chunk:
+            self._run_merged_loop(chunk)
+
+        # A merged loop has no per-shape wall time to report, so split its cost
+        # the way the loop actually spent it: by row-steps.
+        elapsed = time.perf_counter() - started
+        weights = {
+            shape: cost.deals * shape[0] * self._decision_waves(*shape)
+            for shape, cost in self.stats.by_shape.items()
+        }
+        total = sum(weights.values()) or 1
+        for shape, cost in self.stats.by_shape.items():
+            cost.sec += elapsed * weights[shape] / total
+        return [tree for tree, _, _ in entries]
+
+    def _run_merged_loop(
+        self, unit: list[tuple[SeqTree, PlumpEnv, tuple]]
+    ) -> None:
+        """Advance every deal of ``unit`` together, each at its own length."""
+
+        policy_id = self._current_policy_id(0)
+        model = self._trainable_model_map[policy_id]
+        total_rows = sum(tree.num_players for tree, _, _ in unit)
+        # One slot past the longest game absorbs the padding a mixed-length
+        # wave writes; see forward_step_ragged.
+        self._ensure_cache(
+            policy_id,
+            total_rows,
+            self.model_config.max_seq_len + 1,
+            max(total_rows, self._row_cap()),
+        )
+        cache = self._caches[policy_id]
+
+        leaves: list[SeqLeaf] = []
+        row = 0
+        for tree, deal_env, crn_state in unit:
+            leaf = SeqLeaf(
+                env=deal_env.clone_for_rollout(),
+                tree=tree,
+                rng=_rng_from_state(crn_state),
+                slots={
+                    seat: (policy_id, row + seat)
+                    for seat in range(tree.num_players)
+                },
+                owned_from=0,
+                on_policy_spine=True,
+                upstream=None,
+            )
+            row += tree.num_players
+            tree.leaf_total = 1
+            tree.leaves_by_bid_group[0] = 1
+            self._total_leaves += 1
+            leaves.append(leaf)
+
+        self._merged_prefill(leaves, model, cache, policy_id)
+        alive = leaves
+        live_rows = total_rows
+        while alive:
+            t0 = time.perf_counter()
+            by_phase: dict[Phase, list[SeqLeaf]] = {}
+            for leaf in alive:
+                by_phase.setdefault(leaf.env.phase(), []).append(leaf)
+            drawn: list[tuple[SeqLeaf, Phase, np.ndarray, int]] = []
+            for phase, group in by_phase.items():
+                probs, sampled, _ = self._batch_sample(group, phase)
+                drawn.extend(
+                    (leaf, phase, probs[index], int(sampled[index]))
+                    for index, leaf in enumerate(group)
+                )
+            t1 = time.perf_counter()
+            appends: list[tuple[SeqLeaf, list[GameEvent]]] = []
+            alive_next: list[SeqLeaf] = []
+            for leaf, phase, probs, sampled in drawn:
+                self._decide_and_step_merged(
+                    leaf, phase, probs, sampled, appends, alive_next
+                )
+            t2 = time.perf_counter()
+            self.stats.sample_sec += t1 - t0
+            self.stats.step_sec += t2 - t1
+            self.stats.peak_cache_rows = max(self.stats.peak_cache_rows, live_rows)
+            self._record_peak_memory()
+            # ``alive`` is kept in row order, never replaced by the
+            # phase-grouped ``alive_next``: the merged read is a dense slice of
+            # the pool, so reordering the live list would mean physically
+            # reordering the pool behind it, every wave.
+            if len(alive_next) != len(alive):
+                survivors = {id(leaf) for leaf in alive_next}
+                alive = [leaf for leaf in alive if id(leaf) in survivors]
+                live_rows = self._compact_live(cache, alive)
+                self.stats.compact_sec += time.perf_counter() - t2
+            if appends:
+                self._append_merged_wave(
+                    appends, model, cache, policy_id, live_rows
+                )
+
+        # ``_rows_per_deal`` deliberately not updated: it sizes a lockstep
+        # batch of one shape, and a merged unit holds several.
+        cache.reset()
+
+    def _record_peak_memory(self) -> None:
+        if self.device.type == "mps":
+            self.stats.peak_device_bytes = max(
+                self.stats.peak_device_bytes, torch.mps.driver_allocated_memory()
+            )
+        elif self.device.type == "cuda":
+            self.stats.peak_device_bytes = max(
+                self.stats.peak_device_bytes,
+                torch.cuda.max_memory_allocated(self.device),
+            )
+
+    def _compact_live(self, cache: KVCache, alive: list[SeqLeaf]) -> int:
+        """Slide live leaves down so the live rows are a dense pool prefix.
+
+        Retirement order normally makes this a no-op: shapes are dealt into the
+        pool longest-lived first, so the games that finish are already at the
+        tail. It is kept because the dense read is a correctness invariant, not
+        an optimization -- a shape that ever retires out of turn would
+        otherwise have a live row read as if it were somebody else's.
+        """
+
+        sources: list[int] = []
+        targets: list[int] = []
+        length = 0
+        row = 0
+        for leaf in alive:
+            for seat in range(leaf.tree.num_players):
+                current = leaf.slots[seat][1]
+                if current != row:
+                    sources.append(current)
+                    targets.append(row)
+                    length = max(length, leaf.cache_length)
+                leaf.slots[seat] = (leaf.slots[seat][0], row)
+                row += 1
+        if sources:
+            cache.branch_copy(
+                torch.from_numpy(np.asarray(sources, dtype=np.int64)).to(
+                    self.device
+                ),
+                torch.from_numpy(np.asarray(targets, dtype=np.int64)).to(
+                    self.device
+                ),
+                length=length,
+            )
+        return row
+
+    def _merged_prefill(
+        self,
+        leaves: list[SeqLeaf],
+        model: SeqPlumpModel,
+        cache: KVCache,
+        policy_id: str,
+    ) -> None:
+        """Encode each shape's prefix into its own rows of the shared pool.
+
+        A fresh prefix attends only to itself, so a prefill has nothing to gain
+        from the ragged machinery -- but it still gains from width. Grouping by
+        prefix length rather than by shape merges every table size at a given
+        hand size into one call, since the prefix's length is a function of the
+        hand alone.
+        """
+
+        groups: dict[int, list[SeqLeaf]] = {}
+        for leaf in leaves:
+            groups.setdefault(leaf.tree.hand_size, []).append(leaf)
+        launched: list[tuple[list[tuple[SeqLeaf, int]], SeqStepOutput]] = []
+        for hand_size, group in groups.items():
+            prefix_len = self.model_config.prefix_len(hand_size)
+            rows: list[int] = []
+            token_rows: list[np.ndarray] = []
+            capture: list[tuple[SeqLeaf, int]] = []
+            capture_rows: list[int] = []
+            for leaf in group:
+                num_players = leaf.tree.num_players
+                for seat in range(num_players):
+                    if leaf.env.state.current_player == seat:
+                        capture_rows.append(len(rows))
+                        capture.append((leaf, seat))
+                    rows.append(leaf.slots[seat][1])
+                    token_rows.append(
+                        np.asarray(
+                            prefix_tokens(
+                                self.model_config,
+                                seat,
+                                num_players,
+                                hand_size,
+                                leaf.tree.initial_hands[seat],
+                                leaf.tree.bidding_start_player,
+                            ),
+                            dtype=np.int64,
+                        )
+                    )
+                leaf.cache_length = prefix_len
+                leaf.covered_until = prefix_len
+                leaf.open_positions.extend(range(prefix_len))
+            tokens = torch.from_numpy(np.stack(token_rows)).to(self.device)
+            slots = torch.from_numpy(
+                np.asarray(rows, dtype=np.int64)
+            ).to(self.device)
+            indices = torch.from_numpy(
+                np.asarray(capture_rows, dtype=np.int64)
+            ).to(self.device)
+            with autocast_context(self.device, self.train.precision):
+                output = model.forward_prefill(
+                    tokens,
+                    cache,
+                    slots,
+                    readout_indices=indices,
+                    phase="bid",
+                    with_value=False,
+                )
+            self.stats.forward_rows += len(rows) * prefix_len
+            launched.append((capture, output))
+        for capture, output in launched:
+            packed = output.bid_logits.float().cpu().numpy()
+            for index, (leaf, seat) in enumerate(capture):
+                leaf.pending = _Pending(
+                    seat=seat,
+                    policy_id=policy_id,
+                    action_logits=packed[index],
+                    value=0.0,
+                )
+
+    def _decide_and_step_merged(
+        self,
+        leaf: SeqLeaf,
+        phase: Phase,
+        probs: np.ndarray,
+        sampled: int,
+        appends: list[tuple[SeqLeaf, list[GameEvent]]],
+        alive_next: list[SeqLeaf],
+    ) -> None:
+        """``_decide_and_step`` without the branching machinery PPO never uses.
+
+        The only substantive difference is where the readout position comes
+        from: a lockstep wave shares one counter, a merged one asks the leaf.
+        """
+
+        actor = leaf.env.current_player()
+        learn_actor = (
+            actor == leaf.tree.focal
+            or self.train.ppo_self_play_seats == "all"
+        )
+        if learn_actor:
+            leaf.decisions.append(
+                SeqDecisionRecord(
+                    position=leaf.cache_length - 1,
+                    phase=NEXT_BID if phase == Phase.BIDDING else NEXT_PLAY,
+                    seat=actor,
+                    policy_id=leaf.pending.policy_id,
+                    action_index=sampled,
+                    old_probs=probs,
+                    old_value=leaf.pending.value,
+                    reach_weight=leaf.reach_weight,
+                    depth=0,
+                )
+            )
+            leaf.tree.decision_total += 1
+            self.stats.decisions += 1
+        elif self.train.ppo_opponent_action_mode == "argmax":
+            sampled = int(probs.argmax())
+        self._advance_leaf(
+            leaf, self._action_for(actor, phase, sampled), appends, alive_next
+        )
+
+    def _append_merged_wave(
+        self,
+        appends: list[tuple[SeqLeaf, list[GameEvent]]],
+        model: SeqPlumpModel,
+        cache: KVCache,
+        policy_id: str,
+        live_rows: int,
+    ) -> None:
+        """One ragged forward for every live row, whatever length it is at.
+
+        Rows disagree on how many tokens this wave appends -- one game closes a
+        trick while another does not -- so every row is padded to the longest
+        run and names its own last real token. The surplus lands on positions
+        the row has not reached, which it overwrites on a later wave and never
+        attends to in the meantime.
+        """
+
+        t_start = time.perf_counter()
+        blocks_by_leaf = [
+            (leaf, self._wave_blocks(leaf, events)) for leaf, events in appends
+        ]
+        run = max(len(blocks) for _, blocks in blocks_by_leaf)
+        tokens = np.zeros((live_rows, run, TOKEN_WIDTH), dtype=np.int64)
+        positions = np.zeros(live_rows, dtype=np.int64)
+        offsets = np.zeros(live_rows, dtype=np.int64)
+        captures: dict[str, list[tuple[SeqLeaf, int]]] = {}
+        capture_rows: dict[str, list[int]] = {}
+        for leaf, blocks in blocks_by_leaf:
+            count = len(blocks)
+            padded = blocks + [blocks[-1]] * (run - count)
+            stacked = np.stack(padded)  # [run, num_players, TOKEN_WIDTH]
+            # A leaf's seats always hold consecutive rows -- they are dealt that
+            # way and compaction preserves it -- so the whole block lands in one
+            # assignment instead of one per seat.
+            base = leaf.slots[0][1]
+            stop = base + leaf.tree.num_players
+            tokens[base:stop] = stacked.transpose(1, 0, 2)
+            positions[base:stop] = leaf.cache_length
+            offsets[base:stop] = count - 1
+            next_actor = leaf.env.state.current_player
+            phase = "bid" if leaf.env.phase() == Phase.BIDDING else "play"
+            capture_rows.setdefault(phase, []).append(base + next_actor)
+            captures.setdefault(phase, []).append((leaf, next_actor))
+        t_build = time.perf_counter()
+        self.stats.token_build_sec += t_build - t_start
+
+        device_tokens = torch.from_numpy(tokens).to(self.device)
+        device_positions = torch.from_numpy(positions).to(self.device)
+        device_offsets = torch.from_numpy(offsets).to(self.device)
+        launched: list[tuple[list[tuple[SeqLeaf, int]], torch.Tensor]] = []
+        with autocast_context(self.device, self.train.precision):
+            hidden = model.forward_step_ragged(
+                device_tokens,
+                device_positions,
+                cache,
+                None,
+                readout_offsets=device_offsets,
+            )
+            for phase, rows in capture_rows.items():
+                indices = torch.from_numpy(
+                    np.asarray(rows, dtype=np.int64)
+                ).to(self.device)
+                launched.append(
+                    (
+                        captures[phase],
+                        model.action_logits(hidden[indices], phase),
+                    )
+                )
+        self.stats.forward_rows += live_rows * run
+        self._sync()
+        for capture, logits in launched:
+            packed = logits.float().cpu().numpy()
+            for index, (leaf, seat) in enumerate(capture):
+                leaf.pending = _Pending(
+                    seat=seat,
+                    policy_id=policy_id,
+                    action_logits=packed[index],
+                    value=0.0,
+                )
+        self.stats.forward_sec += time.perf_counter() - t_build
+
+        for leaf, blocks in blocks_by_leaf:
+            count = len(blocks)
+            leaf.open_positions.extend(
+                range(leaf.cache_length, leaf.cache_length + count)
+            )
+            leaf.cache_length += count
+            leaf.covered_until = leaf.cache_length
 
     def _split_position(self, tree: SeqTree) -> int:
         """Token position of the focal's own bid: where a split pass starts."""
@@ -1590,7 +2064,26 @@ class SeqRolloutCollector:
         groups: list[list[int]] = [[] for _ in range(count)]
         masses = [0.0] * count
         ranked = sorted(legal, key=lambda action: (-probs[action], action))
-        for action in ranked:
+        # Seed one action per stratum before packing the rest.
+        #
+        # The lightest-bin rule alone does not guarantee this. Placing a
+        # zero-probability action does not raise its bin's mass, so that bin
+        # stays the lightest and swallows every remaining zero, leaving the
+        # later strata empty -- and an empty stratum has no representative to
+        # draw. A policy sharp enough to underflow its tail to exactly 0.0 in
+        # float32 therefore crashed the caller. Distillation reaches that
+        # sharpness quickly because it is chasing a near-deterministic teacher,
+        # but any converged policy can.
+        #
+        # For an all-positive policy this is exactly what the loop below used
+        # to do anyway -- ties in mass break by index, so the first ``count``
+        # ranked actions already landed in distinct bins -- so the healthy path
+        # is unchanged.
+        for index in range(count):
+            action = ranked[index]
+            groups[index].append(action)
+            masses[index] += float(probs[action])
+        for action in ranked[count:]:
             group_index = min(range(count), key=lambda index: (masses[index], index))
             groups[group_index].append(action)
             masses[group_index] += float(probs[action])
@@ -1731,6 +2224,7 @@ class SeqRolloutCollector:
                             capture_indices if optimized_readout else None
                         ),
                         phase="bid" if optimized_readout else None,
+                        with_value=not optimized_readout,
                     )
                 else:
                     output = models[policy_id].forward_prefix(
@@ -1739,6 +2233,7 @@ class SeqRolloutCollector:
                             capture_indices if optimized_readout else None
                         ),
                         phase="bid" if optimized_readout else None,
+                        with_value=not optimized_readout,
                     )
             self.stats.forward_rows += len(entries) * prefix_len
             launched.append((policy_id, capture_list, output))
@@ -1747,16 +2242,23 @@ class SeqRolloutCollector:
         # submitted.  On MPS each .cpu() drains the command queue; launching
         # all resident policies first lets Metal keep useful work queued.
         for policy_id, capture_list, output in launched:
-            packed = torch.cat(
-                (output.bid_logits, output.value.unsqueeze(-1)), dim=-1
-            ).float().cpu().numpy()
+            packed = output.bid_logits.float().cpu().numpy()
+            values = (
+                None
+                if optimized_readout
+                else output.value.float().cpu().numpy()
+            )
             for readout_row, (cache_row, leaf, seat) in enumerate(capture_list):
                 source_row = readout_row if optimized_readout else cache_row
                 leaf.pending = _Pending(
                     seat=seat,
                     policy_id=policy_id,
-                    action_logits=packed[source_row, :-1],
-                    value=float(packed[source_row, -1]),
+                    action_logits=packed[source_row],
+                    value=(
+                        0.0
+                        if values is None
+                        else float(values[source_row])
+                    ),
                 )
 
     @staticmethod
@@ -1796,11 +2298,22 @@ class SeqRolloutCollector:
             return block
 
         blocks = []
+        round_state = leaf.env.state.current_round
+        bids_made = len(round_state.bids)
+        bid_sum = sum(bid.value for bid in round_state.bids)
         for event in events:
             if not emits_token(config, event):
                 continue
             block = tile(
-                event_token(config, event, 0, num_players, hand_size),
+                event_token(
+                    config,
+                    event,
+                    0,
+                    num_players,
+                    hand_size,
+                    bids_made=bids_made if event.type == EventType.BID else None,
+                    bid_sum=bid_sum if event.type == EventType.BID else None,
+                ),
                 event.player,
             )
             if event.type == EventType.TRICK_WIN:
@@ -1816,13 +2329,23 @@ class SeqRolloutCollector:
             blocks.append(
                 tile(
                     turn_token(
-                        config, num_players, hand_size, 0, next_phase, trick, pos
+                        config,
+                        num_players,
+                        hand_size,
+                        0,
+                        next_phase,
+                        trick,
+                        pos,
+                        bids_made=bids_made if bidding else None,
+                        bid_sum=bid_sum if bidding else None,
                     ),
                     next_actor,
                 )
             )
         blocks[-1][:, SLOT_NEXT_ACTOR] = (next_actor - seats) % num_players
         blocks[-1][:, SLOT_NEXT_PHASE] = next_phase
+        for block in blocks:
+            set_na_patterns(block, config)
         return blocks
 
     def _append_wave(
@@ -1922,12 +2445,14 @@ class SeqRolloutCollector:
                             None,
                             readout_indices=(indices if optimized_readout else None),
                             phase=phase if optimized_readout else None,
+                            with_value=not optimized_readout,
                         )
                     else:
                         output = models[policy_id].forward_prefix(
                             tokens,
                             readout_indices=(indices if optimized_readout else None),
                             phase=phase if optimized_readout else None,
+                            with_value=not optimized_readout,
                         )
                 self.stats.forward_rows += row_count * (
                     run_len if self.use_cache else position + run_start + 1
@@ -1939,9 +2464,12 @@ class SeqRolloutCollector:
                 action_logits = (
                     output.bid_logits if phase == "bid" else output.card_logits
                 )
-                packed = torch.cat(
-                    (action_logits, output.value.unsqueeze(-1)), dim=-1
-                ).float().cpu().numpy()
+                packed = action_logits.float().cpu().numpy()
+                values = (
+                    None
+                    if optimized_readout
+                    else output.value.float().cpu().numpy()
+                )
                 for readout_row, (cache_row, seat, leaf) in enumerate(capture_list):
                     source_row = (
                         readout_row if optimized_readout else cache_row
@@ -1949,8 +2477,12 @@ class SeqRolloutCollector:
                     leaf.pending = _Pending(
                         seat=seat,
                         policy_id=policy_id,
-                        action_logits=packed[source_row, :-1],
-                        value=float(packed[source_row, -1]),
+                        action_logits=packed[source_row],
+                        value=(
+                            0.0
+                            if values is None
+                            else float(values[source_row])
+                        ),
                     )
             self.stats.forward_sec += time.perf_counter() - t_build
             if run_start + run_len == event_count:

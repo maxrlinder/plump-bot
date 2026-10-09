@@ -1,0 +1,216 @@
+[run]
+iterations = 100000
+checkpoint_every = 100
+dashboard_every = 5
+device = "auto"
+
+[model]
+# Exactly the distilled student from runs/distill-v5. Every field here must
+# match iter_005600.pt's embedded model_config or the fork refuses to load:
+# 16 layers at d=240 with grouped-query attention at 2 KV heads, factored
+# card embeddings (rank + suit, no 52-row matrix on either side), and no
+# absolute index-in-sequence embedding.
+embedding_rms_norm = true
+d_model = 240
+n_layers = 16
+n_heads = 10
+n_kv_heads = 2
+d_ff = 720
+trick_win_token = true
+turn_token = "bid"
+per_layer_embedding_dim = 64
+value_embedding_mode = "alternating"
+card_embedding_mode = "factored"
+absolute_position_embedding = false
+
+[training]
+seed = 0
+hand_sizes = [3, 4, 5, 6, 7, 8, 9, 10]
+player_counts = [3, 4, 5]
+player_count_weights = [2.0, 3.0, 4.0]
+schedule_repeats = 1
+# 29 deals for each of the 24 shapes (8 hand sizes x 3 player counts) = 696
+# games per update, which is the requested ~700.
+#
+# Retain this learning batch during throughput tuning. Changing the number
+# of games changes gradient noise and needs a learning comparison; gradient
+# clipping alone does not establish a universal batch-size speedup law.
+deals_per_shape = 29
+# One wave, one optimizer step. The whole 696-game batch is consumed by a
+# single accumulate-and-step: _ppo_actor_backward runs every microbatch of
+# every length bucket between one zero_grad() and one optimizer.step(), so
+# the gradient the optimizer sees is the sum over all 696 games.
+#
+# Keep this at 1 so throughput changes preserve the optimizer's learning
+# batch. Additional PPO passes can be tested separately with epochs; the
+# clipped importance-ratio objective supports reuse of the frozen rollout.
+updates_per_collect = 1
+games_per_cell = 0
+
+# PPO ignores branch placement/candidate rules and always collects exactly one
+# sampled trajectory per game. These remain valid so changing the objective
+# back to a counterfactual method is a configuration-only operation.
+reference_rate = 0.5
+branch_rate_player_exponent = 0.0
+exhaustive_until = 7
+bid_mode = "stratified"
+bid_top_k = 5
+play_mode = "none"
+play_top_k = 1
+
+# Raised from 3e-5 after reviewing rl-v6 at iteration 23600. A same-batch
+# checkpoint probe measured mean KL 0.00092 at 4.5e-5 versus 0.00043 at
+# 3e-5, below the 0.004 guard. This is an update-size measurement; tournament
+# progress must still establish the effect on learning. Adam preconditions
+# the clipped gradient, so its parameter-step norm is not the learning rate.
+learning_rate = 0.000045
+core_learning_rate = 0.000045
+auxiliary_learning_rate = 0.000045
+lr_warmup_updates = 100
+epochs = 1
+# The update's memory lever, and the only one that matters: rollout peak sat
+# at 1.9 GB across this whole sweep, so the two phases are tuned separately
+# and neither constrains the other. Measured on this machine at 696 games,
+# 16-layer trunk, all heads weighted:
+#
+#    8192 -> 17.5 s update,  6.18 GB      16384 -> 16.15 s,  9.77 GB
+#   12288 -> 16.5 s update,  7.56 GB      24576 -> 15.5 s,  12.80 GB
+#
+# 16384 is the knee. Below it the per-microbatch overhead starts to show;
+# above it 24576 buys 4% more speed for another 3 GB, which is not worth
+# spending on a 24 GB unified-memory machine where MPS thrashing past ~12 GB
+# is a cliff rather than a gradual cost. Total peak is then ~9.8 GB.
+microbatch_positions = 16384
+use_kv_cache = true
+precision = "bf16"
+policy_objective = "ppo"
+policy_coef = 1.0
+policy_kl_cap = 0.004
+policy_kl_p99_cap = 0.0
+
+ppo_clip_ratio = 0.10
+# Skip the ~1.1 s post-update KL replay, plus rollback snapshots and retries.
+# Post-update KL metrics are left blank; PPO loss clipping remains enabled.
+ppo_trust_region = false
+ppo_trainable_policies = 1
+ppo_self_play_seats = "all"
+ppo_opponent_action_mode = "sample"
+ppo_sequence_bucket_width = 16
+ppo_critic_sequence_bucket_width = 32
+ppo_critic_mode = "oracle"
+ppo_critic_learning_rate = 0.0003
+ppo_critic_epochs = 2
+ppo_advantage_estimator = "monte_carlo"
+ppo_gae_lambda = 0.95
+ppo_advantage_normalize = true
+ppo_actor_auxiliary_detach_hidden = false
+ppo_auxiliary_positions = "all"
+dense_supervision_start = "bidding"
+ppo_actor_value_coef = 0.2
+ppo_auxiliary_grad_fraction = 0.25
+ppo_entropy_mode = "adaptive"
+ppo_entropy_coef = 0.01
+ppo_entropy_learning_rate = 0.001
+# Phase 2: linear sharpening, bid 0.25 -> 0.10 and play 0.25 -> 0.15 over
+# 5700 iterations (9200 -> 14900), which is 30 h at the 18.90 s/iteration
+# this run has held to within 0.5% over every window from the last 500 to
+# the last 3000 iterations.
+#
+# Phase 1 did its job and is why the ramp starts from 0.25 rather than from
+# where the policy sits. The student entered at bid entropy 0.1135 against a
+# 0.25 floor, alpha_bid climbed from 0.010 to a peak of 0.177, and bid
+# entropy came up to 0.276 -- above the floor, with alpha already easing back
+# off its peak. Play was at its floor throughout (0.243-0.268, alpha_play
+# under 0.01), so it has room to give.
+#
+# Starting the ramp at 0.25 and at the resume iteration keeps the target
+# continuous: at progress 0 it is exactly the level the controller has spent
+# 3600 iterations converging against, so nothing is discontinuous at the
+# handover. Past 14900 progress clamps to 1 and the floors are simply
+# constant at 0.10 and 0.15 for the rest of the run.
+#
+# What must NOT change here is the controller's own mechanics --
+# ppo_entropy_mode, ppo_entropy_coef, ppo_entropy_learning_rate. Alpha carries
+# over across a target change but resets if any of those three move, and a
+# reset would drop the multiplier from 0.177 back to 0.01 and leave the floor
+# effectively off for the first several thousand iterations of the ramp.
+ppo_bid_entropy_target = 0.25
+ppo_play_entropy_target = 0.25
+ppo_entropy_target_schedule = "linear"
+ppo_entropy_schedule_start_iteration = 9200
+ppo_entropy_schedule_end_iteration = 14900
+ppo_bid_entropy_target_end = 0.10
+ppo_play_entropy_target_end = 0.15
+
+# Legacy-objective parameters are inert under PPO but retained so this file can
+# select another policy objective without changing its schema.
+neurd_regret_coef = 1.0
+neurd_kl_coef = 1.0
+neurd_advantage_clip = 0.0
+neurd_inclusion_exponent = 1.0
+neurd_inclusion_cap = 0.0
+sampled_mirror_step_size = 1.0
+sampled_mirror_target_kl = 0.003
+sampled_mirror_uniform_mix = 0.02
+sampled_mirror_advantage_clip = 10.0
+sampled_mirror_inclusion_exponent = 1.0
+sampled_mirror_inclusion_cap = 12.0
+kl_backtrack_attempts = 4
+kl_backtrack_factor = 0.5
+branch_depth_exponent = 0.0
+
+value_objective = "mse"
+value_positions = "all"
+value_reward_scale = 5.0
+value_coef = 0.5
+# Every head trains. bid_hit_coef is the change from v4-5, where it sat at
+# 0.0 for the whole run -- which is why the distillation transferred nothing
+# into that head (there was nothing in the teacher's to transfer, and its
+# distillation KL sat at 2e-4 from the first iteration). Its MLP head is
+# present but effectively untrained, so it starts from scratch here while
+# every other head continues from a distilled state.
+suit_coef = 0.1
+rank_boundary_coef = 0.2
+bid_hit_coef = 0.2
+trick_coef = 0.2
+next_winner_coef = 0.2
+oracle_card_order_coef = 0.05
+entropy_coef = 0.0
+league_max_snapshots = 64
+league_min_iteration = 3500
+league_pool_size = 5
+league_recent_fraction = 0.0
+
+[rollout]
+# rows = deals_per_shape x sum(player_counts) x len(hand_sizes)
+#      = 29 x 12 x 8 = 2784, so the whole schedule runs as one merged loop and
+# this cap never binds. Left at the historical value so a wider schedule
+# still fits without a config change.
+max_cache_rows = 12288
+cache_budget_gb = 4.0
+auto_deals_per_batch = false
+deals_per_batch = 128
+max_deals_per_batch = 128
+merged_waves = true
+# Full current-policy self-play: every seat is the trainable policy and every
+# seat contributes PPO gradients.
+opponent_mode = "off"
+opponent_fraction = 0.0
+opponent_packing = "concurrent"
+kv_dtype = "fp16"
+bid_position_mode = "uniform"
+
+[evaluation]
+# Automatic evaluation disabled at iteration 45000 to avoid background CPU
+# inference. Run training with tools/train_supervised.sh without the monitor
+# watcher; the trainer still updates its metrics dashboard without inference.
+every = 0
+deals = 64
+seed = 1234
+action_seed = 17
+batch_size = 256
+training_action_mode = "argmax"
+best_action_mode = "argmax"
+opponent_switch_action_mode = "argmax"
+opponent_switch_reward = 0.0
+opponent_switch_consecutive = 4

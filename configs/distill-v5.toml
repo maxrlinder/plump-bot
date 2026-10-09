@@ -1,0 +1,361 @@
+[run]
+iterations = 10000
+checkpoint_every = 100
+# Iterations between dashboard refreshes. `plump train` now renders this
+# itself, in a skipped-if-busy subprocess, so a run is self-observing with no
+# watcher process alongside it. At ~20s/iteration this is a refresh every few
+# minutes, which is well inside the timescale anything here moves on.
+dashboard_every = 10
+device = "auto"
+
+[model]
+# Normalize the summed input embedding before the trunk. Off preserves the
+# historical architecture; a model that trained without it must be calibrated
+# on insertion (the fork path does this automatically).
+embedding_rms_norm = true
+d_model = 240
+n_layers = 16
+n_heads = 10
+n_kv_heads = 2
+d_ff = 720
+trick_win_token = true
+turn_token = "bid"
+# Packed token/context conditioning is prepared once, then one 128-d slice is
+# injected after each block. Attention V receives separate token-identity
+# capacity in alternating blocks (1, 3, ... 15 for this sixteen-layer model).
+per_layer_embedding_dim = 64
+value_embedding_mode = "alternating"
+# A card is rank + suit and nothing else, at full width, on input and
+# output alike. Removes the 53 exact-card rows from the slot table (and
+# from both packed conditioning tables, where depth replicates them) and
+# the 52 x d output matrix. The token schema is unchanged, which is what
+# lets the dense teacher and this student read one set of rollout tensors.
+card_embedding_mode = "factored"
+# No absolute index-in-sequence embedding. An index means different things at
+# different table sizes -- position 14 is mid-bidding at five players and the
+# second trick at three -- so one row has to serve both and every row shifts
+# meaning with the opponent count. The game's own coordinates are already in
+# the token and are shape-invariant: SLOT_TRICK is the round, SLOT_POS_IN_TRICK
+# the seat order within it, SLOT_REL_PLAYER who acted. Causal masking still
+# supplies the ordering. Verified collision-free across the shape grid: no two
+# tokens in a sequence share a row once the index is gone.
+absolute_position_embedding = false
+
+[training]
+seed = 0
+hand_sizes = [3, 4, 5, 6, 7, 8, 9, 10]
+player_counts = [3, 4, 5]
+player_count_weights = [2.0, 3.0, 4.0]
+schedule_repeats = 1
+# 192 independent games for each of 24 shapes = 4608 games/update.
+#
+# Doubled again to 192 by request for the run to 110000.
+#
+# Batch width under a KL objective.
+#
+# The reinforcement runs needed thousands of games per update because the
+# learning signal was a *sampled return*: one scalar per decision, mostly
+# noise, and averaging it down was the only way to recover a usable gradient.
+# Distillation has no such problem. The teacher hands over its entire
+# distribution at every decision, so each position carries a dense, exact,
+# low-variance target and a few hundred games already saturate the gradient
+# direction. Updates, not batch size, are the currency here.
+#
+# Measured on this machine (MPS, 16-layer student, dense teacher forward):
+#
+#    288 games   55k positions   collect 13.5s  update 5.8s   3.4 GB
+#    648 games  121k positions   collect 12.4s  update 7.7s   8.2 GB
+#
+# Note the collect column: it barely moves. Rollout cost is dominated by the
+# per-shape autoregressive decode loop, which runs once per schedule cell
+# whatever the deal count, so a thin wave pays the same sequential latency as
+# a fat one and simply under-fills each step. 288 games across 24 cells is
+# 12 deals per wave, which is well under the width the decode could carry.
+#
+# The consequence worth knowing: covering fewer shapes per update with fatter
+# waves would buy roughly 2x the games for the same wall clock. It is not set
+# that way here because the schedule is static -- a fixed subset would starve
+# the shapes it leaves out rather than rotating through them.
+#
+deals_per_shape = 12
+# One rollout wave feeds this many updates. Rollout is latency-bound on the
+# per-shape decode loop, so a wave of 8x the deals costs ~2x the time, not 8x:
+# measured 288 games in 13.2s against 2304 games in 27.7s, i.e. 13.2s -> 3.5s
+# of rollout per update. deals_per_shape stays the per-update batch you want
+# (288 games); this only changes how many are gathered at once.
+updates_per_collect = 8
+games_per_cell = 0
+
+# PPO ignores branch placement/candidate rules and always collects exactly one
+# sampled trajectory per game. These remain valid so changing the objective
+# back to a counterfactual method is a configuration-only operation.
+reference_rate = 0.0
+branch_rate_player_exponent = 0.0
+exhaustive_until = 0
+# No branching of any kind. Stratified bid selection exists to build a
+# counterfactual tree for the reinforcement objective; distillation never
+# reads one -- the teacher labels the single realized path -- so it is pure
+# rollout cost here. It was also what crashed the first attempt at iteration
+# 177: stratifying a policy sharp enough to underflow its tail produced empty
+# strata. That is fixed in _policy_mass_strata, but this run has no use for
+# the mechanism either way.
+# Kept expanding. play_mode is "none" so no trick branches, but the focal bid
+# still stratifies: validate() requires the bid to expand (for the
+# reinforcement objective it is the root of every tree), and for distillation
+# the extra bid subtrees are simply more distinct states for the teacher to
+# label per deal, so there is nothing to save by disabling it.
+#
+# Stratifying a policy sharp enough to underflow its tail to exactly 0.0 used
+# to produce empty strata and crash the rollout; fixed in
+# _policy_mass_strata, which now seeds one action per stratum before packing.
+bid_mode = "stratified"
+bid_top_k = 5
+play_mode = "none"
+play_top_k = 1
+
+# Raised 1e-5 -> 1.5e-5 for the final stint. All three must move together:
+# core/auxiliary default to ``learning_rate`` only when unset, and the actor
+# uses a single Adam group precisely because they are equal.
+#
+# The headroom is measured. ``policy_kl_cap`` is 0.004 and observed KL has sat
+# at 0.0005-0.0009 for thousands of iterations -- under 25% of the cap. KL
+# grows as the square of the step, so 1.5x LR lands near 0.0018, still under
+# half the cap, with kl_backtrack_attempts=4 as the backstop below that.
+#
+# Worth doing because the run is still travelling, not settled: reward has
+# climbed linearly at +0.0084/1000 iterations for 21,000 iterations with no
+# sign of flattening. In that regime progress is proportional to the step
+# size, and the clip means the step size is exactly this number. There is no
+# LR decay schedule in the trainer, so a settle-down phase near the end has to
+# be a manual reconfigure.
+# Doubled 1.5e-5 -> 3e-5. At 4608 games KL had fallen to ~0.0008, under 20% of
+# the 0.004 cap, because the wider batch makes each step gentler in policy
+# terms. KL grows as the square of the step, so 2x LR targets ~0.0032 -- 80% of
+# the cap. That is deliberately close: expect the tail to breach it and
+# kl_backtrack_attempts to halve those steps, which turns the run into
+# KL-controlled rather than LR-controlled training. Watch the backtrack rate;
+# if it is heavy, 2.4e-5 lands near 50% of cap instead.
+# Cold-start distillation, not fine-tuning.
+#
+# 3e-5 was inherited from the reinforcement config, where it fine-tuned an
+# already-converged policy. It is far too small here, and the reason is the
+# gradient clip: max_grad_norm is 1.0 while the measured pre-clip norm at the
+# start of this run is ~100, so the optimizer receives a unit-norm direction
+# every single iteration and the learning rate *is* the step size, outright.
+#
+# At 3e-5 behind a 100-iteration warmup the effective step at iteration 25 was
+# 7.5e-6 against a unit gradient, and the run showed it: bid KL and value RMSE
+# crept down while play KL, top-1 agreement and value correlation did not move
+# at all over 26 iterations. The same student at 3e-4 moved agreement
+# 0.48 -> 0.58 and value correlation -0.13 -> +0.56 inside 40 iterations.
+learning_rate = 0.0003
+core_learning_rate = 0.0003
+auxiliary_learning_rate = 0.0003
+lr_warmup_updates = 100
+epochs = 1
+# Independent of the 2304-game rollout batch, and the only meaningful lever on
+# peak memory: the update dominates it (13.5 GB against the rollout's 4.5 GB
+# at this schedule). Measured on the split-backward update at iteration 47600,
+# all else equal:
+#
+#   57,344 -> 13.53 GB, 13.96 s      24,576 ->  7.57 GB, 14.00 s
+#   32,768 -> 10.60 GB, 14.18 s      16,384 ->  5.57 GB, 14.99 s
+#
+# 24,576 gives up nothing on time and 44% of the peak, which buys back the
+# headroom the second backward and any later widening will want. Below that
+# the per-microbatch overhead starts to show.
+microbatch_positions = 32768
+use_kv_cache = true
+precision = "bf16"
+policy_objective = "distill"
+# The frozen teacher. Loaded with its own embedded model_config, so this
+# dense 6-layer d=384 checkpoint supervises the factored 16-layer d=240
+# student above without either being coerced to the other's architecture.
+distill_teacher_checkpoint = "runs/ppo-oracle-mps-768-v4-5/checkpoints/iter_100500.pt"
+# On-policy: the student visits its own states and the teacher labels them,
+# so the teacher corrects the drift the student actually exhibits rather
+# than only the states the teacher itself would reach.
+distill_rollout_policy = "student"
+distill_policy_coef = 1.0
+distill_value_coef = 1.0
+distill_aux_coef = 1.0
+distill_temperature = 1.0
+policy_coef = 1.0
+policy_kl_cap = 0.0
+policy_kl_p99_cap = 0.0
+
+ppo_clip_ratio = 0.10
+ppo_trainable_policies = 1
+ppo_self_play_seats = "all"
+ppo_opponent_action_mode = "sample"
+ppo_sequence_bucket_width = 16
+ppo_critic_sequence_bucket_width = 32
+ppo_critic_mode = "oracle"
+ppo_critic_learning_rate = 0.0003
+ppo_critic_epochs = 2
+# Vanilla PPO: the advantage is the game's realized return minus the oracle's
+# EV for that state. No bootstrapping between decisions and no action-value
+# head. V5 tried the GAE estimator here and it did not move the curves, so the
+# setting stays at the V4 value; ppo_gae_lambda is inert while it does.
+ppo_advantage_estimator = "monte_carlo"
+ppo_gae_lambda = 0.95
+ppo_advantage_normalize = true
+# Couple observer suit-presence, rank-boundary, and final-trick prediction to
+# the actor trunk. Since core and auxiliary rates match, the actor uses one
+# Adam parameter group. The independent oracle critic remains end-to-end
+# trainable as before.
+ppo_actor_auxiliary_detach_hidden = false
+# Belief/outcome auxiliaries use every causal token from bidding onward. Their
+# total trajectory weight is unchanged; it is averaged over these positions.
+ppo_auxiliary_positions = "all"
+# Do not spend dense actor/oracle auxiliary or EV mass on GAME/dealt-card
+# serialization. Start at the opening-bid TURN state (actor and oracle each
+# use the end of their own card prefix).
+dense_supervision_start = "bidding"
+# Train the actor's own per-seat value head as a dense auxiliary probe. It is
+# a measurement, not a control signal: PPO advantages and evaluation still come
+# entirely from the oracle critic. Same targets, centering and normalization as
+# the oracle, so the two value losses are directly comparable and the gap is
+# exactly what perfect information is worth.
+ppo_actor_value_coef = 0.2
+# Separate gradient-norm budgets for the two objectives sharing the actor
+# trunk: the auxiliary half is rescaled to 25% of the PPO half's norm before
+# the two are summed and the single max_grad_norm clip is applied.
+#
+# Why: the PPO objective carries one row per decision while every auxiliary
+# head carries unit mass per sequence, so over a 3..10 card schedule the
+# policy term enters with ~7.5x the weight before coefficients and ~40-75x
+# after them. Because Adam divides by the second moment of the *summed*
+# gradient, the belief signal on the shared trunk was a small perturbation of
+# a direction set by PPO advantage noise -- which is renormalized to unit
+# scale every batch and so never decays, while a belief residual does. Over
+# V4's 47k iterations suit-presence CE never moved (0.478 -> 0.483) even as
+# freshly added heads fit, which is the signature of a trunk that is not
+# being shaped by them.
+#
+# The ratio is the knob because Adam is invariant to a uniform rescale. Costs
+# a second backward over the shared trunk; the forward is not repeated.
+ppo_auxiliary_grad_fraction = 0.25
+ppo_entropy_mode = "fixed"
+ppo_entropy_coef = 0.01
+ppo_entropy_learning_rate = 0.001
+# Normalized entropy floors, ramped linearly from where the run currently sits
+# to their end values, then held there: ppo_entropy_targets clamps progress to
+# [0, 1], so the end values are the constant floors for the rest of the run.
+# Starting the ramp exactly at the resume iteration keeps the target continuous
+# -- at progress 0 it equals the value the controller has already converged
+# against.
+#
+# The adaptive temperature carries over from the source checkpoint: the
+# controller resets only when its own mechanics change (mode, coefficient,
+# learning rate), not when the target moves, so retargeting does not switch the
+# constraint off while alpha re-converges.
+#
+# Final stint: sharpen from the common 0.20 floor the run has been holding
+# since 66500. Bid ramps 0.20 -> 0.10 over 10600 iterations (~48 h at the
+# 16.3 s/iter this schedule actually runs at, evaluation and checkpointing
+# included), then holds at 0.10 for the rest of the run. The schedule clamps
+# progress to [0, 1], so past 80500 the floors are simply constant at 0.10 and
+# 0.15 however far the run is extended.
+# (~72 h total).
+#
+# Play ramps 0.20 -> 0.15 over the same window, which is very likely moot:
+# play entropy has been sitting at ~0.237, above its floor, with alpha_play
+# decayed to ~1e-6. The floor only starts to bind if PPO drives it below 0.15
+# on its own account, and 0.15 is set so that it can.
+ppo_bid_entropy_target = 0.2
+ppo_play_entropy_target = 0.2
+ppo_entropy_target_schedule = "linear"
+ppo_entropy_schedule_start_iteration = 69900
+ppo_entropy_schedule_end_iteration = 80500
+ppo_bid_entropy_target_end = 0.1
+ppo_play_entropy_target_end = 0.15
+
+# Legacy-objective parameters are inert under PPO but retained so this file can
+# select another policy objective without changing its schema.
+neurd_regret_coef = 1.0
+neurd_kl_coef = 1.0
+neurd_advantage_clip = 0.0
+neurd_inclusion_exponent = 1.0
+neurd_inclusion_cap = 0.0
+sampled_mirror_step_size = 1.0
+sampled_mirror_target_kl = 0.003
+sampled_mirror_uniform_mix = 0.02
+sampled_mirror_advantage_clip = 10.0
+sampled_mirror_inclusion_exponent = 1.0
+sampled_mirror_inclusion_cap = 12.0
+kl_backtrack_attempts = 4
+kl_backtrack_factor = 0.5
+branch_depth_exponent = 0.0
+
+value_objective = "mse"
+# The oracle has no policy head: its zero-sum EV vector is supervised for all
+# active players from the first post-deal bidding token onward. The per-game
+# value mass is averaged across positions, matching dense auxiliary weighting.
+value_positions = "all"
+value_reward_scale = 5.0
+value_coef = 0.5
+suit_coef = 0.1
+rank_boundary_coef = 0.2
+bid_hit_coef = 0.0
+trick_coef = 0.2
+# Who takes the next trick, one softmax over seats per position, dense from
+# the last bid through the penultimate trick. Trained on both sides at the
+# same weight: the oracle sees every hand and still has to work out the play,
+# and the actor's head is a probe of whether its trunk tracks the same thing.
+next_winner_coef = 0.2
+oracle_card_order_coef = 0.05
+entropy_coef = 0.0
+league_max_snapshots = 64
+league_min_iteration = 3500
+league_pool_size = 5
+league_recent_fraction = 0.0
+
+[rollout]
+# Inert at deals_per_shape=32: the whole merged schedule is 3072 rows =
+# 32 deals x (3+4+5 seats) x 8 hand sizes. Left at 12288 so a wider schedule
+# still runs as one merged loop -- splitting it costs 2.7% of the iteration
+# for no memory saving. rows = deals_per_shape x sum(player_counts) x
+# len(hand_sizes).
+max_cache_rows = 12288
+cache_budget_gb = 4.0
+# Inert at this schedule and left at the historical value: a cell holds only
+# deals_per_shape (32) deals, so the wave is already deal-limited and 128
+# never binds. peak_cache_rows sits at 160 = 32 deals x 5 seats whether this
+# says 128, 256 or 512. Rollout width is a function of deals_per_shape, not
+# of this cap, and rollout peak memory (4.5 GB) is not a constraint.
+auto_deals_per_batch = false
+deals_per_batch = 128
+max_deals_per_batch = 128
+# Decode the whole 768-game schedule in one continuously-batched loop instead
+# of 24 lockstep ones. The lockstep loop can only hold games that agree on
+# shape and length, which left it running 600 decode calls of ~133 rows -- and
+# the decode kernel is ~2.2 ms of fixed cost plus ~4.9 us/row, so three
+# quarters of every call was launch overhead. Merged: 8.1s -> 2.8s collect
+# (2.95x), for +19% forward rows of padding and 0.38 GB of pool.
+# Set merged_max_rows to cut the schedule into several loops if the pool ever
+# stops fitting; 9216 rows is the whole schedule here.
+merged_waves = true
+# Use the entire fixed 768-game budget for current-policy self-play. Every seat
+# samples on-policy and contributes PPO gradients; evaluation remains against
+# the deterministic heuristic independently of rollout opponent selection.
+opponent_mode = "off"
+opponent_fraction = 0.0
+opponent_packing = "concurrent"
+# On M5 Pro, BF16 transformer compute plus FP16 cached attention is the fastest
+# measured pair. BF16 cache was 17% slower and full FP16 compute 26% slower.
+kv_dtype = "fp16"
+bid_position_mode = "uniform"
+
+[evaluation]
+# 100 iterations at ~46 s is ~76 min, the cadence 300 gave at 16.5 s/iter.
+every = 100
+deals = 64
+seed = 1234
+action_seed = 17
+batch_size = 256
+training_action_mode = "argmax"
+best_action_mode = "argmax"
+opponent_switch_action_mode = "argmax"
+opponent_switch_reward = 0.0
+opponent_switch_consecutive = 4

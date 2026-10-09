@@ -37,7 +37,11 @@ trap 'exit 0' INT TERM
 while true; do
   # This is intentionally a fresh process each pass: evaluation and dashboard
   # code/config edits take effect without touching the training process.
-  uv run plump monitor "$run_name" "$@" >>"$log_path" 2>&1
+  # Not `uv run`: the venv carries stale console-script shebangs, so the
+  # `plump` entry point fails to launch. Invoking the module through the
+  # venv's own interpreter is equivalent and does not depend on them.
+  "${project_root}/.venv/bin/python" -m plump.cli monitor \
+    "$run_name" "$@" >>"$log_path" 2>&1
   status=$?
   if [[ $status -ne 0 ]]; then
     printf '[%s] monitor pass failed with exit %s\n' \

@@ -8,7 +8,9 @@ import json
 import random
 import re
 import shutil
+import subprocess
 import sys
+from dataclasses import replace
 import time
 from pathlib import Path
 from typing import Any
@@ -17,6 +19,7 @@ import numpy as np
 import torch
 
 from plump.dashboard import DEFAULT_SMOOTH_WINDOW, render_dashboard
+from plump.distill_dashboard import render_distill_dashboard
 from plump.evaluation import DealBank
 from plump.gui.app import run as run_gui
 from plump.run_evaluation import (
@@ -34,9 +37,23 @@ from plump.run_config import (
     resolve_training_config,
 )
 from plump.runs import RunDirectory, atomic_write_json
-from plump.seq.model import SeqPlumpModel
+from plump.tournament import (
+    TournamentProgress,
+    TournamentProtocol,
+    build_plan,
+    build_roster,
+    estimate_seconds,
+    load_policies,
+    run_tournament,
+    summarize,
+    tournament_payload,
+    write_tournament_csv,
+)
+from plump.tournament_dashboard import render_tournament_dashboard
+from plump.seq.model import EMBEDDING_NORM_KEYS, SeqPlumpModel
+from plump.seq.autorelease import autorelease_pool
 from plump.seq.policy import best_seq_device
-from plump.seq.trainer import SeqTrainer
+from plump.seq.trainer import SeqTrainer, build_training_groups
 
 METRIC_COLUMNS = (
     "iteration",
@@ -79,19 +96,37 @@ METRIC_COLUMNS = (
     "value_prediction_std",
     "value_rows",
     "loss_suit",
+    "loss_rank_boundary",
     "loss_trick",
     "loss_oracle_trick",
+    "loss_next_winner",
+    "loss_oracle_next_winner",
+    "loss_oracle_card_order",
     "loss_bid_hit",
     "suit_accuracy_10c_0",
     "suit_accuracy_10c_4",
     "suit_accuracy_10c_8",
+    "suit_loss_10c_0",
+    "suit_loss_10c_4",
+    "suit_loss_10c_8",
+    "rank_boundary_balanced_accuracy_10c_0",
+    "rank_boundary_balanced_accuracy_10c_4",
+    "rank_boundary_balanced_accuracy_10c_8",
+    "rank_boundary_loss_10c_0",
+    "rank_boundary_loss_10c_4",
+    "rank_boundary_loss_10c_8",
     "trick_accuracy_10c_0",
     "trick_accuracy_10c_4",
     "trick_accuracy_10c_8",
     "oracle_trick_accuracy",
+    "next_winner_accuracy",
+    "oracle_next_winner_accuracy",
+    "oracle_card_order_top1_accuracy",
     "entropy",
     "entropy_bid_normalized",
     "entropy_play_normalized",
+    "entropy_target_bid",
+    "entropy_target_play",
     "entropy_alpha_bid",
     "entropy_alpha_play",
     "ppo_ratio_clip_fraction",
@@ -99,6 +134,7 @@ METRIC_COLUMNS = (
     "advantage_mean",
     "advantage_std",
     "policy_logit_shift",
+    "policy_kl_checked",
     "policy_kl",
     "policy_kl_p95",
     "policy_kl_p99",
@@ -113,10 +149,18 @@ METRIC_COLUMNS = (
     "step_scale",
     "rolled_back",
     "core_grad_norm",
+    "embedding_grad_norm",
     "auxiliary_grad_norm",
+    "policy_loss_grad_norm",
+    "auxiliary_loss_grad_norm",
+    "auxiliary_grad_scale",
     "critic_grad_norm",
     "critic_all_player_rmse",
     "critic_all_player_correlation",
+    "oracle_value_loss",
+    "actor_value_loss",
+    "actor_all_player_rmse",
+    "actor_value_zero_rmse",
     "critic_loss_first_epoch",
     "critic_loss_last_epoch",
     "critic_loss_reduction",
@@ -140,6 +184,30 @@ METRIC_COLUMNS = (
     "forward_sec",
     "positions_per_sec",
     "forward_rows_per_sec",
+    "distill_kl",
+    "distill_kl_bid",
+    "distill_kl_play",
+    "distill_agree",
+    "distill_agree_bid",
+    "distill_agree_play",
+    "distill_top1_mass_bid",
+    "distill_top1_mass_play",
+    "distill_teacher_entropy_bid",
+    "distill_teacher_entropy_play",
+    "distill_student_entropy_bid",
+    "distill_student_entropy_play",
+    "distill_loss_policy",
+    "distill_loss_value",
+    "distill_loss_aux",
+    "distill_value_rmse",
+    "distill_value_correlation",
+    "distill_aux_kl_suit",
+    "distill_aux_kl_rank_boundary",
+    "distill_aux_kl_trick",
+    "distill_aux_kl_bid_hit",
+    "distill_aux_kl_next_winner",
+    "distill_skipped_steps",
+    "distill_aux_entropy_floor",
 )
 
 
@@ -187,8 +255,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--prepare-only",
         action="store_true",
         help=(
-            "create/fork and checkpoint a new run without entering its "
-            "training loop"
+            "create/fork a run, or apply an explicit reconfiguration, "
+            "without entering its training loop"
         ),
     )
     train.add_argument(
@@ -203,6 +271,18 @@ def build_parser() -> argparse.ArgumentParser:
         "--reconfigure-reason",
         default="CLI-authorized training reconfiguration",
         help="reason stored in the run metadata with --reconfigure",
+    )
+    train.add_argument(
+        "--recycle-after",
+        type=int,
+        default=0,
+        metavar="ITERATIONS",
+        help=(
+            "exit with status 75 at the first checkpoint after this many "
+            "iterations in this process, so a supervisor restarts it from that "
+            "checkpoint with a fresh heap (0 disables; see "
+            "tools/train_supervised.sh)"
+        ),
     )
     train.set_defaults(handler=train_command)
 
@@ -305,6 +385,93 @@ def build_parser() -> argparse.ArgumentParser:
     )
     analyze.set_defaults(handler=analyze_command)
 
+    tournament = subparsers.add_parser(
+        "tournament",
+        help=(
+            "play lineage checkpoints against each other on seat-symmetric "
+            "mixed tables"
+        ),
+    )
+    tournament.add_argument("run")
+    tournament.add_argument(
+        "--iterations",
+        help=(
+            "exact comma-separated lineage iterations to enter; overrides "
+            "--from-iteration, --to-iteration, --stride, and latest inclusion"
+        ),
+    )
+    tournament.add_argument(
+        "--from-iteration",
+        type=int,
+        default=20000,
+        help="oldest checkpoint to enter, and the anchor for --stride",
+    )
+    tournament.add_argument(
+        "--to-iteration",
+        type=int,
+        help="newest checkpoint to enter (default: newest in the lineage)",
+    )
+    tournament.add_argument("--stride", type=int, default=200)
+    tournament.add_argument(
+        "--no-include-latest",
+        dest="include_latest",
+        action="store_false",
+        help="omit the newest checkpoint when it does not land on the stride",
+    )
+    tournament.add_argument(
+        "--no-heuristic",
+        dest="include_heuristic",
+        action="store_false",
+        help="drop the heuristic anchor from the field",
+    )
+    tournament.add_argument(
+        "--deals-per-match",
+        type=int,
+        default=64,
+        help="shared deals per table; also the inference batch width",
+    )
+    tournament.add_argument(
+        "--waves",
+        type=int,
+        default=1,
+        help="independent re-draws of the tables at every shape",
+    )
+    tournament.add_argument("--player-counts", default="3,4,5")
+    tournament.add_argument("--hand-sizes", default="3-10")
+    tournament.add_argument(
+        "--action-mode",
+        choices=("argmax", "sample"),
+        default="argmax",
+    )
+    tournament.add_argument(
+        "--device",
+        default="cpu",
+        help="cpu, mps, or cuda (default: cpu, so training keeps the accelerator)",
+    )
+    tournament.add_argument("--deal-seed", type=int, default=1234)
+    tournament.add_argument("--action-seed", type=int, default=17)
+    tournament.add_argument("--schedule-seed", type=int, default=7)
+    tournament.add_argument("--bootstrap-samples", type=int, default=2000)
+    tournament.add_argument("--max-concurrent-rounds", type=int, default=8192)
+    tournament.add_argument(
+        "--name",
+        help="output stem under runs/<run>/tournaments (default: from the range)",
+    )
+    tournament.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="print the roster, table plan, and cost estimate without playing",
+    )
+    tournament.add_argument(
+        "--rate",
+        type=float,
+        help=(
+            "override the measured per-shape decision rate used by --dry-run "
+            "with one flat decisions/sec figure"
+        ),
+    )
+    tournament.set_defaults(handler=tournament_command)
+
     play = subparsers.add_parser("play", help="launch the local browser GUI")
     play.add_argument("run", nargs="?")
     play.add_argument("--checkpoint", default="latest")
@@ -323,6 +490,52 @@ def main(argv: list[str] | None = None) -> int:
     except (FileNotFoundError, RuntimeError, ValueError) as error:
         print(f"error: {error}", file=sys.stderr)
         return 2
+
+
+def _calibrate_embedding_norm(
+    run: RunDirectory,
+    trainer: SeqTrainer,
+    resolved: Any,
+) -> None:
+    """Fit the embedding-norm gain when forking a model that trained without it.
+
+    RMSNorm throws away the magnitude of the embedding sum, so a gain of 1.0
+    rescales the trunk's input by ~1/rms and wrecks the policy. Calibrating on
+    real rollout tokens restores the pre-norm scale, which is the closest a
+    single gain can get to leaving the forked policy alone.
+    """
+
+    if not EMBEDDING_NORM_KEYS <= trainer.migrated_model_keys:
+        return
+    trees, _ = trainer.collect()
+    groups = build_training_groups(trees, resolved.model, resolved.training)
+    targets = list(trainer.models)
+    if getattr(trainer, "critic", None) is not None:
+        targets.append(trainer.critic)
+    gains = []
+    batches = [
+        (
+            torch.from_numpy(group.tokens).to(trainer.device),
+            torch.from_numpy(np.asarray(group.owned)).to(trainer.device),
+        )
+        for group in groups
+    ]
+    for model in targets:
+        backbone = getattr(model, "backbone", model)
+        if getattr(backbone, "embedding_norm", None) is None:
+            continue
+        gains.append(backbone.calibrate_embedding_norm(batches))
+    _emit(
+        run,
+        "Calibrated input-embedding RMSNorm gain to "
+        + ", ".join(f"{gain:.5f}" for gain in gains)
+        + f" over {sum(int(group.owned.sum()) for group in groups)} real tokens.",
+    )
+
+
+# EX_TEMPFAIL. `plump train --recycle-after` exits with this once it has saved
+# a checkpoint, and tools/train_supervised.sh restarts the run on seeing it.
+RECYCLE_EXIT_CODE = 75
 
 
 def _restore_evaluation_state(run: RunDirectory, trainer: SeqTrainer) -> None:
@@ -490,8 +703,10 @@ def train_command(args: argparse.Namespace) -> int:
         raise ValueError("--resume-checkpoint requires an existing run.")
     if args.reset_league and args.from_checkpoint is None:
         raise ValueError("--reset-league requires --from-checkpoint.")
-    if args.prepare_only and existed:
-        raise ValueError("--prepare-only requires a new run name.")
+    if args.prepare_only and existed and not args.reconfigure:
+        raise ValueError(
+            "--prepare-only on an existing run requires --reconfigure."
+        )
 
     with run.acquire_lock():
         reconfiguration_differences: list[str] = []
@@ -595,6 +810,7 @@ def train_command(args: argparse.Namespace) -> int:
                 allow_training_config_mismatch=True,
             )
             trainer.resolved_config = resolved.raw
+            _calibrate_embedding_norm(run, trainer, resolved)
             if args.reset_league:
                 trainer.league.clear()
             imported = run.interval_checkpoint(trainer.iteration)
@@ -645,78 +861,132 @@ def train_command(args: argparse.Namespace) -> int:
         )
         target = int(resolved.run["iterations"])
         checkpoint_every = int(resolved.run["checkpoint_every"])
+        dashboard = _BackgroundDashboard(
+            run.name, int(resolved.run.get("dashboard_every", 0))
+        )
         _restore_evaluation_state(run, trainer)
+        pending_slices: list = []
+        wave_summary = None
+        recycle_after = int(args.recycle_after)
+        if recycle_after < 0:
+            raise ValueError("--recycle-after must be >= 0.")
+        first_iteration = trainer.iteration + 1
         for iteration in range(trainer.iteration + 1, target + 1):
-            previous_phase = trainer.opponent_phase
-            _restore_evaluation_state(run, trainer)
-            opponent_switched = (
-                previous_phase == "heuristic"
-                and trainer.opponent_phase == "historical"
-            )
-            trainer.iteration = iteration
-            started = time.perf_counter()
-            trees, summary = trainer.collect()
-            stats = trainer.update(trees)
-            collector = trainer.collector.stats
-
-            total = time.perf_counter() - started
-            row = _metric_row(
-                trainer,
-                summary,
-                stats,
-                collector,
-                total,
-                elapsed_before + total,
-                {},
-            )
-            _append_metric(run.metrics, row)
-            elapsed_before += total
-
-            checkpoint_due = (
-                checkpoint_every > 0 and iteration % checkpoint_every == 0
-            )
-            if checkpoint_due or iteration == target:
-                checkpoint = run.interval_checkpoint(iteration)
-                snapshot_id = f"iter_{iteration}"
-                trainer.league.add(snapshot_id, str(checkpoint), iteration)
-                try:
-                    trainer.save_checkpoint(checkpoint)
-                except Exception:
-                    trainer.league.snapshots = [
-                        snap
-                        for snap in trainer.league.snapshots
-                        if snap.snapshot_id != snapshot_id
-                    ]
-                    raise
-                run.record_latest(checkpoint, iteration)
-
-            message = (
-                f"iter {iteration:5d} | {total:6.1f}s "
-                f"(collect {summary.collect_sec:.1f} "
-                f"update {stats.update_sec:.1f}) "
-                f"| leaves {summary.leaves:5d} positions {stats.positions:6d} "
-                f"| bid F/N {summary.bid_hit_focal:.3f}/"
-                f"{summary.bid_hit_non_focal:.3f} "
-                f"| kl {stats.policy_kl:.5f} "
-                f"| step {stats.step_scale:.3f}"
-            )
-            if stats.backtracks:
-                message += f" ({stats.backtracks} backtracks)"
-            if stats.rolled_back:
-                message += " ROLLBACK"
-            if (
-                trainer.train.rollout.opponent_mode
-                == "heuristic_then_historical"
-                and trainer.opponent_phase == "heuristic"
-            ):
-                message += (
-                    f" | gate {trainer.heuristic_eval_win_streak}/"
-                    f"{switch_consecutive}"
+            # One pool per iteration: MPS leaves autoreleased Metal objects
+            # behind that a run-loop-less Python process otherwise never
+            # frees (see plump.seq.autorelease).
+            with autorelease_pool():
+                previous_phase = trainer.opponent_phase
+                _restore_evaluation_state(run, trainer)
+                opponent_switched = (
+                    previous_phase == "heuristic"
+                    and trainer.opponent_phase == "historical"
                 )
-            if opponent_switched:
-                message += " | ARGMAX HEURISTIC GATE PASSED; SWITCHED TO HISTORY"
-            _emit(run, message)
+                trainer.iteration = iteration
+                started = time.perf_counter()
+                # One rollout wave feeds several updates. Collect only when the
+                # previous wave is exhausted, then consume one slice per
+                # iteration, so every per-iteration concern below -- metrics,
+                # checkpoints, evaluation, the dashboard, the iteration counter
+                # itself -- is completely unchanged.
+                if not pending_slices:
+                    trees, wave_summary = trainer.collect()
+                    pending_slices = trainer.split_for_updates(trees)
+                    # Attribute the wave's rollout cost across the updates it
+                    # feeds. Reporting it in full on each row would multiply the
+                    # run's apparent rollout time by the slice count and make
+                    # seconds-per-iteration meaningless.
+                    wave_summary = replace(
+                        wave_summary,
+                        collect_sec=wave_summary.collect_sec / len(pending_slices),
+                    )
+                summary = wave_summary
+                stats = trainer.update(pending_slices.pop(0))
+                collector = trainer.collector.stats
 
+                total = time.perf_counter() - started
+                row = _metric_row(
+                    trainer,
+                    summary,
+                    stats,
+                    collector,
+                    total,
+                    elapsed_before + total,
+                    {},
+                )
+                _append_metric(run.metrics, row)
+                elapsed_before += total
+                dashboard.maybe_refresh(iteration)
+
+                checkpoint_due = (
+                    checkpoint_every > 0 and iteration % checkpoint_every == 0
+                )
+                if checkpoint_due or iteration == target:
+                    checkpoint = run.interval_checkpoint(iteration)
+                    snapshot_id = f"iter_{iteration}"
+                    trainer.league.add(snapshot_id, str(checkpoint), iteration)
+                    try:
+                        trainer.save_checkpoint(checkpoint)
+                    except Exception:
+                        trainer.league.snapshots = [
+                            snap
+                            for snap in trainer.league.snapshots
+                            if snap.snapshot_id != snapshot_id
+                        ]
+                        raise
+                    run.record_latest(checkpoint, iteration)
+
+                kl_status = (
+                    f"{stats.policy_kl:.5f}" if stats.policy_kl_checked else "off"
+                )
+                message = (
+                    f"iter {iteration:5d} | {total:6.1f}s "
+                    f"(collect {summary.collect_sec:.1f} "
+                    f"update {stats.update_sec:.1f}) "
+                    f"| leaves {summary.leaves:5d} positions {stats.positions:6d} "
+                    f"| bid F/N {summary.bid_hit_focal:.3f}/"
+                    f"{summary.bid_hit_non_focal:.3f} "
+                    f"| kl {kl_status} "
+                    f"| step {stats.step_scale:.3f}"
+                )
+                if stats.backtracks:
+                    message += f" ({stats.backtracks} backtracks)"
+                if stats.rolled_back:
+                    message += " ROLLBACK"
+                if (
+                    trainer.train.rollout.opponent_mode
+                    == "heuristic_then_historical"
+                    and trainer.opponent_phase == "heuristic"
+                ):
+                    message += (
+                        f" | gate {trainer.heuristic_eval_win_streak}/"
+                        f"{switch_consecutive}"
+                    )
+                if opponent_switched:
+                    message += " | ARGMAX HEURISTIC GATE PASSED; SWITCHED TO HISTORY"
+                _emit(run, message)
+                if (
+                    recycle_after
+                    and checkpoint_due
+                    and iteration != target
+                    and iteration - first_iteration + 1 >= recycle_after
+                ):
+                    # Exit only straight after a checkpoint, so the restart
+                    # resumes from exactly this iteration and discards no
+                    # metric rows. The fresh process starts with a clean heap.
+                    dashboard.finish()
+                    _emit(
+                        run,
+                        f"Recycling the training process after "
+                        f"{iteration - first_iteration + 1} iterations at "
+                        f"checkpoint {iteration}; a supervisor resumes from it.",
+                    )
+                    return RECYCLE_EXIT_CODE
+
+        # One final render so the dashboard reflects the last iteration
+        # rather than whatever the last interval happened to catch.
+        dashboard.maybe_refresh(trainer.iteration, force=True)
+        dashboard.finish()
         run.update_metadata(
             status="complete",
             completed_iteration=trainer.iteration,
@@ -724,10 +994,92 @@ def train_command(args: argparse.Namespace) -> int:
     return 0
 
 
+class _BackgroundDashboard:
+    """Keep ``dashboard.png`` fresh while training runs, without stalling it.
+
+    ``dashboard_every`` used to be honoured only by the separate ``monitor``
+    command, so a plain ``plump train`` produced no dashboard at all unless
+    something else was watching the run. It is refreshed here instead.
+
+    The render runs in a subprocess rather than inline: it costs ~1s, which is
+    a real fraction of a fast iteration, and matplotlib in-process would also
+    hold figure state inside the training loop. A refresh still in flight when
+    the next one is due is simply skipped, so a slow render can never queue up
+    behind itself or slow training down.
+    """
+
+    def __init__(self, run_name: str, every: int) -> None:
+        self.run_name = run_name
+        self.every = max(int(every), 0)
+        self.last_iteration = 0
+        self.process: subprocess.Popen | None = None
+
+    def maybe_refresh(self, iteration: int, *, force: bool = False) -> None:
+        if not self.every:
+            return
+        if not force and iteration < self.last_iteration + self.every:
+            return
+        if self.process is not None and self.process.poll() is None:
+            # Previous render still going; let it finish rather than pile on.
+            return
+        self.last_iteration = iteration
+        try:
+            self.process = subprocess.Popen(
+                [sys.executable, "-m", "plump.cli", "dashboard", self.run_name],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except OSError:
+            # A dashboard is a convenience; never take training down for it.
+            self.process = None
+
+    def finish(self, timeout: float = 30.0) -> None:
+        if self.process is not None and self.process.poll() is None:
+            try:
+                self.process.wait(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                self.process.kill()
+
+
+def _render_run_dashboard(run: "RunDirectory", output, **kwargs) -> int:
+    """Render whichever dashboard matches the run's objective.
+
+    A distillation run has no reward, advantage or trust region to plot, and
+    the reinforcement dashboard would render nine empty panels for it. The
+    objective is read from the run's own recorded config so this stays correct
+    for a run resumed under a different config file.
+    """
+
+    objective = ""
+    try:
+        objective = str(
+            (run.recorded_config().get("training", {}) or {}).get(
+                "policy_objective", ""
+            )
+        )
+    except (FileNotFoundError, ValueError, AttributeError):
+        objective = ""
+    if objective == "distill":
+        return render_distill_dashboard(
+            run.metrics,
+            output,
+            title=f"Plump distillation · {run.name}",
+            # The reinforcement renderer takes options this one has no
+            # analogue for (evaluation overlays, the learning-rate axis);
+            # ``title`` is already passed above.
+            **{
+                key: value
+                for key, value in kwargs.items()
+                if key in {"smooth", "dpi", "update_budget"}
+            },
+        )
+    return render_dashboard(run.metrics, output, **kwargs)
+
+
 def dashboard_command(args: argparse.Namespace) -> int:
     run = RunDirectory(args.run)
-    rows = render_dashboard(
-        run.metrics,
+    rows = _render_run_dashboard(
+        run,
         run.dashboard,
         title=f"Plump schema-v6 · {run.name}",
         smooth=args.smooth,
@@ -845,8 +1197,8 @@ def evaluate_command(args: argparse.Namespace) -> int:
         )
         if dashboard_changed:
             try:
-                rows = render_dashboard(
-                    run.metrics,
+                rows = _render_run_dashboard(
+                    run,
                     run.evaluation_dashboard,
                     title=f"Plump schema-v6 · {run.name}",
                 )
@@ -985,8 +1337,8 @@ def monitor_command(args: argparse.Namespace) -> int:
         )
     )
     if dashboard_due:
-        rows = render_dashboard(
-            run.metrics,
+        rows = _render_run_dashboard(
+            run,
             run.dashboard,
             title=f"Plump schema-v6 · {run.name}",
         )
@@ -1042,6 +1394,237 @@ def analyze_command(args: argparse.Namespace) -> int:
     return 0
 
 
+def _parse_int_list(value: str, label: str) -> tuple[int, ...]:
+    """Accept comma lists and inclusive a-b ranges, e.g. "3,4,5" or "3-10"."""
+
+    values: list[int] = []
+    for part in str(value).split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part.lstrip("-"):
+            low, _, high = part.partition("-")
+            values.extend(range(int(low), int(high) + 1))
+        else:
+            values.append(int(part))
+    if not values:
+        raise ValueError(f"{label} must list at least one value.")
+    return tuple(sorted(set(values)))
+
+
+def _format_duration(seconds: float) -> str:
+    seconds = max(seconds, 0.0)
+    if seconds < 90:
+        return f"{seconds:.0f}s"
+    if seconds < 5400:
+        return f"{seconds / 60:.1f}min"
+    return f"{seconds / 3600:.2f}h"
+
+
+def tournament_command(args: argparse.Namespace) -> int:
+    run = RunDirectory(args.run)
+    if not run.exists:
+        raise FileNotFoundError(run.path)
+    exact_iterations = (
+        _parse_int_list(args.iterations, "--iterations")
+        if args.iterations
+        else None
+    )
+    roster = build_roster(
+        run,
+        from_iteration=args.from_iteration,
+        to_iteration=args.to_iteration,
+        stride=args.stride,
+        include_latest=args.include_latest,
+        include_heuristic=args.include_heuristic,
+        iterations=exact_iterations,
+    )
+    protocol = TournamentProtocol(
+        player_counts=_parse_int_list(args.player_counts, "--player-counts"),
+        hand_sizes=_parse_int_list(args.hand_sizes, "--hand-sizes"),
+        deals_per_match=int(args.deals_per_match),
+        waves=int(args.waves),
+        deal_seed=int(args.deal_seed),
+        action_seed=int(args.action_seed),
+        schedule_seed=int(args.schedule_seed),
+        bootstrap_samples=int(args.bootstrap_samples),
+        greedy=args.action_mode == "argmax",
+    )
+    plan = build_plan(roster, protocol)
+    device = args.device or str(best_seq_device())
+
+    checkpoints = [entry for entry in roster if not entry.is_heuristic]
+    per_entry = plan.rounds_per_entry
+    runs_present = sorted({entry.run for entry in checkpoints})
+    selection_text = (
+        "exact selection"
+        if exact_iterations is not None
+        else f"stride {args.stride}"
+    )
+    print(
+        f"roster: {len(checkpoints)} checkpoints "
+        f"({checkpoints[0].iteration}..{checkpoints[-1].iteration} "
+        f"{selection_text}) "
+        f"from {', '.join(runs_present)}"
+        + (" + heuristic" if args.include_heuristic else ""),
+        flush=True,
+    )
+    print(
+        f"plan: {len(plan.matches)} tables | {plan.rounds} rounds | "
+        f"{plan.decisions} decisions | "
+        f"{min(per_entry.values())}-{max(per_entry.values())} rounds per entry | "
+        f"batch {protocol.deals_per_match} | device {device}",
+        flush=True,
+    )
+    if args.dry_run:
+        if args.rate:
+            seconds = plan.decisions / max(args.rate, 1e-9)
+            basis = f"{args.rate:.0f} decisions/s"
+        else:
+            seconds = estimate_seconds(plan, device=device)
+            basis = f"{plan.decisions / max(seconds, 1e-9):.0f} decisions/s blended"
+        print(f"estimate: ~{_format_duration(seconds)} at {basis}", flush=True)
+        return 0
+
+    name = args.name or (
+        f"iters-{checkpoints[0].iteration}-{checkpoints[-1].iteration}"
+        f"-s{args.stride}-d{protocol.deals_per_match}w{protocol.waves}"
+        f"-{args.action_mode}"
+    )
+    output = run.tournaments / f"{name}.json"
+    csv_path = output.with_suffix(".csv")
+    named_dashboard = output.with_suffix(".png")
+    overall_started = time.perf_counter()
+    started_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+    def publish(
+        status: str,
+        outcomes,
+        progress: TournamentProgress | dict[str, Any],
+        *,
+        final: bool = False,
+    ):
+        # CIs are the only expensive part of aggregation.  During the run the
+        # dashboard shows point estimates with collapsed intervals; the final
+        # publication performs the configured bootstrap once.
+        report = summarize(
+            plan,
+            outcomes,
+            bootstrap_samples=None if final else 0,
+        )
+        payload = tournament_payload(
+            run,
+            plan,
+            report,
+            device=device,
+            elapsed_sec=time.perf_counter() - overall_started,
+            status=status,
+            progress=progress,
+            started_at=started_at,
+        )
+        atomic_write_json(output, payload)
+        write_tournament_csv(csv_path, report)
+        # The result-specific image is authoritative when multiple tournaments
+        # run concurrently. The stable alias remains a convenient latest view.
+        render_tournament_dashboard(output, named_dashboard)
+        render_tournament_dashboard(output, run.tournament_dashboard)
+        return report
+
+    loading_progress = {
+        "loaded_policies": 0,
+        "total_policies": len(roster),
+        "completed_matches": 0,
+        "total_matches": len(plan.matches),
+        "completed_decisions": 0,
+        "total_decisions": plan.decisions,
+        "completed_round_seats": 0,
+        "total_round_seats": plan.round_seats,
+        "fraction": 0.0,
+    }
+    publish("loading", (), loading_progress)
+    print(f"live results: {output}", flush=True)
+    print(f"live dashboard: {run.tournament_dashboard}", flush=True)
+
+    def loaded(position: int, total: int, entry) -> None:
+        if position == total or position % 10 == 0:
+            print(f"loaded {position}/{total} policies", flush=True)
+            publish(
+                "loading",
+                (),
+                {**loading_progress, "loaded_policies": position},
+            )
+
+    started = time.perf_counter()
+    policies = load_policies(
+        roster,
+        device=device,
+        greedy=protocol.greedy,
+        progress=loaded,
+    )
+    print(f"policies resident in {time.perf_counter() - started:.1f}s", flush=True)
+
+    play_started = time.perf_counter()
+
+    total_decisions = plan.decisions
+    seen_decisions = {"count": 0}
+    last_progress: dict[str, TournamentProgress | None] = {"value": None}
+
+    def report_progress(shape, done, total, decisions, chunk_sec, played) -> None:
+        elapsed = time.perf_counter() - play_started
+        seen_decisions["count"] += decisions
+        num_players, hand_size = shape
+        chunk_rate = decisions / chunk_sec if chunk_sec > 0 else 0.0
+        overall = seen_decisions["count"] / elapsed if elapsed > 0 else 0.0
+        remaining = (total_decisions - seen_decisions["count"]) / max(overall, 1e-9)
+        print(
+            f"{num_players}p-{hand_size:>2}c | tables {done}/{total} | "
+            f"{chunk_rate:.0f} dec/s here | {overall:.0f} dec/s overall | "
+            f"{played} round-seats | eta {_format_duration(remaining)}",
+            flush=True,
+        )
+
+    def publish_progress(progress: TournamentProgress, outcomes) -> None:
+        last_progress["value"] = progress
+        publish("running", outcomes, progress)
+
+    outcomes = run_tournament(
+        plan,
+        policies,
+        max_concurrent_rounds=int(args.max_concurrent_rounds),
+        progress=report_progress,
+        snapshot=publish_progress,
+    )
+    elapsed = time.perf_counter() - play_started
+    complete_progress = last_progress["value"] or {
+        "completed_matches": len(plan.matches),
+        "total_matches": len(plan.matches),
+        "completed_decisions": plan.decisions,
+        "total_decisions": plan.decisions,
+        "completed_round_seats": len(outcomes),
+        "total_round_seats": plan.round_seats,
+        "fraction": 1.0,
+    }
+    report = publish("complete", outcomes, complete_progress, final=True)
+    print(
+        f"played {plan.rounds} rounds in {_format_duration(elapsed)} "
+        f"({plan.decisions / max(elapsed, 1e-9):.0f} decisions/s)",
+        flush=True,
+    )
+    print(f"wrote {output}", flush=True)
+    print(f"wrote {csv_path}", flush=True)
+    print(f"wrote {named_dashboard}", flush=True)
+    print(f"updated {run.tournament_dashboard}", flush=True)
+    for entry in report.entries:
+        print(
+            f"  {entry.key:>14} n={entry.rounds:>6} "
+            f"reward={entry.relative_reward:+.4f} "
+            f"[{entry.relative_reward_ci_low:+.4f}, {entry.relative_reward_ci_high:+.4f}] "
+            f"bid_hit={entry.bid_hit_rate:.4f}",
+            flush=True,
+        )
+    return 0
+
+
 def play_command(args: argparse.Namespace) -> int:
     checkpoint = None
     if args.run is not None:
@@ -1064,13 +1647,26 @@ def _metric_row(
     elapsed: float,
     eval_reports: dict[str, Any],
 ) -> dict[str, Any]:
+    def measured_kl(value: float) -> float | str:
+        # An omitted replay is not a measured zero. Empty cells keep the
+        # dashboard and CSV consumers from reporting a fictitious KL value.
+        return value if stats.policy_kl_checked else ""
+
     sample_report = eval_reports.get("sample")
     argmax_report = eval_reports.get("argmax")
+    auxiliary_group = next(
+        (
+            group
+            for group in trainer.optimizer.param_groups
+            if not group.get("kl_sensitive", True)
+        ),
+        trainer.optimizer.param_groups[0],
+    )
     return {
         "iteration": trainer.iteration,
         "optimizer_steps": trainer.optimizer_steps,
         "learning_rate": trainer.optimizer.param_groups[0]["lr"],
-        "auxiliary_learning_rate": trainer.optimizer.param_groups[1]["lr"],
+        "auxiliary_learning_rate": auxiliary_group["lr"],
         "elapsed_sec": elapsed,
         "total_sec": total,
         "collect_sec": summary.collect_sec,
@@ -1098,6 +1694,31 @@ def _metric_row(
         "opponent_phase": trainer.opponent_phase,
         "heuristic_eval_win_streak": trainer.heuristic_eval_win_streak,
         "spine_entropy": summary.spine_entropy,
+        "distill_kl": stats.distill_kl,
+        "distill_kl_bid": stats.distill_kl_bid,
+        "distill_kl_play": stats.distill_kl_play,
+        "distill_agree": stats.distill_agree,
+        "distill_agree_bid": stats.distill_agree_bid,
+        "distill_agree_play": stats.distill_agree_play,
+        "distill_top1_mass_bid": stats.distill_top1_mass_bid,
+        "distill_top1_mass_play": stats.distill_top1_mass_play,
+        "distill_teacher_entropy_bid": stats.distill_teacher_entropy_bid,
+        "distill_teacher_entropy_play": stats.distill_teacher_entropy_play,
+        "distill_student_entropy_bid": stats.distill_student_entropy_bid,
+        "distill_student_entropy_play": stats.distill_student_entropy_play,
+        "distill_loss_policy": stats.distill_loss_policy,
+        "distill_loss_value": stats.distill_loss_value,
+        "distill_loss_aux": stats.distill_loss_aux,
+        "distill_value_rmse": stats.distill_value_rmse,
+        "distill_value_correlation": stats.distill_value_correlation,
+        "distill_aux_kl_suit": stats.distill_aux_kl_suit,
+        "distill_aux_kl_rank_boundary": stats.distill_aux_kl_rank_boundary,
+        "distill_aux_kl_trick": stats.distill_aux_kl_trick,
+        "distill_aux_kl_bid_hit": stats.distill_aux_kl_bid_hit,
+        "distill_aux_kl_next_winner": stats.distill_aux_kl_next_winner,
+        "distill_skipped_steps": stats.distill_skipped_steps,
+        "distill_aux_entropy_floor": stats.distill_aux_entropy_floor,
+
         "loss_policy": stats.loss_policy,
         "loss_value": stats.loss_value,
         "loss_value_zero": stats.loss_value_zero,
@@ -1107,19 +1728,45 @@ def _metric_row(
         "value_prediction_std": stats.value_prediction_std,
         "value_rows": stats.value_rows,
         "loss_suit": stats.loss_suit,
+        "loss_rank_boundary": stats.loss_rank_boundary,
         "loss_trick": stats.loss_trick,
         "loss_oracle_trick": stats.loss_oracle_trick,
+        "loss_next_winner": stats.loss_next_winner,
+        "loss_oracle_next_winner": stats.loss_oracle_next_winner,
+        "loss_oracle_card_order": stats.loss_oracle_card_order,
         "loss_bid_hit": stats.loss_bid_hit,
         "suit_accuracy_10c_0": stats.suit_accuracy_10c_0,
         "suit_accuracy_10c_4": stats.suit_accuracy_10c_4,
         "suit_accuracy_10c_8": stats.suit_accuracy_10c_8,
+        "suit_loss_10c_0": stats.suit_loss_10c_0,
+        "suit_loss_10c_4": stats.suit_loss_10c_4,
+        "suit_loss_10c_8": stats.suit_loss_10c_8,
+        "rank_boundary_balanced_accuracy_10c_0": (
+            stats.rank_boundary_balanced_accuracy_10c_0
+        ),
+        "rank_boundary_balanced_accuracy_10c_4": (
+            stats.rank_boundary_balanced_accuracy_10c_4
+        ),
+        "rank_boundary_balanced_accuracy_10c_8": (
+            stats.rank_boundary_balanced_accuracy_10c_8
+        ),
+        "rank_boundary_loss_10c_0": stats.rank_boundary_loss_10c_0,
+        "rank_boundary_loss_10c_4": stats.rank_boundary_loss_10c_4,
+        "rank_boundary_loss_10c_8": stats.rank_boundary_loss_10c_8,
         "trick_accuracy_10c_0": stats.trick_accuracy_10c_0,
         "trick_accuracy_10c_4": stats.trick_accuracy_10c_4,
         "trick_accuracy_10c_8": stats.trick_accuracy_10c_8,
         "oracle_trick_accuracy": stats.oracle_trick_accuracy,
+        "next_winner_accuracy": stats.next_winner_accuracy,
+        "oracle_next_winner_accuracy": stats.oracle_next_winner_accuracy,
+        "oracle_card_order_top1_accuracy": (
+            stats.oracle_card_order_top1_accuracy
+        ),
         "entropy": stats.entropy,
         "entropy_bid_normalized": stats.entropy_bid_normalized,
         "entropy_play_normalized": stats.entropy_play_normalized,
+        "entropy_target_bid": stats.entropy_target_bid,
+        "entropy_target_play": stats.entropy_target_play,
         "entropy_alpha_bid": stats.entropy_alpha_bid,
         "entropy_alpha_play": stats.entropy_alpha_play,
         "ppo_ratio_clip_fraction": stats.ppo_ratio_clip_fraction,
@@ -1127,23 +1774,32 @@ def _metric_row(
         "advantage_mean": stats.advantage_mean,
         "advantage_std": stats.advantage_std,
         "policy_logit_shift": stats.policy_logit_shift,
-        "policy_kl": stats.policy_kl,
-        "policy_kl_p95": stats.policy_kl_p95,
-        "policy_kl_p99": stats.policy_kl_p99,
-        "policy_kl_max": stats.policy_kl_max,
-        "proposed_policy_kl": stats.proposed_policy_kl,
-        "proposed_policy_kl_p95": stats.proposed_policy_kl_p95,
-        "proposed_policy_kl_p99": stats.proposed_policy_kl_p99,
-        "proposed_policy_kl_max": stats.proposed_policy_kl_max,
-        "proposed_mean_exceeded": int(stats.proposed_mean_exceeded),
-        "proposed_p99_exceeded": int(stats.proposed_p99_exceeded),
+        "policy_kl_checked": int(stats.policy_kl_checked),
+        "policy_kl": measured_kl(stats.policy_kl),
+        "policy_kl_p95": measured_kl(stats.policy_kl_p95),
+        "policy_kl_p99": measured_kl(stats.policy_kl_p99),
+        "policy_kl_max": measured_kl(stats.policy_kl_max),
+        "proposed_policy_kl": measured_kl(stats.proposed_policy_kl),
+        "proposed_policy_kl_p95": measured_kl(stats.proposed_policy_kl_p95),
+        "proposed_policy_kl_p99": measured_kl(stats.proposed_policy_kl_p99),
+        "proposed_policy_kl_max": measured_kl(stats.proposed_policy_kl_max),
+        "proposed_mean_exceeded": measured_kl(int(stats.proposed_mean_exceeded)),
+        "proposed_p99_exceeded": measured_kl(int(stats.proposed_p99_exceeded)),
         "backtracks": stats.backtracks,
         "step_scale": stats.step_scale,
         "rolled_back": int(stats.rolled_back),
         "core_grad_norm": stats.core_grad_norm,
+        "embedding_grad_norm": stats.embedding_grad_norm,
         "auxiliary_grad_norm": stats.auxiliary_grad_norm,
+        "policy_loss_grad_norm": stats.policy_loss_grad_norm,
+        "auxiliary_loss_grad_norm": stats.auxiliary_loss_grad_norm,
+        "auxiliary_grad_scale": stats.auxiliary_grad_scale,
         "critic_grad_norm": stats.critic_grad_norm,
         "critic_all_player_rmse": stats.critic_all_player_rmse,
+        "oracle_value_loss": stats.oracle_value_loss,
+        "actor_value_loss": stats.actor_value_loss,
+        "actor_all_player_rmse": stats.actor_all_player_rmse,
+        "actor_value_zero_rmse": stats.actor_value_zero_rmse,
         "critic_all_player_correlation": stats.critic_all_player_correlation,
         "critic_loss_first_epoch": stats.critic_loss_first_epoch,
         "critic_loss_last_epoch": stats.critic_loss_last_epoch,
@@ -1194,6 +1850,7 @@ def _ensure_metrics_header(path: Path) -> None:
             rows = list(reader)
         if header != METRIC_COLUMNS:
             upgradable = {
+                "policy_kl_checked",
                 "bid_hit_focal",
                 "bid_hit_non_focal",
                 "reward_focal",
@@ -1218,10 +1875,16 @@ def _ensure_metrics_header(path: Path) -> None:
                 "proposed_mean_exceeded",
                 "proposed_p99_exceeded",
                 "core_grad_norm",
+                "embedding_grad_norm",
                 "auxiliary_grad_norm",
+                "policy_loss_grad_norm",
+                "auxiliary_loss_grad_norm",
+                "auxiliary_grad_scale",
                 "policy_logit_shift",
                 "entropy_bid_normalized",
                 "entropy_play_normalized",
+                "entropy_target_bid",
+                "entropy_target_play",
                 "entropy_alpha_bid",
                 "entropy_alpha_play",
                 "ppo_ratio_clip_fraction",
@@ -1230,19 +1893,39 @@ def _ensure_metrics_header(path: Path) -> None:
                 "advantage_std",
                 "critic_grad_norm",
                 "critic_all_player_rmse",
+                "oracle_value_loss",
+                "actor_value_loss",
+                "actor_all_player_rmse",
+                "actor_value_zero_rmse",
                 "critic_all_player_correlation",
                 "critic_loss_first_epoch",
                 "critic_loss_last_epoch",
                 "critic_loss_reduction",
                 "peak_update_device_gb",
                 "loss_oracle_trick",
+                "loss_next_winner",
+                "loss_oracle_next_winner",
+                "next_winner_accuracy",
+                "oracle_next_winner_accuracy",
+                "loss_oracle_card_order",
+                "loss_rank_boundary",
                 "suit_accuracy_10c_0",
                 "suit_accuracy_10c_4",
                 "suit_accuracy_10c_8",
+                "suit_loss_10c_0",
+                "suit_loss_10c_4",
+                "suit_loss_10c_8",
+                "rank_boundary_balanced_accuracy_10c_0",
+                "rank_boundary_balanced_accuracy_10c_4",
+                "rank_boundary_balanced_accuracy_10c_8",
+                "rank_boundary_loss_10c_0",
+                "rank_boundary_loss_10c_4",
+                "rank_boundary_loss_10c_8",
                 "trick_accuracy_10c_0",
                 "trick_accuracy_10c_4",
                 "trick_accuracy_10c_8",
                 "oracle_trick_accuracy",
+                "oracle_card_order_top1_accuracy",
                 "eval_reward_vs_heuristic_sample",
                 "eval_bid_hit_sample",
                 "eval_reward_vs_heuristic_argmax",

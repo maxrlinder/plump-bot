@@ -147,8 +147,24 @@ The clipped actor objective uses the exact legally masked behavior policy:
 ratio = exp(log pi_new(action|observation) - log pi_old(action|observation))
 L_clip = -min(ratio * advantage,
               clip(ratio, 1-epsilon, 1+epsilon) * advantage)
-advantage = terminal_relative_reward - V_old(global_state, seat)
 ```
+
+`ppo_advantage_estimator="monte_carlo"` uses
+`terminal_relative_reward - V_old(global_state, seat)`. Oracle runs may instead
+select `"gae"`. With discount one, their frozen pre-update oracle values define
+
+```text
+delta_t = reward_t + V_old(next_decision_state, seat) - V_old(state_t, seat)
+advantage_t = delta_t + lambda * delta_(t+1) + lambda^2 * delta_(t+2) + ...
+```
+
+The successor is the next genuine action readout after the chosen action and
+all automatic bookkeeping, not necessarily the next serialized token. A final
+action uses the realized terminal return in place of a successor value.
+`ppo_gae_lambda=1` telescopes exactly to the Monte Carlo advantage; zero is
+one-step TD. The selected estimator is weight-normalized to standard deviation
+one before PPO, and the existing global gradient clip and KL acceptance test
+remain unchanged.
 
 There is no epsilon-random behavior policy. Sampling from an external mixture
 while storing `pi_old` probabilities would make ordinary PPO off-policy.
@@ -163,51 +179,113 @@ column `s` is always the value for the same seat `s` named by card-owner and
 event-actor fields. An assertion checks this tie for every PPO decision while
 building the update batch.
 
-At each learned pre-action state the critic is trained against all active
-players' undiscounted terminal relative returns. Its loss averages the player
-axis, so adding output columns does not multiply the weight of larger tables.
-The oracle also predicts every absolute seat's final trick count at every
-causal prefix, using the same feasibility-masked classes as the actor. This is
+With `value_positions="all"` and the active
+`dense_supervision_start="bidding"`, the critic is trained at every token from
+the first bidding state onward against all active players' undiscounted
+terminal relative returns. GAME and its $P N$ owner-tagged card tokens have
+zero weight. The loss averages both the eligible-position and player axes, so
+longer sequences or wider tables do not multiply a game's objective weight. The active values are
+mean-centered at each state, enforcing the exact zero-sum identity of the
+relative return targets. PPO then gathers only the acting player's column at
+actual pre-action states for its baseline. The oracle also predicts every
+absolute seat's final trick count at every eligible token, using the same
+feasibility-masked classes as the actor. This is
 an outcome auxiliary, not a hidden-information belief: the oracle already sees
 the full deal. Oracle suit presence is intentionally not trained because it is
 visible verbatim in the owned HAND tokens and would be a trivial identity.
-For the actor advantage only the acting player's column is selected. The
+With `oracle_card_order_coef > 0`, a 52-logit oracle head also scores exact
+cards. Scores are normalized separately over each absolute player's remaining
+hand with a Plackett--Luce listwise likelihood of the realized future play
+permutation. The per-state loss averages non-trivial selections and players,
+so it does not grow with hand size or table width. Its 20,020 parameters are
+packed with the final-trick projection and use the same oracle
+forward/backward; it never runs during actor rollout.
+For the actor advantage only the acting player's column is selected. GAE is
+formed over every actual action-to-action transition before that selection, so
+opponent actions, bidding-to-play, and trick-boundary bookkeeping cannot create
+an artificial gap in the trajectory. The
 critic runs after rollout collection, uses full causal forwards coalesced by
 padded sequence length, and never changes actor tokens or exposes hidden cards
 at deployment. The older `privileged` pooled-deal observer critic and the
 non-privileged `independent` critic remain available as ablations.
 
 For oracle PPO runs, the dashboard's value panel becomes **Oracle critic
-dynamics**. It compares acting-seat RMSE, all-seat RMSE, and the zero-baseline
-RMSE; plots acting/all-seat return correlation and fractional critic-loss
-reduction from the first to last epoch within each update; and includes the
+dynamics**. It compares decision-only acting-seat RMSE, dense all-seat RMSE,
+and the decision-only zero-baseline RMSE; plots the corresponding return
+correlations and fractional critic-loss reduction from the first to last epoch
+within each update; and includes the
 separately clipped critic gradient norm in the gradient panel. The raw first
 and last epoch losses are retained in `metrics.csv` as
 `critic_loss_first_epoch` and `critic_loss_last_epoch`.
+`loss_oracle_card_order` reports the normalized listwise NLL summed across
+critic epochs, while `oracle_card_order_top1_accuracy` reports whether the
+highest-scored remaining card is the next realized card for each player.
 
-When `suit_coef` or `trick_coef` is nonzero, PPO actor replay also trains the
-ordinary observer-limited heads from the same full-sequence hidden states used
-by the policy loss. Each game has unit auxiliary mass, split across learned
-seats and then evenly across that observer's genuine token positions; padding
-has zero weight. This keeps auxiliary loss scale independent of sequence
-length without changing the deliberately length-weighted policy objective.
-The active MPS profile sets `ppo_actor_auxiliary_detach_hidden=true`: suit and
-final-trick readouts consume `hidden.detach()`, so their losses update only the
-auxiliary-head optimizer group. Embeddings, transformer blocks, final
-normalization, and bid/card action heads receive gradients only from the PPO
-policy/entropy objective. This option does not detach or freeze the separate
-oracle critic.
-For ten-card games, metrics report opponent-suit bit accuracy and exact
-per-seat final-trick accuracy immediately before the observer's first, fifth,
-and ninth play—after that observer has played 0, 4, and 8 cards.
+When `suit_coef`, `rank_boundary_coef`, or `trick_coef` is nonzero, PPO actor
+replay also trains the ordinary observer-limited heads from the same
+full-sequence hidden states used by the policy loss. Rank boundaries ask, for
+each opponent and suit, whether a held card lies strictly below the observer's
+current lowest remaining card or above its highest; an additional row asks the
+same of any opponent. Suits absent from the observer's current hand are masked.
+With `ppo_auxiliary_positions="all"`, each game has unit auxiliary mass, split
+across learned seats and then evenly across every token from bidding onward in
+that observer stream. `dense_supervision_start="bidding"` zeros GAME and the
+actor's $N$ dealt-card tokens; with bidding TURN tokens, supervision begins on
+the opening-bid readout. Suit presence, rank boundaries, and final trick counts
+are therefore dense post-deal state targets. Prefix and padding have zero
+weight. Bid/card PPO loss,
+entropy, clipping, and KL are still gathered only at actual observer decision
+rows. This keeps auxiliary loss scale independent of sequence length without
+changing the deliberately length-weighted policy objective. Setting the option
+to `"policy"` retains the decision-only auxiliary ablation.
+The active MPS profile sets `ppo_actor_auxiliary_detach_hidden=false`: suit,
+rank-boundary, and final-trick losses pass through the observer actor's hidden states and therefore
+train its embeddings, transformer blocks, and final normalization as well as
+their readout heads. They still do not supervise bid/card logits directly, but
+their shared-trunk update can change the policy and is consequently covered by
+the same KL guard. Because the configured core and auxiliary learning rates are
+equal, this coupled actor uses one Adam parameter group, and one global-norm
+clip covers all of it: trunk, action heads, input embeddings, and auxiliary
+heads share a single budget and are rescaled by the same factor. The gradient
+panel still breaks the pre-clip norm down into the input-embedding and
+auxiliary-head components, but those are diagnostics, not budgets. The separate
+oracle critic remains end-to-end trainable and clipped independently.
+With `ppo_actor_value_coef > 0` the actor additionally carries its own
+`player_value_head`, a per-seat value readout on the observer-relative seat
+axis. It is a measurement, not a control signal: PPO advantages, the acting
+baseline, and checkpoint evaluation all still come entirely from the oracle
+critic. The probe is deliberately identical to the oracle's head in every
+respect that could otherwise explain a difference — same module shape, same
+per-seat terminal-reward targets, dense over every token from bidding onward, the
+same zero-sum centering, and the same unit objective mass per game — so the gap
+between the two curves in the **Value prediction · actor vs oracle** panel is
+exactly the price of observer information versus perfect information.
+`actor_value_loss` and `oracle_value_loss` are both per-pass (the oracle's is
+`loss_value` divided by `ppo_critic_epochs`), and `actor_all_player_rmse` is
+measured the same way as `critic_all_player_rmse`, in reward units. The actor's
+scalar `value_head` is unrelated to this probe: it remains the counterfactual
+objectives' baseline readout and the oracle's initialization source, and takes
+no gradient under PPO.
+
+For ten-card games, metrics report opponent-suit bit accuracy, class-balanced
+rank-boundary bit accuracy, and exact per-seat final-trick accuracy immediately
+before the observer's first, fifth, and ninth play—after that observer has
+played 0, 4, and 8 cards. Balanced rank-boundary accuracy is the mean of the
+positive and negative recall, preventing an all-negative predictor from looking
+good merely because a particular boundary event is uncommon.
 
 Entropy is calculated over legal actions and normalized by `log(legal_count)`.
 Forced moves are excluded. Bid and play temperatures are separate. Adaptive
 mode increases a positive temperature when measured normalized entropy falls
 below its configured target and decreases it above target. Full masked
 `KL(pi_old || pi_new)` guards still backtrack or reject an Adam proposal
-independently of PPO ratio clipping. The mean guard is mandatory and the p99
-guard is optional. `ppo_behavior_replay_kl` checks
+independently of PPO ratio clipping. With `ppo_trust_region=true` (the default),
+the mean guard is mandatory and the p99 guard is optional. Setting
+`ppo_trust_region=false` skips the post-step actor replay, rollback snapshots,
+and backtracking loop. Adam takes its normal step; the PPO loss, gradient
+clipping, auxiliary budget, and entropy controller are unchanged. Post-step KL
+metrics are then blank (`policy_kl_checked=0`), and the log shows `kl off`.
+`ppo_behavior_replay_kl` still checks
 the pre-update numerical difference between reduced-precision cached
 collection and full-sequence update replay; it should remain near zero.
 
@@ -244,17 +322,30 @@ changes neither histories nor action probabilities. At checkpoint 4000, the
 seconds collection-plus-update, down from approximately 25 and 32 seconds,
 with a 1.60 GB rollout peak.
 
-PPO update groups can be coalesced with `ppo_sequence_bucket_width`. Each
-actor/oracle sequence is tail-padded to the next bucket boundary (capped at its
-model's positional capacity), then shapes with the same padded length are
-processed together. Causality makes selected pre-padding readouts exactly
-unchanged. The PPO MPS preset uses width 32. In the 768-game production
-profile this reduced the 24 small per-shape groups to 3 actor and 4 critic
-length buckets. PPO replay
-also evaluates bid/card heads only on actual decision rows rather than every
-token. Measured together, these changes cut steady update time while keeping
-`microbatch_positions=16384`; larger microbatches increased memory without a
-repeatable speed gain.
+PPO update groups can be coalesced with `ppo_sequence_bucket_width`; the
+independent critic can use `ppo_critic_sequence_bucket_width` because its
+canonical oracle sequences have a different length distribution. Each stream
+is tail-padded to its next bucket boundary (capped at that model's positional
+capacity), then shapes with the same padded length are processed together.
+Causality makes selected pre-padding readouts exactly unchanged. The PPO MPS
+preset uses actor width 16 and critic width 32. PPO replay evaluates bid/card
+heads only on actual decision rows.
+Coupled state auxiliaries use every bidding-and-play token in one contiguous packed
+projection; selecting narrow logits after projection avoids an expensive
+hidden-state gather. Oracle value remains decision-indexed while trick/order
+auxiliaries are dense. All active losses share the existing backward per
+microbatch. Vectorized rank-boundary construction and reuse of the oracle's
+seat-0 replay remove most CPU labeling overhead. The production setting is
+57,344 update positions: the smallest threshold that fits each of the five
+actor length buckets in one physical microbatch. Rollout keeps all 768 games;
+rollout games and update microbatch positions remain independent knobs, and
+update slicing does not change the accumulated loss.
+
+At v4 checkpoint 46,900, a controlled three-repeat MPS benchmark improved
+from 23.18 seconds/update (8.61 collection + 14.57 update) to 22.18 seconds
+(8.59 + 13.59), or 4.3% end-to-end. Peak update allocation rose from 11.22 GB
+to 14.52 GB on the 24 GB machine. The same sweep rejected 16-deal rollout
+batches, BF16 KV storage, retained PPO cache pools, and critic width 64.
 
 ## Rollout packing and opponent curriculum
 
@@ -276,10 +367,42 @@ environment trajectories fixed while increasing actor decision rows from
 12,480 to 19,968 per update. `deals_per_batch=128` is only a rollout wave
 capacity and does not change the 768-game objective batch.
 
-Changing an adaptive entropy target resets its temperature and temperature
-optimizer to `ppo_entropy_coef`. Those are controller state for the previous
-constraint, not actor weights; carrying a wound-up temperature into a new
-target can impose the old entropy floor for hundreds of updates.
+### Merged waves
+
+`rollout.merged_waves` decodes the whole schedule in one continuously-batched
+loop instead of one lockstep loop per cell. The lockstep loop is width-starved
+by construction: it can only hold deals of one shape at one length, which on
+this schedule meant 600 decode calls of about 133 rows each. The decode kernel
+costs roughly 2.2 ms of fixed overhead plus 4.9 us/row, so three quarters of
+every call was launch, not arithmetic.
+
+| width | ms/call | us/row |
+| --- | --- | --- |
+| 128 | 2.84 | 22.19 |
+| 1024 | 6.47 | 6.31 |
+| 4096 | 22.35 | 5.46 |
+
+Two measurements shaped the design. Padding the ragged read to the batch's
+longest row is nearly free (1.14x from length 30 to 73, free from 73 to 146),
+so rows are masked rather than gathered by length. Addressing rows by an index
+tensor instead of a dense slice costs up to 1.65x, so live rows must stay a
+dense prefix of the pool rather than a scattered free list -- which is why
+games are dealt longest-lived first and retire from the tail.
+
+Measured on the 768-game MPS schedule: collect 8.1s -> 2.8s (2.9x) for +19%
+forward rows of padding and 0.38 GB of pool, and the whole iteration 22.1s ->
+16.6s. The trees are unchanged -- the merged path reproduces the lockstep
+trajectories exactly. `merged_max_rows` cuts the schedule into several loops if
+the pool ever stops fitting.
+
+Adaptive bid/play entropy targets may be constant or follow an iteration-based
+linear or half-cosine path from their base values to
+`ppo_*_entropy_target_end`. Configure the curve with `ppo_entropy_target_schedule`,
+`ppo_entropy_schedule_start_iteration`, and
+`ppo_entropy_schedule_end_iteration`. Linear changes at a constant rate; the
+half-cosine has zero slope at both ends. Reconfiguration preserves the adaptive
+temperature and optimizer state, allowing the existing controller pressure to
+track the new target continuously.
 
 When historical mode is selected, five distinct checkpoints are sampled
 uniformly from every retained checkpoint at iteration 3500 or later. They are
@@ -334,6 +457,8 @@ typed schema-v6 training entrypoint and run/checkpoint machinery:
 
 - balanced player/card/bidding-position schedule;
 - schema-v6 model dimensions and token flags;
+- causal bid-pressure fields, packed per-layer embedding width, and
+  alternating/all/off attention value embeddings;
 - branch rule and per-shape rate schedule;
 - cache and microbatch limits;
 - loss coefficients, KL cap, and warmup;
@@ -345,6 +470,8 @@ Use typed dotted overrides:
 ```bash
 uv run plump train experiment \
   --set model.d_model=320 \
+  --set model.per_layer_embedding_dim=128 \
+  --set model.value_embedding_mode=\"alternating\" \
   --set training.core_learning_rate=0.00002 \
   --set training.auxiliary_learning_rate=0.0002 \
   --set rollout.kv_dtype=\"fp16\"
@@ -364,7 +491,7 @@ The production PPO actor/critic path has a dedicated benchmark:
 ```bash
 .venv/bin/python tools/benchmarks/benchmark_ppo.py \
   --games-per-shape 32 \
-  --bucket-width 32 \
-  --microbatch-positions 16384 \
+  --bucket-width 16 \
+  --microbatch-positions 65536 \
   --warmup 1 --repeats 3
 ```

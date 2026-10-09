@@ -49,9 +49,9 @@ Adam proposes new weights -> measure KL(old policy || new policy)
         +-- acceptable: keep the weights
 ```
 
-The value, suit-presence, and trick-count losses train useful predictions from
-the same transformer representation. The policy loss is the part that directly
-turns game reward into action preference.
+The value, suit-presence, rank-boundary, and trick-count losses train useful
+predictions from the same transformer representation. The policy loss is the
+part that directly turns game reward into action preference.
 
 ## 1. What is the policy?
 
@@ -604,14 +604,42 @@ An accurate baseline makes $Y-b$ smaller and reduces variance in
 $\widehat Q$. It is not required for the expectation to be correct because
 the same $b$ is added back outside the inclusion correction.
 
+In the active PPO-oracle profile, the terminal return vector is instead
+supervised at every oracle token from the first bidding state onward. GAME and
+the oracle's full owner-tagged dealt-card block have zero loss weight. For game
+$g$, active player $i$, and eligible causal position $t$, the oracle predicts
+$V_i(h_{g,t})$. The prediction is
+projected to exact zero sum across active players and fitted to that game's
+terminal relative-return vector. Position weights sum to the original game
+weight, and the player axis is averaged, so dense supervision changes the set
+of state targets without increasing the value coefficient. PPO advantages
+still gather only the acting player's value at actual decision states.
+
 ## 10. Auxiliary predictions
 
 The current loss also trains:
 
 - whether each opponent still holds each suit;
 - every player's final trick count;
+- which seat takes the next trick still to be resolved;
+- for the oracle critic, the future within-player play order of every
+  remaining hand;
 - optionally, whether each player exactly hits its bid (disabled in the active
   preset).
+
+The next-trick-winner target is the only one of these that is not a statement
+about the round as a whole. Final trick count and bid hit are outcomes: one
+label per seat, restated at every position, and the feasibility mask that
+bounds the trick count narrows to a point mass by the last trick, so the task
+gets easier exactly as the round runs out. "Who takes the next trick" instead
+re-aims at the nearest unresolved event, and stays a genuine forecast for the
+whole play phase. It is labeled densely from the token carrying the final bid
+through the token carrying the second-to-last trick win, and is IGNORE outside
+that window: before the bids are in the question conflates the trick with the
+bids still to come, and after the last trick there is no next trick. Classes
+are seats on whichever axis the stream uses -- observer-relative for an actor,
+absolute for the oracle, whose canonical observer is seat 0 -- and seats a
+table does not have are masked out of the softmax.
 
 These labels never become policy inputs. They encourage the shared transformer
 to represent strategically relevant information. The active coefficients are
@@ -621,27 +649,77 @@ L_{\text{total}}
 =
 1.0L_{\text{policy}}
 +0.5L_V
-+0.05L_{\text{suit}}
-+0.05L_{\text{trick}},
++0.10L_{\text{suit}}
++0.20L_{\text{rank-boundary}}
++0.20L_{\text{trick}}
++0.20L_{\text{next-winner}},
 $$
 
 with bid-hit and entropy coefficients zero.
 
-Although the auxiliary readout parameters have their own optimizer group,
-their gradients also pass through the shared transformer. They can help the
-policy representation, but they are another reason the neural update is not a
-literal tabular policy-improvement proof. The KL guard observes their net
-effect on the policy. This describes the counterfactual preset. The active PPO
-preset instead enables `ppo_actor_auxiliary_detach_hidden`: observer suit and
-final-trick heads receive $\operatorname{stopgrad}(h)$, so
+The oracle uses a separate objective and optimizer. In addition to value MSE,
+`0.20`-weighted final-trick CE and `0.20`-weighted next-trick-winner CE, the
+active profile gives its card-order loss coefficient `0.05`; it does not enter
+the actor loss above. Trick count and next-trick winner are single
+coefficients read by both sides, so the two objectives always weight them
+identically. The oracle's copies of both heads are trainable even though it
+sees every hand: knowing the cards does not tell you who takes the next trick
+without working out the play.
+
+The active PPO preset couples the observer suit, rank-boundary, final-trick and
+next-trick-winner
+losses to the shared transformer: `ppo_actor_auxiliary_detach_hidden=false`, so
 
 $$
-\frac{\partial L_{\text{actor-aux}}}{\partial h}=0.
+\frac{\partial L_{\text{actor-aux}}}{\partial h}\ne 0.
 $$
 
-Those readout heads learn whatever is already decodable from the policy hidden
-state, but cannot reshape embeddings, transformer blocks, normalization, or
-action heads. PPO's independent oracle critic remains end-to-end trainable.
+These tasks can therefore improve strategically useful representations in the
+embeddings, transformer blocks, and normalization. They do not supervise the
+action logits directly, but changes to the shared trunk can change the policy;
+the KL guard observes their combined effect. With equal configured core and
+auxiliary learning rates the complete actor uses one Adam parameter group and
+one global-norm gradient clip. PPO's independent oracle critic remains
+end-to-end trainable and is clipped as its own whole.
+
+With `ppo_auxiliary_positions="all"`, these state targets are read at every
+eligible causal token; with `value_positions="all"`, the oracle EV vector is
+too. The active `dense_supervision_start="bidding"` excludes GAME and all
+dealt-card tokens, independently locating the end of the actor's $N$-card and
+oracle's $P N$-card prefixes. With the active bidding TURN token, the first
+eligible state is the opening-bid readout. Action PPO, entropy, clipping, and
+KL remain restricted to actual bid/play decisions. If trajectory $g$ has
+$S_g$ eligible positions and auxiliary coefficient $\lambda$, its contribution
+is
+
+$$
+\lambda\frac{w_g}{S_g}\sum_{t\in\mathcal S_g}\ell_{g,t}.
+$$
+
+Thus denser labels do not increase the coefficient or the trajectory's total
+auxiliary mass; they replace an average over decision states by an average over
+all bidding-and-play states. Prefix tokens and bucket padding have zero weight.
+
+### Separate gradient-norm budgets
+
+Note what the two masses are: PPO carries one row of weight $w_g$ per
+*decision*, while each auxiliary head carries $w_g$ per *sequence*. A
+trajectory has $N+1$ decisions, so over the 3..10 card schedule the policy term
+enters the sum with mean weight $7.5$ against every head's $1$ — before
+coefficients, and varying by hand size. Measured on the actor at v4's iteration
+47,600 the two halves differed by $15.7\times$ ($6.37$ against $0.41$ over
+every actor parameter).
+
+That imbalance is not neutralized by the clip, because Adam is invariant to a
+uniform rescale of the gradient; and it does not decay, because normalized
+advantages hold the PPO gradient at unit scale however converged the policy is,
+while a belief residual $(p-y)$ shrinks as its head fits.
+`ppo_auxiliary_grad_fraction` therefore sets the ratio directly: the two halves
+are differentiated separately, the auxiliary one is rescaled so that
+$\|g_{\text{aux}}\| = \phi\,\|g_{\text{PPO}}\|$, and the sum then takes
+the single `max_grad_norm` clip as before. 0 disables the split entirely and
+restores the one summed backward. The cost is a second backward over the shared
+trunk, measured at 1.4 s of a 14.0 s update.
 
 ## 11. What one counterfactual local update contains
 
@@ -858,29 +936,86 @@ $$
 
 Input player id $i$ and output column $i$ always refer to the same absolute
 seat. For an action sampled by seat $i$, let the frozen pre-update prediction
-be $V_{\phi_{old}}(s_t,i)$. With no discounting or bootstrapping, the advantage
-sample is
+be $V_{\phi_{old}}(s_t,i)$. The Monte Carlo estimator is
 
 $$
 A_t = R_i - V_{\phi_{old}}(s_t,i).
 $$
 
+The oracle can instead use generalized advantage estimation (GAE) with
+undiscounted one-step temporal-difference residuals
+
+$$
+\delta_t^i=r_t^i+V_{\phi_{old}}(s_{t+1},i)
+             -V_{\phi_{old}}(s_t,i),
+\qquad
+\hat A_t^i=\sum_{k\ge0}\lambda^k\delta_{t+k}^i.
+$$
+
+$s_{t+1}$ is the next genuine decision state after action $t$ and all
+deterministic game bookkeeping. Thus it can cross a TURN or TRICK_WIN token;
+the next serialized token is not used blindly. On a terminal transition,
+$r_t^i=R_i$ and the successor value is zero. With $\gamma=1$ and
+$\lambda=1$, the sum telescopes exactly to the Monte Carlo expression above;
+$\lambda=0$ gives one-step TD. The V5 profile uses $\lambda=0.95$ and retains
+the same weighted advantage normalization, PPO clipping, gradient clipping,
+and KL guard.
+
 The critic changes variance, not the expected policy gradient. Although it sees
 hidden cards unavailable to the actor, it is a valid baseline because those
 cards are part of the pre-action environment state and the critic does not see
 which current action will be sampled. Conditional on that state,
-$\mathbb E_{a\sim\pi}[\nabla\log\pi(a) V_\phi(s,i)]=0$. At every learned
-pre-action state, all active output columns are trained by Monte Carlo MSE
-against $(R_0,\ldots,R_{P-1})$; the player axis is averaged so it does not
+$\mathbb E_{a\sim\pi}[\nabla\log\pi(a) V_\phi(s,i)]=0$. At every supervised
+state from bidding onward, all active output columns are trained by Monte Carlo
+MSE against $(R_0,\ldots,R_{P-1})$; the player axis is averaged so it does not
 reweight games by player count.
 
+Relative rewards sum to zero in every realized game. The oracle therefore
+projects its raw active-seat outputs $z_i(s_t)$ onto the same exact subspace
+before they are used for advantages, metrics, or MSE:
+
+$$
+V_i(s_t)=z_i(s_t)-\frac{1}{P}\sum_{j=0}^{P-1}z_j(s_t),
+\qquad \sum_i V_i(s_t)=0.
+$$
+
+This is a state-dependent shared offset, not reward shaping. Under the equal
+per-seat MSE it is the orthogonal projection onto the known target space and
+cannot increase the joint squared error to a zero-sum return vector.
+
 The same oracle hidden states have a second, feasibility-masked categorical
-head for every absolute seat's final trick count. It is supervised densely at
-all real oracle positions. There is deliberately no oracle suit-presence loss:
+head for every absolute seat's final trick count. It is supervised at every
+oracle token from bidding onward. There is deliberately no oracle suit-presence loss:
 the oracle HAND prefix already states every card owner, so that target would
 measure copying rather than inference. This auxiliary may improve the critic's
 representation, but it does not enter the advantage directly and does not
 change the validity of the baseline argument above.
+
+The oracle also predicts the order in which every player's remaining cards
+will be played. From every supervised hidden state from bidding onward it emits one contextual
+score $z_t(c)$ for each exact card. Because dealt hands are disjoint, these 52
+scores are partitioned by owner and normalized independently inside each
+player's remaining hand; a redundant player-by-card output table would add no
+valid comparison. If player $i$'s realized remaining within-hand order is
+$(c_1,\ldots,c_m)$, its Plackett--Luce likelihood is
+
+$$
+P(c_1,\ldots,c_m\mid s_t,i)
+=
+\prod_{j=1}^{m-1}
+\frac{\exp z_t(c_j)}
+{\sum_{k=j}^{m}\exp z_t(c_k)}.
+$$
+
+The loss is the mean negative log-likelihood over the $m-1$ non-trivial
+selections, then the mean over active players with at least two cards left.
+It therefore defines a coherent distribution over permutations: every card is
+selected once, with no duplicate order slots. The observed suffix is a Monte
+Carlo sample from the rollout policy when future choices remain stochastic; in
+a forced continuation it is deterministic, and the likelihood optimum puts
+probability one on that order. The trick and card-order linear projections are
+packed into one matrix multiplication and share the oracle's existing single
+backward pass.
 
 For the actor, define
 
@@ -925,24 +1060,29 @@ Self-play can learn from every seat without counting one deal as $P$
 independent games. The sum is deliberately not divided by decision count, so a
 longer hand contributes more policy decisions.
 
-The actor's suit-presence and final-trick auxiliaries use a separate dense
-normalization:
+The actor's suit-presence, rank-boundary, final-trick and next-trick-winner
+auxiliaries use a
+separate decision-state normalization. If $D_{g,i}$ is the number of learned
+decisions for seat $i$:
 
 $$
 L_{aux}=\frac{1}{G}\sum_g\frac{1}{|C_g|}
-\sum_{i\in C_g}\frac{1}{L_{g,i}}\sum_{t=1}^{L_{g,i}}
+\sum_{i\in C_g}\frac{1}{D_{g,i}}\sum_{t=1}^{D_{g,i}}
 \ell_{aux}(h_{g,i,t}).
 $$
 
-With the active head-only setting, the loss value is unchanged but its input is
-treated as $\operatorname{stopgrad}(h_{g,i,t})$ for differentiation.
+In the active coupled setting, this loss differentiates through
+$h_{g,i,t}$ and shapes the shared actor representation. The same normalization
+keeps each game's auxiliary mass fixed.
 
 Thus each game contributes equal auxiliary mass while longer games retain
 their requested larger policy mass. For ten-card games, evaluation of these
 heads is pinned to the pre-action states before plays 1, 5, and 9, meaning the
 observer has personally played exactly 0, 4, or 8 cards. Opponent-suit accuracy
-is micro-accuracy over opponent/suit bits; final-trick accuracy is exact-class
-accuracy over active seats.
+is micro-accuracy over opponent/suit bits. Rank-boundary accuracy averages
+positive recall and negative recall over every labeled opponent/aggregate,
+suit, and lower/higher bit, so class imbalance cannot inflate it. Final-trick
+accuracy is exact-class accuracy over active seats.
 
 ### Preventing entropy collapse
 
@@ -971,6 +1111,52 @@ which is faster than BF16 cached attention on the M5 Pro. Attention softmax,
 masked policy log-softmax, likelihood ratios, KL, entropy, returns, advantages,
 and loss accumulation are explicitly FP32.
 
+### Additive per-layer conditioning
+
+Let $e_t$ be the ordinary input embedding at token $t$. For PLE width $r$ and
+$L$ blocks, one packed lookup supplies $u_t\in\mathbb{R}^{Lr}$ from all token
+fields and position, while a learned packed projection supplies
+$W_c e_t\in\mathbb{R}^{Lr}$. After reshaping, block $\ell$ receives
+
+$$
+p_{t,\ell}=\frac{u_{t,\ell}+(W_c e_t)_\ell}{\sqrt{2}},\qquad
+h_{t,\ell}\leftarrow h_{t,\ell}+R(p_{t,\ell}),
+$$
+
+where $R$ is the fixed repeat/truncate map from $r$ to model width, scaled by
+the square root of its repeat count. The packed lookup and $W_c$ start at zero,
+so this update is initially exactly zero and both receive gradients directly.
+This streamlined residual realizes the token-specific, per-block conditioning
+idea without adding launch-bound gated MLPs to every one-token cached decode.
+
+For selected attention blocks, a second packed lookup produces
+$z_{t,\ell}\in\mathbb{R}^{H_{kv}d_h}$ and attention uses
+
+$$
+V_{t,\ell}=V^{\text{qkv}}_{t,\ell}+z_{t,\ell}.
+$$
+
+The zero-initialized $z$ rows preserve the former attention result and receive
+ordinary gradients immediately. Actor and oracle tables are independent; the
+oracle learns absolute-owner semantics and has longer position tables.
+
+Absent categorical fields are represented by one compact pattern row, rather
+than by adding every individual NA sentinel row. For an absence mask $M_t$, its
+row is initialized on migration as
+
+$$
+e_{\mathrm{NA-pattern}}(M_t)
+=
+\sum_{j\in M_t} e_j(\mathrm{NA}_j),
+$$
+
+and the analogous sum is used for the PLE and attention-value tables. Thus the
+new representation begins with the same mathematical contribution as the old
+one, but subsequent optimization learns one state-pattern direction instead
+of driving several ubiquitous sentinel rows. Different valid missing-field
+patterns remain distinct. Because floating-point addition is not associative,
+the migration is numerically close rather than guaranteed byte-identical.
+
 ### Current local production batch and execution
 
 The `ppo-oracle-mps-768-v2` profile collects 32 independent games for each of the
@@ -982,14 +1168,19 @@ decision rows per update, versus 12,480 under the former half-self,
 half-focal-versus-heuristic mixture. The larger Monte Carlo batch reduces
 estimator variance but does not change the PPO objective above.
 
-At update time, sequences are tail-padded to length buckets of width 32 and
-concatenated. At 768 games this turns the 24 per-shape groups into three actor
-and four oracle-critic groups. Causal masking means padding after a selected
+At update time, sequences are tail-padded to length buckets of width 16 and
+concatenated. This coalesces neighboring shapes without the larger padded-FLOP
+cost measured at width 32. Causal masking means padding after a selected
 decision cannot alter that decision's hidden state, so this coalescing is an
-exact execution optimization. Actor replay also computes bid and card heads
-only at stored decision rows; unused token positions do not enter the PPO
-loss. The production microbatch ceiling remains 16,384 positions because a
-larger ceiling raised memory use without a repeatable throughput gain.
+exact execution optimization. Actor replay computes bid/card heads only at
+stored decision rows. State auxiliaries use every token from bidding onward in one
+contiguous packed projection, after which the much narrower logits discard
+bucket padding. Their losses join the policy loss before one backward per
+microbatch. With PLE and attention-value activations, production uses 16,384
+positions per microbatch while accumulating the same complete 768-game loss;
+the first live update peaked at 7.90 GiB.
+At 32,768 the live process retained 15.54 GiB and left too little unified-memory
+headroom; a 49,152-position stress test caused severe pressure.
 
 The trainer checkpoints every 100 updates. A separate restartable monitor
 evaluates every 300 updates and refreshes the dashboard every five metric rows.
@@ -997,8 +1188,10 @@ Every automatic evaluation runs both sampled and deterministic-argmax policies
 on the same deal bank, yielding reward and bid accuracy for each while updates
 continue. The heuristic remains the evaluation benchmark even though it is no
 longer part of training rollout collection. Argmax reward controls `best` and,
-when that curriculum is enabled, the heuristic-to-history gate. The active
-adaptive normalized-entropy targets are 0.50 for bidding and 0.40 for play.
+when that curriculum is enabled, the heuristic-to-history gate. From iteration
+46,900 through 58,000, the adaptive normalized-entropy targets decrease
+linearly from 0.45 to 0.25 for bidding and from 0.35 to 0.20 for play. The
+oracle receives two optimization epochs per collected batch.
 These reporting intervals affect observability and recovery, not the
 estimator.
 

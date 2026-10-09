@@ -6,13 +6,14 @@ A seat sequence is the game from one observer's point of view:
 
 All player references are observer-relative. The sequence contains exactly the
 information the observer may see: their own dealt hand plus the public event
-stream. Per-position auxiliary labels (suit presence, bid hit, final trick
-counts) are reconstructed by replaying the event log against the true deal; they
-are training targets only and never model inputs.
+stream. Per-position auxiliary labels (suit presence, rank boundaries, bid hit,
+final trick counts) are reconstructed by replaying the event log against the
+true deal; they are training targets only and never model inputs.
 """
 
 from __future__ import annotations
 
+from collections.abc import Collection
 from dataclasses import dataclass
 from functools import lru_cache
 
@@ -23,15 +24,21 @@ from plump.state import EventType, GameEvent
 
 from .config import (
     BASE_TOKEN_WIDTH,
+    NA_PATTERN_MASKS,
     NEXT_BID,
     NEXT_NONE,
     NEXT_PLAY,
     NUM_CARDS,
     SLOT_BID,
+    SLOT_BID_PRESSURE,
+    SLOT_BID_SUM,
+    SLOT_BIDS_MADE,
+    SLOT_BIDS_REMAINING,
     SLOT_CARD,
     SLOT_HAND_SIZE,
     SLOT_NEXT_ACTOR,
     SLOT_NEXT_PHASE,
+    SLOT_NA_PATTERN,
     SLOT_NUM_PLAYERS,
     SLOT_POS_IN_TRICK,
     SLOT_RANK,
@@ -54,6 +61,12 @@ SUITS: tuple[Suit, ...] = (Suit.SPADES, Suit.HEARTS, Suit.DIAMONDS, Suit.CLUBS)
 RANKS: tuple[Rank, ...] = tuple(Rank)
 
 IGNORE_LABEL = -100
+_NA_PATTERN_TO_ID = {
+    mask: index for index, mask in enumerate(NA_PATTERN_MASKS)
+}
+_NA_PATTERN_ID_LOOKUP = np.full(1 << BASE_TOKEN_WIDTH, -1, dtype=np.int8)
+for _pattern_id, _pattern_mask in enumerate(NA_PATTERN_MASKS):
+    _NA_PATTERN_ID_LOOKUP[_pattern_mask] = _pattern_id
 
 
 # There are 52 cards and this is called millions of times per update, so the
@@ -95,8 +108,12 @@ def _base_token_template(
     token[SLOT_NUM_PLAYERS] = num_players
     token[SLOT_NEXT_ACTOR] = config.player_na_id
     token[SLOT_NEXT_PHASE] = NEXT_NONE
-    token[SLOT_REMAINING_HAND_START:] = [config.card_na_id] * (
-        TOKEN_WIDTH - BASE_TOKEN_WIDTH
+    token[SLOT_BIDS_MADE] = config.bids_made_na_id
+    token[SLOT_BID_SUM] = config.bid_sum_na_id
+    token[SLOT_BID_PRESSURE] = config.bid_pressure_na_id
+    token[SLOT_BIDS_REMAINING] = config.bids_remaining_na_id
+    token[SLOT_REMAINING_HAND_START:SLOT_NA_PATTERN] = [config.card_na_id] * (
+        SLOT_NA_PATTERN - BASE_TOKEN_WIDTH
     )
     return tuple(token)
 
@@ -106,6 +123,65 @@ def _base_token(config: SeqModelConfig, num_players: int, hand_size: int) -> lis
     # a shape group, so the eleven field writes happen once per shape instead of
     # once per token -- and list(tuple) is a single C-level copy.
     return list(_base_token_template(config, num_players, hand_size))
+
+
+@lru_cache(maxsize=None)
+def _na_slot_ids(config: SeqModelConfig) -> tuple[int | None, ...]:
+    """Sentinel id for each base slot; None means it is always present."""
+
+    return config.base_slot_na_ids
+
+
+def set_na_pattern(token: list[int] | np.ndarray, config: SeqModelConfig) -> None:
+    """Encode which base fields are absent after all token mutations."""
+
+    mask = 0
+    for slot, sentinel in enumerate(_na_slot_ids(config)):
+        if sentinel is not None and int(token[slot]) == sentinel:
+            mask |= 1 << slot
+    try:
+        token[SLOT_NA_PATTERN] = _NA_PATTERN_TO_ID[mask]
+    except KeyError as error:
+        raise ValueError(f"Unsupported token NA pattern 0x{mask:04x}.") from error
+
+
+def set_na_patterns(tokens: np.ndarray, config: SeqModelConfig) -> None:
+    """Refresh pattern ids after vector-shaped token mutation."""
+
+    flat = tokens.reshape(-1, TOKEN_WIDTH)
+    masks = np.zeros(flat.shape[0], dtype=np.uint16)
+    for slot, sentinel in enumerate(_na_slot_ids(config)):
+        if sentinel is not None:
+            masks |= (flat[:, slot] == sentinel).astype(np.uint16) << slot
+    pattern_ids = _NA_PATTERN_ID_LOOKUP[masks]
+    if np.any(pattern_ids < 0):
+        invalid = int(masks[np.flatnonzero(pattern_ids < 0)[0]])
+        raise ValueError(f"Unsupported token NA pattern 0x{invalid:04x}.")
+    flat[:, SLOT_NA_PATTERN] = pattern_ids
+
+
+def _set_bid_pressure(
+    token: list[int] | np.ndarray,
+    config: SeqModelConfig,
+    num_players: int,
+    hand_size: int,
+    bids_made: int,
+    bid_sum: int,
+) -> None:
+    """Attach the causal aggregate bidding state to a relevant token row."""
+
+    if not 0 <= bids_made <= num_players:
+        raise ValueError("bids_made is outside the active-player range.")
+    if not 0 <= bid_sum <= num_players * hand_size:
+        raise ValueError("bid_sum is outside the possible round range.")
+    pressure = hand_size - bid_sum
+    pressure_id = pressure + config.bid_pressure_offset
+    if not 0 <= pressure_id < config.bid_pressure_na_id:
+        raise ValueError("Encoded bid pressure is outside its vocabulary.")
+    token[SLOT_BIDS_MADE] = bids_made
+    token[SLOT_BID_SUM] = bid_sum
+    token[SLOT_BID_PRESSURE] = pressure_id
+    token[SLOT_BIDS_REMAINING] = num_players - bids_made
 
 
 def game_token(
@@ -148,6 +224,7 @@ def oracle_hand_token(
         raise ValueError("Oracle card owner must be an active absolute seat.")
     token = hand_token(config, num_players, hand_size, card)
     token[SLOT_REL_PLAYER] = owner
+    _set_bid_pressure(token, config, num_players, hand_size, 0, 0)
     return token
 
 
@@ -159,6 +236,8 @@ def turn_token(
     phase: int,
     trick_index: int | None = None,
     pos_in_trick: int | None = None,
+    bids_made: int | None = None,
+    bid_sum: int | None = None,
 ) -> list[int]:
     """A pause token announcing whose turn it is. ``rel_actor == 0`` is "mine".
 
@@ -178,6 +257,12 @@ def turn_token(
         token[SLOT_POS_IN_TRICK] = pos_in_trick
     token[SLOT_NEXT_ACTOR] = rel_actor
     token[SLOT_NEXT_PHASE] = phase
+    if phase == NEXT_BID:
+        if bids_made is None or bid_sum is None:
+            raise ValueError("Bid TURN tokens require the current bidding state.")
+        _set_bid_pressure(
+            token, config, num_players, hand_size, bids_made, bid_sum
+        )
     return token
 
 
@@ -212,6 +297,8 @@ def event_token(
     num_players: int,
     hand_size: int,
     remaining_hand: list[Card] | None = None,
+    bids_made: int | None = None,
+    bid_sum: int | None = None,
 ) -> list[int] | None:
     """Map one public game event to a token row; None for non-token events."""
 
@@ -220,6 +307,11 @@ def event_token(
         token[SLOT_TYPE] = TOKEN_BID
         token[SLOT_REL_PLAYER] = _relative(event.player, observer, num_players)
         token[SLOT_BID] = event.bid
+        if bids_made is None or bid_sum is None:
+            raise ValueError("BID event tokens require the updated bidding state.")
+        _set_bid_pressure(
+            token, config, num_players, hand_size, bids_made, bid_sum
+        )
         return token
     if event.type == EventType.PLAY:
         token = _base_token(config, num_players, hand_size)
@@ -254,10 +346,10 @@ def set_remaining_hand(
     if len(cards) > hand_size:
         raise ValueError("Remaining hand cannot exceed the round hand size.")
     values = [card_id(card) for card in sort_cards(cards)]
-    width = TOKEN_WIDTH - SLOT_REMAINING_HAND_START
+    width = SLOT_NA_PATTERN - SLOT_REMAINING_HAND_START
     if len(values) > width:
         raise ValueError("Remaining hand exceeds the token's card capacity.")
-    token[SLOT_REMAINING_HAND_START:] = values + [NUM_CARDS] * (
+    token[SLOT_REMAINING_HAND_START:SLOT_NA_PATTERN] = values + [NUM_CARDS] * (
         width - len(values)
     )
 
@@ -283,14 +375,26 @@ def prefix_tokens(
     tokens = [game_token(config, num_players, hand_size, bidding_position)]
     for card in sort_cards(initial_hand):
         tokens.append(hand_token(config, num_players, hand_size, card))
+    for token in tokens:
+        _set_bid_pressure(token, config, num_players, hand_size, 0, 0)
     rel_first = _relative(bidding_start_player, observer, num_players)
     if config.turn_token != "off":
         tokens.append(
-            turn_token(config, num_players, hand_size, rel_first, NEXT_BID)
+            turn_token(
+                config,
+                num_players,
+                hand_size,
+                rel_first,
+                NEXT_BID,
+                bids_made=0,
+                bid_sum=0,
+            )
         )
     else:
         tokens[-1][SLOT_NEXT_ACTOR] = rel_first
         tokens[-1][SLOT_NEXT_PHASE] = NEXT_BID
+    for token in tokens:
+        set_na_pattern(token, config)
     return tokens
 
 
@@ -327,6 +431,8 @@ def _turn_row(
     observer: int,
     num_players: int,
     hand_size: int,
+    bids_made: int,
+    bid_sum: int,
 ) -> list[int]:
     """The TURN token that precedes ``event``."""
 
@@ -339,6 +445,8 @@ def _turn_row(
         NEXT_BID if is_bid else NEXT_PLAY,
         trick_index=None if is_bid else event.trick_index,
         pos_in_trick=None if is_bid else event.position_in_trick,
+        bids_made=bids_made if is_bid else None,
+        bid_sum=bid_sum if is_bid else None,
     )
 
 
@@ -384,16 +492,36 @@ def build_seat_tokens(
         elif event.type == EventType.TRICK_WIN:
             remaining_by_event[index] = list(remaining)
 
+    bid_state_before: dict[int, tuple[int, int]] = {}
+    bid_state_after: dict[int, tuple[int, int]] = {}
+    bids_made = bid_sum = 0
+    for index, event in enumerate(round_events):
+        bid_state_before[index] = (bids_made, bid_sum)
+        if event.type == EventType.BID:
+            bids_made += 1
+            bid_sum += event.bid
+        bid_state_after[index] = (bids_made, bid_sum)
+
     for offset, (kind, index) in enumerate(token_layout(config, round_events)):
         if prefix_len + offset < skip:
             tokens.append(None)      # comes from token_prefix; never read below
             continue
         event = round_events[index]
         if kind == "turn":
+            made, total = bid_state_before[index]
             tokens.append(
-                _turn_row(config, event, observer, num_players, hand_size)
+                _turn_row(
+                    config,
+                    event,
+                    observer,
+                    num_players,
+                    hand_size,
+                    made,
+                    total,
+                )
             )
             continue
+        made, total = bid_state_after[index]
         token = event_token(
             config,
             event,
@@ -401,6 +529,8 @@ def build_seat_tokens(
             num_players,
             hand_size,
             remaining_hand=remaining_by_event.get(index),
+            bids_made=made if event.type == EventType.BID else None,
+            bid_sum=total if event.type == EventType.BID else None,
         )
         if token is None:
             raise AssertionError("Layout emitted an event with no token.")
@@ -445,20 +575,30 @@ def build_seat_tokens(
                         pos += 1
             tokens.append(
                 turn_token(
-                    config, num_players, hand_size, rel, pending_phase, trick, pos
+                    config,
+                    num_players,
+                    hand_size,
+                    rel,
+                    pending_phase,
+                    trick,
+                    pos,
+                    bids_made=bids_made if pending_phase == NEXT_BID else None,
+                    bid_sum=bid_sum if pending_phase == NEXT_BID else None,
                 )
             )
         else:
             tokens[-1][SLOT_NEXT_ACTOR] = rel
             tokens[-1][SLOT_NEXT_PHASE] = pending_phase
     if skip == 0:
-        return np.asarray(tokens, dtype=np.int64)
-    array = np.empty((len(tokens), TOKEN_WIDTH), dtype=np.int64)
-    array[:skip] = token_prefix
-    if skip < len(tokens):
-        # Guarded: an empty tail is a list, which numpy reads as shape (0,) and
-        # refuses to broadcast into (0, TOKEN_WIDTH).
-        array[skip:] = tokens[skip:]
+        array = np.asarray(tokens, dtype=np.int64)
+    else:
+        array = np.empty((len(tokens), TOKEN_WIDTH), dtype=np.int64)
+        array[:skip] = token_prefix
+        if skip < len(tokens):
+            # Guarded: an empty tail is a list, which numpy reads as shape (0,)
+            # and refuses to broadcast into (0, TOKEN_WIDTH).
+            array[skip:] = tokens[skip:]
+    set_na_patterns(array, config)
     return array
 
 
@@ -511,12 +651,13 @@ def build_oracle_tokens(
     # The actor's TRICK_WIN row repeats its observer's remaining hand. That is
     # redundant in a full-information stream and would privilege canonical
     # seat 0, so the oracle derives current hands from initial cards + plays.
-    oracle[:, SLOT_REMAINING_HAND_START:] = NUM_CARDS
+    oracle[:, SLOT_REMAINING_HAND_START:SLOT_NA_PATTERN] = NUM_CARDS
     if config.turn_token == "off":
         # In the actor stream this annotation lived on seat 0's last HAND row,
         # which was replaced above. Restore it on the final oracle card token.
         oracle[num_players * hand_size, SLOT_NEXT_ACTOR] = bidding_start_player
         oracle[num_players * hand_size, SLOT_NEXT_PHASE] = NEXT_BID
+    set_na_patterns(oracle, config)
     expected = config.oracle_seq_len(num_players, hand_size)
     if oracle.shape != (expected, TOKEN_WIDTH):
         raise AssertionError(
@@ -538,7 +679,14 @@ class ReplayArrays:
     action_targets: np.ndarray    # [D] int64 — bid value or card id actually taken
     trick_targets: np.ndarray     # [max_players] int64, IGNORE_LABEL padding
     trick_masks: np.ndarray       # [L, max_players, bid_count] bool
+    # [L] int64 — relative seat that takes the next trick to be resolved.
+    # IGNORE_LABEL before the last bid lands and again once the final trick
+    # has been won, so the label is dense over exactly the play phase.
+    next_winner_targets: np.ndarray
     suit_targets: np.ndarray      # [L, belief_opponents, 4], column j is rel seat j+1
+    # [L, belief_opponents + any, suit, lower/higher]. The final seat row is
+    # the redundant but useful "any active opponent" aggregate.
+    rank_boundary_targets: np.ndarray
     bid_hit_targets: np.ndarray   # [max_players] int64 in {0,1}, IGNORE_LABEL padding
     final_tricks_won: dict[int, int]
 
@@ -555,6 +703,9 @@ def build_replay_arrays(
     tokens: np.ndarray | None = None,
     suit_labels: bool = True,
     trick_labels: bool = True,
+    rank_boundary_labels: bool = True,
+    next_winner_labels: bool = True,
+    label_decision_seats: Collection[int] | None = None,
 ) -> ReplayArrays:
     """Replay a completed round and emit tokens plus per-position labels.
 
@@ -572,13 +723,20 @@ def build_replay_arrays(
     (holders, suit counts, tricks won) has to reach ``label_from`` before any
     label can be written, so only the token construction is skippable.
 
-    ``suit_labels`` / ``trick_labels`` both default to on. A caller whose loss
-    weights one of these at zero can turn it off to skip building targets
+    ``suit_labels`` / ``trick_labels`` / ``rank_boundary_labels`` /
+    ``next_winner_labels`` default to
+    on. A caller whose loss weights one of these at zero can turn it off to
+    skip building targets
     nothing will read. The arrays are still returned at full shape, left at
     IGNORE_LABEL / False, so a loss enabled against labels that were not built
     sees no labeled positions rather than wrong ones. Bid hit has no gate: it is
     one comparison per seat at the end of the walk, with no per-position work to
     skip.
+
+    ``label_decision_seats`` restricts the three per-position target families
+    to pre-action states for the listed absolute seats. This supports PPO's
+    decision-only auxiliary ablation. The default ``None`` supplies dense
+    state supervision at every causal token.
     """
 
     if set(initial_hands) != set(range(num_players)):
@@ -606,7 +764,34 @@ def build_replay_arrays(
     bid_count = config.bid_count
     trick_masks = np.zeros((total_len, config.max_players, bid_count), dtype=bool)
     suit_targets = np.full(
-        (total_len, config.belief_opponents, len(SUITS)), IGNORE_LABEL, dtype=np.int64
+        (total_len, config.belief_opponents, len(SUITS)), IGNORE_LABEL, dtype=np.int8
+    )
+    rank_boundary_targets = np.full(
+        (
+            total_len,
+            config.belief_opponents + 1,
+            len(SUITS),
+            2,
+        ),
+        IGNORE_LABEL,
+        dtype=np.int8,
+    )
+    next_winner_targets = np.full(total_len, IGNORE_LABEL, dtype=np.int64)
+    # The label looks forward, so it cannot be read off the replay state the
+    # way every other target is. Resolve the whole winner sequence up front and
+    # index it by how many tricks have already completed; the walk below then
+    # only has to know where it is, not what happens next.
+    trick_winner_rel = (
+        np.asarray(
+            [
+                (event.player - observer) % num_players
+                for event in events
+                if event.type == EventType.TRICK_WIN
+            ],
+            dtype=np.int64,
+        )
+        if next_winner_labels
+        else np.zeros(0, dtype=np.int64)
     )
 
     # Vectorized replay state (rel-indexed): holder_rel[card] is the current
@@ -615,11 +800,21 @@ def build_replay_arrays(
     # real game -- see the non-holder assertion below.
     holder_rel = np.full(NUM_CARDS, num_players, dtype=np.int64)
     suit_count_rel = np.zeros((num_players, len(SUITS)), dtype=np.int64)
+    # The same holdings as a rank bitmask per (relative seat, suit). The
+    # rank-boundary labels ask about the extremes of a 13-bit set -- "does
+    # anyone hold a spade below my lowest" -- which an integer answers in a
+    # handful of shifts, where a [4, opponents, 13] boolean broadcast spends
+    # twenty numpy calls on arrays far too small to earn any of them back.
+    # That block was measured at roughly half of all batch-building time.
+    suit_bits = [0] * (num_players * len(SUITS))
     for player, hand in initial_hands.items():
         rel = (player - observer) % num_players
         for card in hand:
-            holder_rel[card_id(card)] = rel
-            suit_count_rel[rel, SUITS.index(card.suit)] += 1
+            index = card_id(card)
+            holder_rel[index] = rel
+            suit, rank = divmod(index, len(RANKS))
+            suit_count_rel[rel, suit] += 1
+            suit_bits[rel * len(SUITS) + suit] |= 1 << rank
     tricks_won_rel = np.zeros(num_players, dtype=np.int64)
     observer_hand: set[Card] = set(initial_hands[observer])
     bid_values: list[int] = []
@@ -630,30 +825,105 @@ def build_replay_arrays(
     current_led_suit: Suit | None = None
     current_trick_size = 0
     count_range = np.arange(bid_count)
+    rank_full = (1 << len(RANKS)) - 1
+    cached_trick_mask = np.zeros(
+        (config.max_players, bid_count), dtype=bool
+    )
+    cached_suit_target = np.full(
+        (config.belief_opponents, len(SUITS)), IGNORE_LABEL, dtype=np.int8
+    )
+    cached_rank_boundary_target = np.full(
+        (config.belief_opponents + 1, len(SUITS), 2),
+        IGNORE_LABEL,
+        dtype=np.int8,
+    )
+    # A PLAY moves holdings and a TRICK_WIN moves trick counts; neither moves
+    # the other's labels. Tracked apart because the two events alternate, so
+    # one flag would rebuild both caches on every event and the cache would
+    # only ever hit during bidding.
+    trick_dirty = True
+    belief_dirty = True
 
     def fill_labels(position: int) -> None:
-        if trick_labels:
-            unresolved = hand_size - completed_tricks
-            upper = np.minimum(tricks_won_rel + unresolved, config.max_hand_size)
-            trick_masks[position, :num_players] = (
-                count_range[None, :] >= tricks_won_rel[:, None]
-            ) & (count_range[None, :] <= upper[:, None])
-        if suit_labels:
-            # Opponents only, so column j is relative seat j + 1. The observer's
-            # own suits (rel 0) are not a belief: its dealt hand and every card
-            # it has played are both in its own token stream, so the answer is
-            # already in the prefix verbatim.
-            suit_targets[position, : num_players - 1] = (
-                suit_count_rel[1:num_players] > 0
-            ).astype(np.int64)
+        nonlocal trick_dirty, belief_dirty
+        if trick_dirty:
+            cached_trick_mask.fill(False)
+            if trick_labels:
+                unresolved = hand_size - completed_tricks
+                upper = np.minimum(
+                    tricks_won_rel + unresolved, config.max_hand_size
+                )
+                cached_trick_mask[:num_players] = (
+                    count_range[None, :] >= tricks_won_rel[:, None]
+                ) & (count_range[None, :] <= upper[:, None])
+            trick_dirty = False
+        if belief_dirty:
+            cached_suit_target.fill(IGNORE_LABEL)
+            cached_rank_boundary_target.fill(IGNORE_LABEL)
+            if suit_labels:
+                # Opponents only, so column j is relative seat j + 1. The
+                # observer's own suits are visible verbatim in its stream.
+                cached_suit_target[: num_players - 1] = (
+                    suit_count_rel[1:num_players] > 0
+                ).astype(np.int8)
+            if rank_boundary_labels:
+                # Only suits currently held by the observer have meaningful
+                # own bounds. The final row is the OR over active opponents.
+                aggregate = config.belief_opponents
+                for suit_index in range(len(SUITS)):
+                    own = suit_bits[suit_index]
+                    if not own:
+                        continue
+                    # Bits strictly below the lowest own rank, and strictly
+                    # above the highest: (own & -own) isolates the lowest set
+                    # bit, bit_length() names the highest.
+                    below = (own & -own) - 1
+                    above = rank_full & ~((1 << own.bit_length()) - 1)
+                    lower_any = False
+                    higher_any = False
+                    for rel in range(1, num_players):
+                        held = suit_bits[rel * len(SUITS) + suit_index]
+                        lower = (held & below) != 0
+                        higher = (held & above) != 0
+                        cached_rank_boundary_target[rel - 1, suit_index, 0] = (
+                            lower
+                        )
+                        cached_rank_boundary_target[rel - 1, suit_index, 1] = (
+                            higher
+                        )
+                        lower_any = lower_any or lower
+                        higher_any = higher_any or higher
+                    cached_rank_boundary_target[aggregate, suit_index, 0] = (
+                        lower_any
+                    )
+                    cached_rank_boundary_target[aggregate, suit_index, 1] = (
+                        higher_any
+                    )
+            belief_dirty = False
+        trick_masks[position] = cached_trick_mask
+        suit_targets[position] = cached_suit_target
+        rank_boundary_targets[position] = cached_rank_boundary_target
+        # Deliberately outside the dirty-cache block: it is one scalar read of
+        # two counters that a BID also moves, and putting it inside would mean
+        # invalidating the three expensive caches on every bid to keep it
+        # correct. Both windows are half-open at the far end -- the label
+        # appears on the token carrying the last bid and disappears on the one
+        # carrying the last TRICK_WIN.
+        if (
+            next_winner_labels
+            and len(bid_values) == num_players
+            and completed_tricks < hand_size
+        ):
+            next_winner_targets[position] = trick_winner_rel[completed_tricks]
 
     prefix_len = config.prefix_len(hand_size)
-    if label_from < prefix_len:
+    if label_decision_seats is None and label_from < prefix_len:
         first = max(label_from, 0)
         fill_labels(first)
         for position in range(first + 1, prefix_len):
             trick_masks[position] = trick_masks[first]
             suit_targets[position] = suit_targets[first]
+            rank_boundary_targets[position] = rank_boundary_targets[first]
 
     decision_positions: list[int] = []
     decision_phases: list[int] = []
@@ -664,6 +934,12 @@ def build_replay_arrays(
     def record_decision(position: int, upcoming: GameEvent) -> None:
         if upcoming.type not in (EventType.BID, EventType.PLAY):
             return
+        if (
+            label_decision_seats is not None
+            and upcoming.player in label_decision_seats
+            and position >= label_from
+        ):
+            fill_labels(position)
         if upcoming.player != observer or position < label_from:
             return
         phase = NEXT_BID if upcoming.type == EventType.BID else NEXT_PLAY
@@ -701,7 +977,7 @@ def build_replay_arrays(
     for index, event in enumerate(round_events):
         if index > 0 and turn_token_precedes(config, event):
             position += 1
-            if position >= label_from:
+            if label_decision_seats is None and position >= label_from:
                 fill_labels(position)
         tokenized = emits_token(config, event)
         if tokenized:
@@ -721,16 +997,24 @@ def build_replay_arrays(
             if holder_rel[index_of_card] != rel:
                 raise AssertionError("Replay saw a play from a non-holder.")
             holder_rel[index_of_card] = -1
-            suit_count_rel[rel, SUITS.index(event.card.suit)] -= 1
+            suit_index, rank_index = divmod(index_of_card, len(RANKS))
+            suit_count_rel[rel, suit_index] -= 1
+            suit_bits[rel * len(SUITS) + suit_index] &= ~(1 << rank_index)
             if event.player == observer:
                 observer_hand.remove(event.card)
             current_trick_size += 1
+            belief_dirty = True
         elif event.type == EventType.TRICK_WIN:
             tricks_won_rel[(event.player - observer) % num_players] += 1
             completed_tricks += 1
             current_trick_size = 0
             current_led_suit = None
-        if tokenized and position >= label_from:
+            trick_dirty = True
+        if (
+            label_decision_seats is None
+            and tokenized
+            and position >= label_from
+        ):
             fill_labels(position)
 
     if position + 1 != total_len:
@@ -769,7 +1053,9 @@ def build_replay_arrays(
         action_targets=np.asarray(action_targets, dtype=np.int64),
         trick_targets=trick_targets,
         trick_masks=trick_masks,
+        next_winner_targets=next_winner_targets,
         suit_targets=suit_targets,
+        rank_boundary_targets=rank_boundary_targets,
         bid_hit_targets=bid_hit_targets,
         final_tricks_won={
             (observer + rel) % num_players: int(tricks_won_rel[rel])

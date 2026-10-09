@@ -257,6 +257,42 @@ class KVCache:
             self.k[layer][slots, :, start:stop] = k_new.to(self.dtype)
             self.v[layer][slots, :, start:stop] = v_new.to(self.dtype)
 
+    def write_step(
+        self,
+        layer: int,
+        rows: torch.Tensor,
+        positions: torch.Tensor,
+        k_new: torch.Tensor,
+        v_new: torch.Tensor,
+    ) -> None:
+        """Write K/V at a per-row offset instead of a shared one.
+
+        ``write_range`` puts every row's new entry at the same ``start``, which
+        is what a lockstep wave wants and what a merged one cannot have: rows
+        holding different games sit at different lengths. ``rows`` is [B] and
+        ``positions`` is [B] for a single append or [B, T] for a run, matching
+        ``k_new``/``v_new`` of [B, kv_heads, T, head_dim].
+
+        Indexing dims 0 and 2 with a slice between them puts the batch (and
+        time) axes first, which is already the layout of ``k_new`` once its
+        time axis is transposed forward.
+        """
+
+        length = k_new.shape[2]
+        if positions.dim() == 1:
+            if length != 1:
+                raise ValueError(
+                    "A [B] position vector writes exactly one position per row."
+                )
+            self.k[layer][rows, :, positions] = k_new[:, :, 0].to(self.dtype)
+            self.v[layer][rows, :, positions] = v_new[:, :, 0].to(self.dtype)
+            return
+        if positions.shape[1] != length:
+            raise ValueError("positions must carry one offset per written step.")
+        index = rows[:, None]
+        self.k[layer][index, :, positions] = k_new.transpose(1, 2).to(self.dtype)
+        self.v[layer][index, :, positions] = v_new.transpose(1, 2).to(self.dtype)
+
     def read(
         self,
         layer: int,

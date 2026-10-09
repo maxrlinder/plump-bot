@@ -21,6 +21,11 @@ runs/<name>/
     heuristic.json
     heuristic_sample.json
   analysis/<checkpoint>/
+  tournaments/
+    dashboard.png
+    <tournament>.json
+    <tournament>.csv
+    <tournament>.png
 ```
 
 `metadata.json` records the command, Git revision and dirty state, Python and
@@ -123,3 +128,26 @@ Sidecar evaluation defaults to at most 64 rows even if the inline evaluator is
 configured higher. The watcher refreshes `dashboard-eval.png` on new training
 rows as well as new checkpoint results, producing a stable live image that an
 already running trainer with older dashboard code cannot overwrite.
+
+## Lineage tournament
+
+To see whether play improves across architectural forks, put lineage
+checkpoints at mixed tables with two independent schedule waves:
+
+```bash
+uv run plump tournament RUN --from-iteration 20000 --stride 200 \
+  --deals-per-match 64 --waves 2 --device cpu
+```
+
+The lineage walker follows `parent_checkpoint`, assigns every checkpoint to
+the run that actually trained it, and loads each participant from its own
+embedded model configuration. Width, token-stream, normalization,
+conditioning, and auxiliary-head changes can therefore coexist at the same
+table as long as the checkpoint uses the current game-token schema.
+
+CPU is the tournament default so a live trainer retains the accelerator. Every
+completed match chunk atomically replaces the tournament JSON and CSV with the
+current aggregate, then refreshes `tournaments/dashboard.png`. The dashboard
+is partial-safe: unfinished player-count/hand-size cells remain blank and fill
+in as the evaluation advances. On completion the configured bootstrap
+intervals are calculated once and a tournament-specific PNG is also written.

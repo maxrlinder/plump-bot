@@ -16,6 +16,10 @@ from plump.seq.config import (
     NEXT_NONE,
     NEXT_PLAY,
     SLOT_BID,
+    SLOT_BID_PRESSURE,
+    SLOT_BID_SUM,
+    SLOT_BIDS_MADE,
+    SLOT_BIDS_REMAINING,
     SLOT_CARD,
     SLOT_NEXT_ACTOR,
     SLOT_NEXT_PHASE,
@@ -23,6 +27,7 @@ from plump.seq.config import (
     SLOT_HAND_SIZE,
     SLOT_REL_PLAYER,
     SLOT_REMAINING_HAND_START,
+    SLOT_NA_PATTERN,
     SLOT_TYPE,
     TOKEN_BID,
     TOKEN_GAME,
@@ -36,6 +41,27 @@ from plump.seq.config import (
 from plump.state import EventType
 
 CONFIG = SeqModelConfig()
+
+
+def test_vectorized_na_patterns_match_scalar_encoding():
+    rows = []
+    sentinels = seq_tokens._na_slot_ids(CONFIG)
+    for pattern in seq_tokens.NA_PATTERN_MASKS[1:]:
+        row = np.zeros(seq_tokens.TOKEN_WIDTH, dtype=np.int64)
+        for slot, sentinel in enumerate(sentinels):
+            if sentinel is None:
+                continue
+            row[slot] = sentinel if pattern & (1 << slot) else sentinel + 1
+        rows.append(row)
+    expected = np.stack(rows)
+    for row in expected:
+        seq_tokens.set_na_pattern(row, CONFIG)
+
+    actual = np.stack(rows)
+    actual[:, SLOT_NA_PATTERN] = 0
+    seq_tokens.set_na_patterns(actual, CONFIG)
+
+    np.testing.assert_array_equal(actual, expected)
 
 
 def play_random_round(num_players, hand_size, seed, observer):
@@ -74,6 +100,12 @@ def play_random_round(num_players, hand_size, seed, observer):
                 seq_tokens.IGNORE_LABEL,
                 dtype=np.int64,
             )
+            rank_boundary_targets = np.full(
+                (CONFIG.belief_opponents + 1, len(seq_tokens.SUITS), 2),
+                seq_tokens.IGNORE_LABEL,
+                dtype=np.int64,
+            )
+            observer_hand = round_state.current_hands[observer]
             for rel in range(num_players):
                 player = (observer + rel) % num_players
                 wins = round_state.tricks_won.get(player, 0)
@@ -89,12 +121,40 @@ def play_random_round(num_players, hand_size, seed, observer):
                 suit_targets[rel - 1] = [
                     int(suit in held) for suit in seq_tokens.SUITS
                 ]
+            aggregate = CONFIG.belief_opponents
+            for suit_index, suit in enumerate(seq_tokens.SUITS):
+                own_ranks = [
+                    int(card.rank)
+                    for card in observer_hand
+                    if card.suit == suit
+                ]
+                if not own_ranks:
+                    continue
+                lower_any = False
+                higher_any = False
+                for rel in range(1, num_players):
+                    player = (observer + rel) % num_players
+                    opponent_ranks = [
+                        int(card.rank)
+                        for card in round_state.current_hands[player]
+                        if card.suit == suit
+                    ]
+                    lower = any(rank < min(own_ranks) for rank in opponent_ranks)
+                    higher = any(rank > max(own_ranks) for rank in opponent_ranks)
+                    rank_boundary_targets[rel - 1, suit_index] = lower, higher
+                    lower_any = lower_any or lower
+                    higher_any = higher_any or higher
+                rank_boundary_targets[aggregate, suit_index] = (
+                    lower_any,
+                    higher_any,
+                )
             oracles.append(
                 {
                     "legal_bid_mask": bid_mask,
                     "legal_card_mask": card_mask,
                     "trick_mask": trick_mask,
                     "suit_targets": suit_targets,
+                    "rank_boundary_targets": rank_boundary_targets,
                 }
             )
         env.step(rng.choice(env.legal_actions()))
@@ -159,6 +219,35 @@ def test_sequence_structure(num_players, hand_size, seed):
             assert trick_rows[num_players, SLOT_TYPE] == TOKEN_TRICK_WIN
 
 
+def test_bid_pressure_fields_are_causal_and_phase_local():
+    config = replace(CONFIG, turn_token="bid")
+    num_players, hand_size = 4, 6
+    env, _, start = play_random_round(num_players, hand_size, 19, observer=0)
+    tokens = replay_arrays_for(env, 0, start, config=config).tokens
+
+    bids_made = bid_sum = 0
+    for row in tokens:
+        token_type = row[SLOT_TYPE]
+        if token_type == TOKEN_BID:
+            bids_made += 1
+            bid_sum += int(row[SLOT_BID])
+        relevant = token_type in (TOKEN_GAME, TOKEN_HAND, TOKEN_BID) or (
+            token_type == TOKEN_TURN and row[SLOT_NEXT_PHASE] == NEXT_BID
+        )
+        if relevant:
+            assert row[SLOT_BIDS_MADE] == bids_made
+            assert row[SLOT_BID_SUM] == bid_sum
+            assert row[SLOT_BID_PRESSURE] == (
+                hand_size - bid_sum + config.bid_pressure_offset
+            )
+            assert row[SLOT_BIDS_REMAINING] == num_players - bids_made
+        else:
+            assert row[SLOT_BIDS_MADE] == config.bids_made_na_id
+            assert row[SLOT_BID_SUM] == config.bid_sum_na_id
+            assert row[SLOT_BID_PRESSURE] == config.bid_pressure_na_id
+            assert row[SLOT_BIDS_REMAINING] == config.bids_remaining_na_id
+
+
 @pytest.mark.parametrize("num_players,hand_size,seed", CASES)
 def test_trick_win_rows_carry_exactly_the_observers_remaining_hand(
     num_players, hand_size, seed
@@ -185,14 +274,15 @@ def test_trick_win_rows_carry_exactly_the_observers_remaining_hand(
             expected = sorted(
                 seq_tokens.card_id(card) for card in initial - played
             )
-            encoded = row[SLOT_REMAINING_HAND_START:]
+            encoded = row[SLOT_REMAINING_HAND_START:SLOT_NA_PATTERN]
             actual = sorted(int(card) for card in encoded if card < 52)
             assert actual == expected
             assert (encoded[len(expected) :] == CONFIG.card_na_id).all()
 
         non_winners = tokens[tokens[:, SLOT_TYPE] != TOKEN_TRICK_WIN]
         assert (
-            non_winners[:, SLOT_REMAINING_HAND_START:] == CONFIG.card_na_id
+            non_winners[:, SLOT_REMAINING_HAND_START:SLOT_NA_PATTERN]
+            == CONFIG.card_na_id
         ).all()
 
 
@@ -259,6 +349,10 @@ def test_labels_match_environment_at_decisions(num_players, hand_size, seed):
                 arrays.suit_targets[position],
                 oracle["suit_targets"],
             )
+            assert np.array_equal(
+                arrays.rank_boundary_targets[position],
+                oracle["rank_boundary_targets"],
+            )
 
 
 @pytest.mark.parametrize("num_players,hand_size,seed", CASES)
@@ -296,6 +390,10 @@ def test_label_from_matches_full_build(label_from):
         assert np.array_equal(full.trick_masks[position], partial.trick_masks[position])
         assert np.array_equal(
             full.suit_targets[position], partial.suit_targets[position]
+        )
+        assert np.array_equal(
+            full.rank_boundary_targets[position],
+            partial.rank_boundary_targets[position],
         )
     kept = full.decision_positions >= label_from
     assert np.array_equal(full.decision_positions[kept], partial.decision_positions)
@@ -453,8 +551,12 @@ def test_disabled_label_groups_stay_unlabelled_and_do_not_disturb_the_rest(
         start,
         suit_labels=False,
         trick_labels=False,
+        rank_boundary_labels=False,
     )
     assert (off.suit_targets == seq_tokens.IGNORE_LABEL).all()
+    assert (
+        off.rank_boundary_targets == seq_tokens.IGNORE_LABEL
+    ).all()
     assert not off.trick_masks.any()
     # Everything not switched off is untouched. Bid hit has no gate, so it is
     # built either way and must still agree.
@@ -464,3 +566,106 @@ def test_disabled_label_groups_stay_unlabelled_and_do_not_disturb_the_rest(
     assert np.array_equal(off.decision_positions, full.decision_positions)
     assert np.array_equal(off.action_targets, full.action_targets)
     assert np.array_equal(off.legal_card_masks, full.legal_card_masks)
+
+
+@pytest.mark.parametrize("num_players,hand_size,seed", CASES)
+@pytest.mark.parametrize("observer", (0, 1))
+def test_next_winner_labels_track_the_upcoming_trick(
+    num_players, hand_size, seed, observer
+):
+    """The label at every position names the next trick still to be resolved.
+
+    Derived here from the token stream alone -- count the BID tokens to find
+    where bidding closes and the TRICK_WIN tokens to find how many tricks are
+    already behind us -- so it is an independent statement of the intended
+    semantics rather than a replay of the labeller's own bookkeeping.
+    """
+
+    if observer >= num_players:
+        pytest.skip("observer must be a seat at this table")
+    env, _, start = play_random_round(num_players, hand_size, seed, observer)
+    arrays = replay_arrays_for(env, observer, start)
+    labels = arrays.next_winner_targets
+    winners = [
+        (event.player - observer) % num_players
+        for event in env.state.event_log
+        if event.type == EventType.TRICK_WIN
+    ]
+    assert len(winners) == hand_size
+
+    types = arrays.tokens[:, SLOT_TYPE]
+    bids_seen = np.cumsum(types == TOKEN_BID)
+    tricks_seen = np.cumsum(types == TOKEN_TRICK_WIN)
+    # The label appears on the token carrying the final bid and disappears on
+    # the token carrying the final TRICK_WIN: both windows are closed at the
+    # near end and open at the far one.
+    live = (bids_seen == num_players) & (tricks_seen < hand_size)
+
+    assert (labels[~live] == seq_tokens.IGNORE_LABEL).all()
+    assert live.any()
+    expected = np.asarray([winners[count] for count in tricks_seen[live]])
+    assert np.array_equal(labels[live], expected)
+    # A relative seat, so every label is a seat this table actually has.
+    assert labels[live].min() >= 0 and labels[live].max() < num_players
+
+
+@pytest.mark.parametrize("num_players,hand_size,seed", CASES)
+def test_next_winner_labels_gate_off_without_disturbing_the_rest(
+    num_players, hand_size, seed
+):
+    env, _, start = play_random_round(num_players, hand_size, seed, observer=0)
+    full = replay_arrays_for(env, 0, start)
+    round_state = env.state.current_round
+    off = seq_tokens.build_replay_arrays(
+        CONFIG,
+        round_state.initial_hands,
+        env.state.event_log,
+        0,
+        num_players,
+        round_state.hand_size,
+        start,
+        next_winner_labels=False,
+    )
+    assert (off.next_winner_targets == seq_tokens.IGNORE_LABEL).all()
+    assert (full.next_winner_targets != seq_tokens.IGNORE_LABEL).any()
+    assert np.array_equal(off.tokens, full.tokens)
+    assert np.array_equal(off.trick_masks, full.trick_masks)
+    assert np.array_equal(off.suit_targets, full.suit_targets)
+    assert np.array_equal(
+        off.rank_boundary_targets, full.rank_boundary_targets
+    )
+    assert np.array_equal(off.trick_targets, full.trick_targets)
+
+
+@pytest.mark.parametrize("num_players,hand_size,seed", CASES)
+def test_decision_only_labels_match_dense_truth_at_actor_states(
+    num_players, hand_size, seed
+):
+    env, _, start = play_random_round(num_players, hand_size, seed, observer=0)
+    dense = replay_arrays_for(env, 0, start)
+    round_state = env.state.current_round
+    sparse = seq_tokens.build_replay_arrays(
+        CONFIG,
+        round_state.initial_hands,
+        env.state.event_log,
+        0,
+        num_players,
+        round_state.hand_size,
+        start,
+        label_decision_seats=(0,),
+    )
+    positions = sparse.decision_positions
+    assert np.array_equal(sparse.suit_targets[positions], dense.suit_targets[positions])
+    assert np.array_equal(
+        sparse.rank_boundary_targets[positions],
+        dense.rank_boundary_targets[positions],
+    )
+    assert np.array_equal(sparse.trick_masks[positions], dense.trick_masks[positions])
+
+    unused = np.ones(sparse.tokens.shape[0], dtype=bool)
+    unused[positions] = False
+    assert (sparse.suit_targets[unused] == seq_tokens.IGNORE_LABEL).all()
+    assert (
+        sparse.rank_boundary_targets[unused] == seq_tokens.IGNORE_LABEL
+    ).all()
+    assert not sparse.trick_masks[unused].any()

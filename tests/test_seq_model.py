@@ -12,7 +12,10 @@ from plump.env import PlumpEnv
 from plump.rounds import RoundSpec, round_game_config
 from plump.seq import tokens as seq_tokens
 from plump.seq.config import (
+    BASE_TOKEN_WIDTH,
+    CORE_TOKEN_WIDTH,
     SLOT_REMAINING_HAND_START,
+    SLOT_NA_PATTERN,
     SLOT_TYPE,
     TOKEN_TRICK_WIN,
     TOKEN_WIDTH,
@@ -20,8 +23,10 @@ from plump.seq.config import (
     seq_len,
 )
 from plump.seq.model import (
+    RANK_BOUNDARY_HEAD_KEYS,
     STRUCTURED_CARD_OUTPUT_KEYS,
     SeqPlumpModel,
+    SeqPPOOracleCritic,
     load_seq_model_state_dict,
 )
 
@@ -108,7 +113,9 @@ def test_trick_win_embedding_adds_each_remaining_card_input_direction():
     model = SeqPlumpModel(small_config())
     empty = torch.zeros((1, 1, TOKEN_WIDTH), dtype=torch.long)
     empty[..., SLOT_TYPE] = TOKEN_TRICK_WIN
-    empty[..., SLOT_REMAINING_HAND_START:] = model.config.card_na_id
+    empty[..., SLOT_REMAINING_HAND_START:SLOT_NA_PATTERN] = (
+        model.config.card_na_id
+    )
     with_cards = empty.clone()
     with_cards[0, 0, SLOT_REMAINING_HAND_START : SLOT_REMAINING_HAND_START + 2] = (
         torch.tensor([0, 27])
@@ -121,6 +128,80 @@ def test_trick_win_embedding_adds_each_remaining_card_input_direction():
         + model.effective_card_input_weight()[[0, 27]].sum(dim=0)
     )
     torch.testing.assert_close(actual, expected)
+
+
+def test_fused_embedding_bag_matches_explicit_masked_gather_and_gradient():
+    torch.manual_seed(3)
+    indices = torch.randint(17, (4, 7, 12))
+    valid = torch.rand((4, 7, 12)) > 0.25
+    explicit_weight = torch.randn(17, 23, requires_grad=True)
+    fused_weight = explicit_weight.detach().clone().requires_grad_(True)
+
+    explicit = (
+        torch.nn.functional.embedding(indices, explicit_weight)
+        * valid.unsqueeze(-1)
+    ).sum(dim=-2)
+    fused = SeqPlumpModel._embedding_bag_sum(
+        indices,
+        fused_weight,
+        valid=valid,
+    )
+    torch.testing.assert_close(fused, explicit, rtol=1e-5, atol=1e-6)
+
+    probe = torch.randn_like(explicit)
+    (explicit * probe).sum().backward()
+    (fused * probe).sum().backward()
+    torch.testing.assert_close(
+        fused_weight.grad,
+        explicit_weight.grad,
+        rtol=1e-5,
+        atol=1e-6,
+    )
+
+
+def test_na_pattern_initialization_reproduces_legacy_sentinel_sum():
+    torch.manual_seed(7)
+    model = SeqPlumpModel(small_config())
+    tokens = token_batch(4, 3, seeds=[0, 1])[:, : model.config.prefix_len(3)]
+    core = tokens[..., :CORE_TOKEN_WIDTH]
+    pressure = tokens[..., CORE_TOKEN_WIDTH:BASE_TOKEN_WIDTH]
+    legacy = model._embedding_bag_sum(
+        core + model.slot_offsets, model.slot_embedding.weight
+    ) + model._embedding_bag_sum(
+        pressure + model.bid_pressure_offsets,
+        model.bid_pressure_embedding.weight,
+    )
+    current = model.embed(tokens) - model.pos_embedding(
+        torch.arange(tokens.shape[1])
+    )
+    torch.testing.assert_close(current, legacy, rtol=1e-5, atol=1e-6)
+
+
+def test_individual_na_rows_receive_no_gradient_after_pattern_refactor():
+    torch.manual_seed(8)
+    model = SeqPlumpModel(
+        small_config(per_layer_embedding_dim=16, value_embedding_mode="all")
+    )
+    tokens = token_batch(4, 3, seeds=[0, 1])
+    model.forward_full(tokens, aux_heads=False).bid_logits.sum().backward()
+
+    for table, offsets in (
+        (model.slot_embedding, model.slot_offsets),
+        (model.bid_pressure_embedding, model.bid_pressure_offsets),
+        (model.per_layer_slot_embedding, model.conditioning_slot_offsets),
+        (model.value_slot_embedding, model.conditioning_slot_offsets),
+    ):
+        assert table is not None
+        start = 0 if table is not model.bid_pressure_embedding else CORE_TOKEN_WIDTH
+        for local_slot, offset in enumerate(offsets):
+            slot = start + local_slot
+            sentinel = model.config.base_slot_na_ids[slot]
+            if sentinel is not None:
+                assert torch.count_nonzero(table.weight.grad[int(offset) + sentinel]) == 0
+
+    assert model.na_pattern_embedding.weight.grad.abs().sum() > 0
+    assert model.per_layer_na_pattern_embedding.weight.grad.abs().sum() > 0
+    assert model.value_na_pattern_embedding.weight.grad.abs().sum() > 0
 
 
 def test_pre_structured_model_state_loads_with_zero_shared_output_rows():
@@ -139,6 +220,118 @@ def test_pre_structured_model_state_loads_with_zero_shared_output_rows():
     assert torch.count_nonzero(loaded.card_suit_output_embedding.weight) == 0
     for key, expected in old_state.items():
         torch.testing.assert_close(loaded.state_dict()[key], expected)
+
+
+def test_pre_rank_boundary_state_keeps_new_head_randomly_initialized():
+    torch.manual_seed(0)
+    original = SeqPlumpModel(small_config())
+    old_state = {
+        key: value
+        for key, value in original.state_dict().items()
+        if key not in RANK_BOUNDARY_HEAD_KEYS
+    }
+
+    torch.manual_seed(99)
+    loaded = SeqPlumpModel(small_config())
+    initial = {
+        key: loaded.state_dict()[key].clone()
+        for key in RANK_BOUNDARY_HEAD_KEYS
+    }
+    assert load_seq_model_state_dict(loaded, old_state) == RANK_BOUNDARY_HEAD_KEYS
+    for key in RANK_BOUNDARY_HEAD_KEYS:
+        torch.testing.assert_close(loaded.state_dict()[key], initial[key])
+    assert torch.count_nonzero(loaded.rank_boundary_head.weight) > 0
+
+
+def test_zero_initialized_layer_extensions_preserve_the_former_forward_exactly():
+    torch.manual_seed(4)
+    legacy = SeqPlumpModel(small_config(turn_token="bid"))
+    state = legacy.state_dict()
+    extended = SeqPlumpModel(
+        small_config(
+            turn_token="bid",
+            per_layer_embedding_dim=16,
+            value_embedding_mode="alternating",
+        )
+    )
+    load_seq_model_state_dict(extended, state)
+    tokens = token_batch(4, 3, seeds=[0, 1])
+
+    legacy.eval()
+    extended.eval()
+    with torch.no_grad():
+        before = legacy.forward_full(tokens, aux_heads=False)
+        after = extended.forward_full(tokens, aux_heads=False)
+    assert torch.equal(before.hidden, after.hidden)
+    assert torch.equal(before.bid_logits, after.bid_logits)
+    assert torch.equal(before.card_logits, after.card_logits)
+
+
+def test_layer_extensions_receive_gradient_from_the_first_backward():
+    torch.manual_seed(5)
+    model = SeqPlumpModel(
+        small_config(
+            turn_token="bid",
+            per_layer_embedding_dim=16,
+            value_embedding_mode="alternating",
+        )
+    )
+    tokens = token_batch(4, 3, seeds=[0, 1])
+    model.forward_full(tokens, aux_heads=False).bid_logits.sum().backward()
+
+    assert model.bid_pressure_embedding.weight.grad.abs().sum() > 0
+    assert model.per_layer_slot_embedding.weight.grad.abs().sum() > 0
+    assert model.per_layer_context_projection.weight.grad.abs().sum() > 0
+    assert model.value_slot_embedding.weight.grad.abs().sum() > 0
+
+
+def test_extended_cached_decode_matches_full_after_extensions_are_nonzero():
+    torch.manual_seed(6)
+    config = small_config(
+        n_kv_heads=2,
+        turn_token="bid",
+        per_layer_embedding_dim=16,
+        value_embedding_mode="all",
+    )
+    model = SeqPlumpModel(config).eval()
+    with torch.no_grad():
+        for name, parameter in model.named_parameters():
+            if name.startswith(("bid_pressure", "per_layer", "value_")):
+                parameter.normal_(std=0.01)
+    tokens = token_batch(4, 3, seeds=[0, 1])
+    prefix_len = config.prefix_len(3)
+    with torch.no_grad():
+        full = model.forward_full(tokens, aux_heads=False)
+        cache = model.new_cache(capacity=2)
+        slots = torch.tensor(cache.alloc(2), dtype=torch.long)
+        model.forward_prefill(tokens[:, :prefix_len], cache, slots)
+        for position in range(prefix_len, tokens.shape[1]):
+            step = model.forward_step(tokens[:, position], position, cache, slots)
+    torch.testing.assert_close(
+        step.bid_logits, full.bid_logits[:, -1], atol=ATOL, rtol=0
+    )
+    torch.testing.assert_close(
+        step.card_logits, full.card_logits[:, -1], atol=ATOL, rtol=0
+    )
+
+
+def test_oracle_has_independent_extended_tables_at_its_longer_length():
+    config = small_config(
+        per_layer_embedding_dim=16,
+        value_embedding_mode="alternating",
+    )
+    actor = SeqPlumpModel(config)
+    oracle = SeqPPOOracleCritic(config, initialize_from=actor)
+    assert oracle.backbone.per_layer_pos_embedding.num_embeddings == (
+        config.oracle_max_seq_len
+    )
+    assert oracle.backbone.value_pos_embedding.num_embeddings == (
+        config.oracle_max_seq_len
+    )
+    assert (
+        oracle.backbone.per_layer_slot_embedding.weight.data_ptr()
+        != actor.per_layer_slot_embedding.weight.data_ptr()
+    )
 
 
 @pytest.mark.parametrize("kv_heads", [None, 2])
@@ -349,6 +542,13 @@ def test_aux_head_shapes():
         batch, length, config.max_players, config.bid_count
     )
     assert output.suit_logits.shape == (batch, length, config.belief_opponents, 4)
+    assert output.rank_boundary_logits.shape == (
+        batch,
+        length,
+        config.belief_opponents + 1,
+        4,
+        2,
+    )
     assert output.bid_hit_logits.shape == (batch, length, config.max_players)
 
 
@@ -367,6 +567,22 @@ def test_aux_heads_are_individually_selectable():
     assert none.suit_logits is none.bid_hit_logits is None
     with pytest.raises(ValueError):
         model.forward_full(tokens, aux_heads={"beliefs"})
+
+
+def test_packed_linear_auxiliary_projection_matches_individual_heads():
+    torch.manual_seed(9)
+    model = SeqPlumpModel(small_config())
+    hidden = torch.randn(17, model.config.d_model)
+    packed = model.auxiliary_logits(
+        hidden, {"trick", "rank_boundary", "suit"}
+    )
+    assert torch.allclose(packed["suit"], model.suit_presence_head(hidden))
+    assert torch.allclose(
+        packed["rank_boundary"], model.rank_boundary_head(hidden)
+    )
+    assert torch.allclose(packed["trick"], model.trick_count_head(hidden))
+    with pytest.raises(ValueError):
+        model.auxiliary_logits(hidden, {"bid_hit"})
 
 
 def test_cache_layout_follows_the_element_limit():

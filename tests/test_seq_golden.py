@@ -8,6 +8,7 @@ import hashlib
 import json
 
 import numpy as np
+import pytest
 import torch
 
 from plump.seq.config import (
@@ -22,15 +23,45 @@ from plump.seq.model import SeqPlumpModel
 from plump.seq.trainer import SeqTrainer, build_training_groups
 
 # Frozen after adding observer-remaining-card composition at TRICK_WIN and
-# shared rank/suit card-output directions. This covers both the causal token
-# feature in collection and the two new output parameter gradients in update.
-EXPECTED = {
-    "groups": "e275ab81758ec9a354e84c8d924378bb16c206e1f6b3c18f44ff7549e46e204a",
+# shared rank/suit card-output directions, then refreshed for the appended
+# rank-boundary readout and its zero-by-default telemetry fields. Refreshed
+# again for the four causal bid-pressure columns and their zero-start additive
+# embedding. Refreshed once more when fixed-width embedding sums moved to the
+# mathematically equivalent embedding-bag kernel; rollout data and scalar
+# update telemetry remained unchanged, while reduction ordering changed the
+# post-update parameter bytes. Refreshed for compact missing-field patterns:
+# the always-padding tenth remaining-hand column now carries the pattern id,
+# and individual NA sentinel rows are omitted from embedding reductions. This
+# covers both causal token features and parameter layout.
+# Collection runs before any clipping, so it is unaffected by clip topology.
+EXPECTED_COLLECTION = {
+    "groups": "acc1c6b375b3812a4417729e0c1b3a67990db9ac94239d74cda0654e29518356",
     "summary": "74d6ed47c429ef53256124b7bfa7d0738c1c3fab999fd2019618ce4cbe89643a",
-    "trees": "ae55ae3cdcbf0406b21bc4dd9da25a102b97db24ce266f1d4849ec8245e536aa",
-    "update": "257ce6cc805c5489c6c1ea553abd137ec31eea4adb6113e2c8202779ffcdb374",
-    "weights": "35829165699674254f845f65243f69184d032bc6f8edc1d304059f621219d665",
+    "trees": "d41295fac5aa7eef45d33349d4a2b6c2fdaae6b6d41615ce0c218532c0b685c8",
 }
+# Post-update state. Both hashes moved when the actor became a single clip
+# group: the trunk, the input embeddings and the auxiliary heads now share one
+# global-norm budget and one rescale factor, where each previously had its own.
+# They moved again when the actor gained its per-seat player_value_head: the
+# update hash because SeqUpdateStats grew four value-probe fields, the weights
+# hash because the state dict grew four keys. That head is untouched by this
+# counterfactual objective, and dropping its keys from the state dict
+# reproduces 9e62decff303... exactly, which is how the change was verified to
+# leave every pre-existing parameter bit-identical.
+#
+# They moved a third time when the actor gained next_winner_head: the update
+# hash because SeqUpdateStats grew loss_next_winner (the other three new
+# fields are excluded below), the weights hash because the state dict grew two
+# keys. Verified the same way -- against a control tree carrying every other
+# change with only that head removed, the RNG position after construction is
+# identical and every shared parameter is bit-identical both at init and after
+# a full collect+update. Dropping the two keys reproduces d134b182c8b2...
+EXPECTED_UPDATE = (
+    "5b33da42f2dc74da8ac4c827eae159a00a04c628d6882a6dabd0250d46bb640d"
+)
+EXPECTED_WEIGHTS = (
+    "6c1877aa20e315771c4922518e04070273a2b1c12f9a651044cb098c60c28575"
+)
 
 
 def _normalize(value):
@@ -240,13 +271,48 @@ def test_schema_v6_collection_and_update_match_corrected_golden_hashes():
                         "proposed_policy_kl_max",
                         "proposed_mean_exceeded",
                         "proposed_p99_exceeded",
+                        # Split-by-objective gradient telemetry. Zero unless a
+                        # separate auxiliary budget is configured, which this
+                        # NeuRD golden path never is.
+                        "policy_loss_grad_norm",
+                        "auxiliary_loss_grad_norm",
+                        "auxiliary_grad_scale",
                             # Diagnostic readout of the logit direction the policy
                             # is invariant to. Cannot affect the update it reports.
                             "policy_logit_shift",
+                            # Distillation-only reporting. Identically zero
+                            # under this frozen NeuRD golden update, which
+                            # never constructs a teacher.
+                            "distill_kl",
+                            "distill_kl_bid",
+                            "distill_kl_play",
+                            "distill_agree",
+                            "distill_agree_bid",
+                            "distill_agree_play",
+                            "distill_top1_mass_bid",
+                            "distill_top1_mass_play",
+                            "distill_teacher_entropy_bid",
+                            "distill_teacher_entropy_play",
+                            "distill_student_entropy_bid",
+                            "distill_student_entropy_play",
+                            "distill_loss_policy",
+                            "distill_loss_value",
+                            "distill_loss_aux",
+                            "distill_value_rmse",
+                            "distill_value_correlation",
+                            "distill_aux_kl_suit",
+                            "distill_aux_kl_rank_boundary",
+                            "distill_aux_kl_trick",
+                            "distill_aux_kl_bid_hit",
+                            "distill_aux_kl_next_winner",
+                            "distill_skipped_steps",
+                            "distill_aux_entropy_floor",
                             # PPO-only reporting fields are identically zero
                             # under this frozen NeuRD golden update.
                             "entropy_bid_normalized",
                             "entropy_play_normalized",
+                            "entropy_target_bid",
+                            "entropy_target_play",
                             "entropy_alpha_bid",
                             "entropy_alpha_play",
                             "ppo_ratio_clip_fraction",
@@ -260,13 +326,28 @@ def test_schema_v6_collection_and_update_match_corrected_golden_hashes():
                             "critic_loss_last_epoch",
                                 "critic_loss_reduction",
                                 "loss_oracle_trick",
-                                "suit_accuracy_10c_0",
-                                "suit_accuracy_10c_4",
-                                "suit_accuracy_10c_8",
+                                "loss_oracle_card_order",
+                                # Oracle-side and PPO-side next-trick-winner
+                                # reporting. The NeuRD golden path fills
+                                # loss_next_winner (kept in the hash below)
+                                # and leaves these three at zero.
+                                "loss_oracle_next_winner",
+                                "next_winner_accuracy",
+                                "oracle_next_winner_accuracy",
+                                    "suit_accuracy_10c_0",
+                                    "suit_accuracy_10c_4",
+                                    "suit_accuracy_10c_8",
+                                    "suit_loss_10c_0",
+                                    "suit_loss_10c_4",
+                                    "suit_loss_10c_8",
+                                    "rank_boundary_loss_10c_0",
+                                    "rank_boundary_loss_10c_4",
+                                    "rank_boundary_loss_10c_8",
                                 "trick_accuracy_10c_0",
                                 "trick_accuracy_10c_4",
                                 "trick_accuracy_10c_8",
                                 "oracle_trick_accuracy",
+                                "oracle_card_order_top1_accuracy",
                                 "peak_update_device_bytes",
                         }
                 }
@@ -275,4 +356,7 @@ def test_schema_v6_collection_and_update_match_corrected_golden_hashes():
         }
     )
 
-    assert observed == EXPECTED
+    for key, digest in EXPECTED_COLLECTION.items():
+        assert observed[key] == digest, f"collection hash {key} moved"
+    assert observed["update"] == EXPECTED_UPDATE
+    assert observed["weights"] == EXPECTED_WEIGHTS

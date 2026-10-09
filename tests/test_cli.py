@@ -59,6 +59,38 @@ def _train_args(name: str) -> list[str]:
     return args
 
 
+def test_ppo_without_trust_region_records_unmeasured_kl_as_blank(
+    tmp_path, monkeypatch, capsys
+):
+    monkeypatch.setenv("PLUMP_RUNS_DIR", str(tmp_path))
+    args = _train_args("ppo-unguarded")
+    for override in (
+        'training.policy_objective="ppo"',
+        "training.ppo_trust_region=false",
+        "training.ppo_critic_epochs=1",
+    ):
+        args.extend(("--set", override))
+    assert main(args) == 0
+    assert "kl off" in capsys.readouterr().out
+    run = RunDirectory("ppo-unguarded")
+    with run.metrics.open() as handle:
+        row = list(csv.DictReader(handle))[-1]
+    assert row["policy_kl_checked"] == "0"
+    for key in (
+        "policy_kl", "policy_kl_p95", "policy_kl_p99", "policy_kl_max",
+        "proposed_policy_kl", "proposed_policy_kl_p95", "proposed_policy_kl_p99",
+        "proposed_policy_kl_max", "proposed_mean_exceeded", "proposed_p99_exceeded",
+    ):
+        assert row[key] == ""
+    assert row["step_scale"] == "1.0"
+    assert row["rolled_back"] == "0"
+    checkpoint = torch.load(
+        run.resolve_checkpoint("latest"), map_location="cpu", weights_only=False
+    )
+    assert checkpoint["training_config"]["ppo_trust_region"] is False
+    assert checkpoint["optimizer_steps"] == 1
+
+
 def test_legacy_metrics_header_is_upgraded_for_reporting_fields(tmp_path):
     metrics = tmp_path / "metrics.csv"
     new_fields = {
@@ -74,6 +106,7 @@ def test_legacy_metrics_header_is_upgraded_for_reporting_fields(tmp_path):
         "value_prediction_std",
         "value_rows",
         "proposed_policy_kl",
+        "policy_kl_checked",
         "proposed_policy_kl_p95",
         "proposed_policy_kl_p99",
         "proposed_policy_kl_max",
@@ -370,6 +403,7 @@ def test_cli_reconfigure_writes_resume_checkpoint_and_config_audit(
             "--set",
             "training.learning_rate=0.0003",
             "--reconfigure",
+            "--prepare-only",
             "--reconfigure-reason",
             "test curriculum migration",
         )
@@ -383,5 +417,54 @@ def test_cli_reconfigure_writes_resume_checkpoint_and_config_audit(
     assert list((run / "config-history").glob("iter_000001*.toml"))
     metadata = json.loads((run / "metadata.json").read_text())
     migration = metadata["config_migrations"][-1]
+    assert metadata["status"] == "prepared"
     assert migration["reason"] == "test curriculum migration"
     assert any("training.learning_rate" in line for line in migration["changes"])
+
+
+def test_parse_int_list_accepts_lists_and_inclusive_ranges():
+    from plump.cli import _parse_int_list
+
+    assert _parse_int_list("3,4,5", "--player-counts") == (3, 4, 5)
+    assert _parse_int_list("3-10", "--hand-sizes") == tuple(range(3, 11))
+    assert _parse_int_list("3-5,9", "--hand-sizes") == (3, 4, 5, 9)
+    # Duplicates collapse and order is normalised.
+    assert _parse_int_list("5,3,5", "--hand-sizes") == (3, 5)
+
+
+def test_recycle_exits_at_a_checkpoint_and_resumes_without_gaps(
+    tmp_path, monkeypatch
+):
+    """Each process exits right after a checkpoint; restarts lose nothing.
+
+    Mirrors tools/train_supervised.sh: rerun the identical command while it
+    returns the recycle status. Two recycles, then a normal finish.
+    """
+
+    from plump.cli import RECYCLE_EXIT_CODE
+
+    monkeypatch.setenv("PLUMP_RUNS_DIR", str(tmp_path))
+    args = [
+        *_train_args("recycled"),
+        "--set",
+        "run.iterations=5",
+        "--set",
+        "run.checkpoint_every=2",
+        "--recycle-after",
+        "2",
+    ]
+
+    statuses = []
+    while True:
+        status = main(args)
+        statuses.append(status)
+        if status != RECYCLE_EXIT_CODE:
+            break
+        assert len(statuses) < 10, "recycling never reached the target"
+
+    assert statuses == [RECYCLE_EXIT_CODE, RECYCLE_EXIT_CODE, 0]
+    with (tmp_path / "recycled" / "metrics.csv").open(newline="") as handle:
+        iterations = [int(row["iteration"]) for row in csv.DictReader(handle)]
+    assert iterations == [1, 2, 3, 4, 5]
+    log = (tmp_path / "recycled" / "train.log").read_text()
+    assert log.count("Recycling the training process") == 2

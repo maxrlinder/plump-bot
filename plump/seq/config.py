@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+import math
+from dataclasses import dataclass, field, replace
 from typing import Literal, Optional, get_args
 
 SEQ_SCHEMA_VERSION = 6
@@ -29,14 +30,44 @@ NEXT_BID = 1
 NEXT_PLAY = 2
 NUM_NEXT_PHASES = 3
 
-BASE_TOKEN_WIDTH = 12
-# Every TRICK_WIN row carries the observer's cards still in hand. These are
-# card ids, not independent categorical slots: the model gathers the existing
-# exact-card + rank + suit input directions for each id and adds their sum to
-# that row. Other token types fill all ten positions with CARD_NA.
-REMAINING_HAND_SLOTS = 10
+# The first twelve slots are the original schema-v6 fields.  Keep this boundary
+# explicit: their fused embedding table is checkpoint-stable, while additive
+# state fields live in their own zero-initialized table.
+CORE_TOKEN_WIDTH = 12
+
+# Causal bidding-state fields.  They are populated only while bidding is the
+# relevant phase (including the BID event that updates the state).
+SLOT_BIDS_MADE = 12
+SLOT_BID_SUM = 13
+SLOT_BID_PRESSURE = 14
+SLOT_BIDS_REMAINING = 15
+BASE_TOKEN_WIDTH = 16
+# Every TRICK_WIN row carries the observer's cards still in hand. A trick has
+# already consumed one card, so a ten-card round needs at most nine remaining
+# slots. The old tenth always held CARD_NA; reuse it for a compact id describing
+# the complete pattern of absent base fields without changing TOKEN_WIDTH.
+REMAINING_HAND_SLOTS = 9
 SLOT_REMAINING_HAND_START = BASE_TOKEN_WIDTH
-TOKEN_WIDTH = BASE_TOKEN_WIDTH + REMAINING_HAND_SLOTS
+SLOT_NA_PATTERN = SLOT_REMAINING_HAND_START + REMAINING_HAND_SLOTS
+TOKEN_WIDTH = SLOT_NA_PATTERN + 1
+
+# Every valid absence mask emitted by schema-v6 across TURN modes. Row zero is
+# reserved for synthetic padding tokens and contributes exactly zero. Real
+# token rows use one of the remaining compact pattern ids.
+NA_PATTERN_MASKS = (
+    0,
+    0x00DC,
+    0x00E0,
+    0x00FC,
+    0x0C7E,
+    0x0CDC,
+    0x0CE0,
+    0xF020,
+    0xF03C,
+    0xF0BC,
+    0xFC20,
+    0xFCBC,
+)
 
 # Slot indices into a token row.
 SLOT_TYPE = 0
@@ -59,10 +90,16 @@ SLOT_NEXT_PHASE = 11
 #           costs P tokens instead of P + N*P)
 #   all  -> before every bid and every card play
 TurnTokenMode = Literal["off", "bid", "all"]
-PolicyObjective = Literal["neurd", "sampled_mirror", "ppo"]
+PolicyObjective = Literal["neurd", "sampled_mirror", "ppo", "distill"]
+CardEmbeddingMode = Literal["dense", "factored"]
+CARD_EMBEDDING_MODES: frozenset[str] = frozenset(get_args(CardEmbeddingMode))
 POLICY_OBJECTIVES: frozenset[str] = frozenset(get_args(PolicyObjective))
 PPOCriticMode = Literal["independent", "privileged", "oracle"]
 PPO_CRITIC_MODES: frozenset[str] = frozenset(get_args(PPOCriticMode))
+PPOAdvantageEstimator = Literal["monte_carlo", "gae"]
+PPO_ADVANTAGE_ESTIMATORS: frozenset[str] = frozenset(
+    get_args(PPOAdvantageEstimator)
+)
 
 
 def seq_len(
@@ -114,6 +151,13 @@ class SeqModelConfig:
     # rectangular -- see the note in rollout._append_wave.
     turn_token: TurnTokenMode = "off"
 
+    # Normalize the summed input embedding before it enters the trunk. The
+    # sum's magnitude is otherwise unbounded and its scatter-add gradients
+    # dominate the core group. RMSNorm discards that magnitude, so a model
+    # that did not train with it must be calibrated on insertion (see
+    # SeqPlumpBackbone.calibrate_embedding_norm) or its policy changes sharply.
+    embedding_rms_norm: bool = False
+
     d_model: int = 256
     n_layers: int = 6
     n_heads: int = 8
@@ -121,6 +165,40 @@ class SeqModelConfig:
     n_kv_heads: Optional[int] = None
     d_ff: int = 768
     dropout: float = 0.0
+
+    # Additive capacity extensions.  Zero disables the Gemma-3n-style packed
+    # per-layer conditioning path.  Value embeddings are injected into the
+    # attention V stream at either alternating blocks (including the last) or
+    # every block.  All lookup/residual contributions initialize to zero.
+    per_layer_embedding_dim: int = 0
+    value_embedding_mode: Literal["off", "alternating", "all"] = "off"
+
+    # How a card is represented on both sides of the model.  ``dense`` keeps
+    # the exact-card input rows and the 52 x d output matrix.  ``factored``
+    # removes both: a card is *only* ever rank + suit, at full model width, on
+    # input and output alike.  The token schema is untouched -- the serializer
+    # still writes real card ids and ``slot_vocab_sizes`` still validates them
+    # -- so a factored student and a dense teacher consume identical rollout
+    # tensors.  Only the embedding tables change shape, which is what lets the
+    # distillation pipeline run both models over one set of groups.
+    card_embedding_mode: CardEmbeddingMode = "dense"
+
+    # Absolute index-in-sequence embeddings.
+    #
+    # Off is the intended setting. An absolute index means different things at
+    # different table sizes -- position 14 is mid-bidding at five players and
+    # already the second trick at three -- so the table is forced to learn one
+    # row that must serve both, and the meaning of every row shifts with the
+    # opponent count. The information it was carrying is already in the token:
+    # SLOT_TRICK is the round, SLOT_POS_IN_TRICK the seat order within it, and
+    # SLOT_REL_PLAYER says who acted. Those are shape-invariant and jointly
+    # more expressive, and causal masking still supplies the ordering.
+    #
+    # Turning it off also makes the observer's HAND tokens an unordered set,
+    # which is what a hand actually is: they then carry only rank, suit and
+    # the player who holds them, with nothing to distinguish "first card
+    # dealt" from "second".
+    absolute_position_embedding: bool = True
 
     @property
     def kv_heads(self) -> int:
@@ -149,6 +227,18 @@ class SeqModelConfig:
         """[GAME] [HAND x N] plus the TURN token for the opening bid."""
 
         return 1 + hand_size + (0 if self.turn_token == "off" else 1)
+
+    @staticmethod
+    def actor_post_deal_position(hand_size: int) -> int:
+        """First actor-stream position strictly after the dealt-card block."""
+
+        return 1 + hand_size
+
+    @staticmethod
+    def oracle_post_deal_position(num_players: int, hand_size: int) -> int:
+        """First oracle-stream position after all owner-tagged dealt cards."""
+
+        return 1 + num_players * hand_size
 
     def bid_token_position(self, hand_size: int, bid_index: int) -> int:
         """Token position of the ``bid_index``-th bid event."""
@@ -207,6 +297,26 @@ class SeqModelConfig:
         return self.max_hand_size + 1
 
     @property
+    def bids_made_na_id(self) -> int:
+        return self.max_players + 1
+
+    @property
+    def bid_sum_na_id(self) -> int:
+        return self.max_players * self.max_hand_size + 1
+
+    @property
+    def bid_pressure_offset(self) -> int:
+        return (self.max_players - 1) * self.max_hand_size
+
+    @property
+    def bid_pressure_na_id(self) -> int:
+        return self.max_players * self.max_hand_size + 1
+
+    @property
+    def bids_remaining_na_id(self) -> int:
+        return self.max_players + 1
+
+    @property
     def trick_na_id(self) -> int:
         return self.max_hand_size
 
@@ -215,7 +325,7 @@ class SeqModelConfig:
         return self.max_players
 
     @property
-    def base_slot_vocab_sizes(self) -> tuple[int, ...]:
+    def core_slot_vocab_sizes(self) -> tuple[int, ...]:
         return (
             NUM_TOKEN_TYPES,
             self.max_players + 1,
@@ -232,6 +342,83 @@ class SeqModelConfig:
         )
 
     @property
+    def embedding_core_slot_vocab_sizes(self) -> tuple[int, ...]:
+        """Core slot table sizes actually allocated by the model.
+
+        Identical to ``core_slot_vocab_sizes`` under ``dense``.  Under
+        ``factored`` the exact-card block collapses to a single dummy row that
+        every card token is redirected onto with zero bag weight, so the block
+        stays in-bounds for the shared offset arithmetic while contributing
+        nothing and costing one row instead of 53.
+        """
+
+        sizes = list(self.core_slot_vocab_sizes)
+        if self.card_embedding_mode == "factored":
+            sizes[SLOT_CARD] = 1
+        return tuple(sizes)
+
+    @property
+    def embedding_base_slot_vocab_sizes(self) -> tuple[int, ...]:
+        return (
+            self.embedding_core_slot_vocab_sizes
+            + self.bid_pressure_slot_vocab_sizes
+        )
+
+    @property
+    def card_embedding_factored(self) -> bool:
+        return self.card_embedding_mode == "factored"
+
+    @property
+    def bid_pressure_slot_vocab_sizes(self) -> tuple[int, ...]:
+        return (
+            self.max_players + 2,
+            self.max_players * self.max_hand_size + 2,
+            self.max_players * self.max_hand_size + 2,
+            self.max_players + 2,
+        )
+
+    @property
+    def base_slot_na_ids(self) -> tuple[int | None, ...]:
+        """Sentinel id per base field; None means the field is always present."""
+
+        return (
+            None,
+            self.player_na_id,
+            self.rank_na_id,
+            self.suit_na_id,
+            self.card_na_id,
+            self.bid_na_id,
+            self.trick_na_id,
+            self.pos_na_id,
+            None,
+            None,
+            self.player_na_id,
+            NEXT_NONE,
+            self.bids_made_na_id,
+            self.bid_sum_na_id,
+            self.bid_pressure_na_id,
+            self.bids_remaining_na_id,
+        )
+
+    @property
+    def base_slot_vocab_sizes(self) -> tuple[int, ...]:
+        return self.core_slot_vocab_sizes + self.bid_pressure_slot_vocab_sizes
+
+    @property
+    def value_embedding_layers(self) -> tuple[int, ...]:
+        if self.value_embedding_mode == "off":
+            return ()
+        if self.value_embedding_mode == "all":
+            return tuple(range(self.n_layers))
+        # Match nanochat's alternating placement: the final block always has
+        # a value embedding, then every other block working backward.
+        return tuple(
+            layer
+            for layer in range(self.n_layers)
+            if layer % 2 == (self.n_layers - 1) % 2
+        )
+
+    @property
     def slot_vocab_sizes(self) -> tuple[int, ...]:
         """Vocabulary limits for every serialized token column.
 
@@ -240,8 +427,10 @@ class SeqModelConfig:
         schema validation and tooling uniform across the complete token row.
         """
 
-        return self.base_slot_vocab_sizes + (
-            (NUM_CARDS + 1,) * REMAINING_HAND_SLOTS
+        return (
+            self.base_slot_vocab_sizes
+            + ((NUM_CARDS + 1,) * REMAINING_HAND_SLOTS)
+            + (len(NA_PATTERN_MASKS),)
         )
 
     def validate(self) -> None:
@@ -249,6 +438,17 @@ class SeqModelConfig:
             raise ValueError("d_model must be divisible by n_heads.")
         if self.kv_heads > self.n_heads or self.n_heads % self.kv_heads != 0:
             raise ValueError("n_kv_heads must divide n_heads.")
+        if self.per_layer_embedding_dim < 0:
+            raise ValueError("per_layer_embedding_dim must be non-negative.")
+        if self.value_embedding_mode not in ("off", "alternating", "all"):
+            raise ValueError("Unknown value_embedding_mode.")
+        if self.card_embedding_mode not in CARD_EMBEDDING_MODES:
+            raise ValueError(
+                f"Unknown card_embedding_mode {self.card_embedding_mode!r}; "
+                f"expected one of {sorted(CARD_EMBEDDING_MODES)}."
+            )
+        if len(self.core_slot_vocab_sizes) != CORE_TOKEN_WIDTH:
+            raise AssertionError("Core slot vocabulary must match core width.")
         if len(self.base_slot_vocab_sizes) != BASE_TOKEN_WIDTH:
             raise AssertionError("Base slot vocabulary must match base token width.")
         if len(self.slot_vocab_sizes) != TOKEN_WIDTH:
@@ -503,9 +703,31 @@ class RolloutOptions:
     # and pay the replay cost for nothing.
     bid_split_min_hand_size: int = 0
 
+    # Run every schedule cell through one continuously-batched wave loop
+    # instead of one lockstep loop per cell.
+    #
+    # A lockstep loop can only hold games that agree on shape *and* length, so
+    # a 24-cell schedule decodes 24 narrow streams in sequence: measured at 600
+    # calls of ~133 rows each, where the decode kernel costs ~2.2 ms of fixed
+    # overhead plus ~4.9 us/row. At that width the fixed cost is three quarters
+    # of the call and the schedule is paying for launches, not for arithmetic.
+    # Merging trades a per-row cache write and a masked read (~1.3x per call)
+    # for an order of magnitude fewer calls.
+    #
+    # Only the unbranched single-policy PPO path merges: branching, bid splits,
+    # heuristic/historical arms and multi-policy caches each break the dense
+    # row invariant the merged read needs, and ``merged_waves_available`` turns
+    # the flag back off rather than failing.
+    merged_waves: bool = False
+    # Cache rows one merged loop may hold. The schedule is cut into as many
+    # loops as this needs; None uses the whole row budget in one.
+    merged_max_rows: Optional[int] = None
+
     def validate(self) -> None:
         if self.deals_per_batch < 1:
             raise ValueError("deals_per_batch must be >= 1.")
+        if self.merged_max_rows is not None and self.merged_max_rows < 1:
+            raise ValueError("merged_max_rows must be >= 1.")
         if (
             self.parallel_deals_max_hand_size is not None
             and self.parallel_deals_max_hand_size < 1
@@ -635,8 +857,19 @@ def build_branch_rate_table(
     grid supports -- the spread across P at fixed N is within deal noise.
     """
 
-    if not 0.0 < reference_rate <= 1.0:
-        raise ValueError("reference_rate must be in (0, 1].")
+    if not 0.0 <= reference_rate <= 1.0:
+        raise ValueError("reference_rate must be in [0, 1].")
+    if reference_rate == 0.0:
+        # No branching anywhere. Distillation wants breadth of distinct deals
+        # rather than depth of counterfactual tree: every extra leaf re-walks a
+        # position the teacher has already labelled once. Short-circuited
+        # rather than left to the taper, where ``0 ** 0`` would hand a rate of
+        # 1.0 to any shape at or below ``exhaustive_until``.
+        return tuple(
+            ShapeBranchRate(rate=0.0, num_players=players, hand_size=hand_size)
+            for players in player_counts
+            for hand_size in hand_sizes
+        )
     if exhaustive_until >= reference_hand_size:
         raise ValueError(
             "exhaustive_until must be below reference_hand_size, or there is "
@@ -795,6 +1028,25 @@ class SeqTrainingConfig:
     schedule_cells: tuple[GameScheduleCell, ...] = field(
         default_factory=default_schedule_cells
     )
+    @property
+    def collection_schedule_cells(self) -> tuple[GameScheduleCell, ...]:
+        """The schedule one rollout wave actually plays.
+
+        ``schedule_cells`` describes a single update's batch. A wave feeds
+        ``updates_per_collect`` of them, so the collector plays that multiple
+        and the trainer splits the trees back apart. Derived here rather than
+        baked into the cells at config-load time so the two halves of the knob
+        -- how much is collected, and how many slices it becomes -- can never
+        disagree, however the config was constructed.
+        """
+
+        count = max(int(self.updates_per_collect), 1)
+        if count == 1:
+            return self.schedule_cells
+        return tuple(
+            replace(cell, games=cell.games * count) for cell in self.schedule_cells
+        )
+
     player_counts: tuple[int, ...] = (3, 4, 5)
     player_count_weights: tuple[float, ...] = (2.0, 3.0, 4.0)
 
@@ -821,6 +1073,10 @@ class SeqTrainingConfig:
     epochs: int = 1
     # Microbatch size in token positions (sequences x length), sized to memory.
     microbatch_positions: int = 16384
+    # One global-norm budget for the whole actor (trunk, action heads, input
+    # embeddings and auxiliary heads together) and one for the critic. Giving
+    # any part its own budget lets it be rescaled independently of the rest,
+    # which changes the relative step sizes the optimizer was tuned around.
     max_grad_norm: float = 1.0
 
     # Policy objective. Both choices consume the same counterfactual rows and
@@ -833,11 +1089,78 @@ class SeqTrainingConfig:
     #                  an unbiased full-information mirror step)
     policy_objective: PolicyObjective = "neurd"
 
+    # --- Distillation ------------------------------------------------------
+    # ``policy_objective = "distill"`` replaces the reinforcement objective
+    # entirely: a frozen teacher checkpoint both drives the rollout and
+    # supplies every training target, and the student minimizes divergence
+    # from it. No advantages, no critic, no trust region, no Lagrangian duals
+    # -- those controllers all exist to stop a policy-gradient update from
+    # moving too far, and a supervised KL has no such failure mode.
+    #
+    # The teacher is loaded with its own embedded ``model_config``, so a dense
+    # 6-layer teacher can supervise a factored 16-layer student. Only the
+    # token schema has to agree, which the trainer checks on construction.
+    # How many updates one rollout wave feeds.
+    #
+    # Rollout is latency-bound, not throughput-bound: the per-shape
+    # autoregressive decode loop runs once per schedule cell whatever the deal
+    # count, so a thin wave pays the same sequential cost as a fat one.
+    # Measured on this machine: 288 games collect in 13.2s and 1152 games in
+    # 18.5s -- 4x the deals for 1.4x the time, i.e. 13.2s -> 4.6s of rollout
+    # per update. Collecting N updates' worth in one wave and then running N
+    # updates back to back converts that into a straight speedup, and the GPU
+    # spends proportionally more of its time on the update, which is the only
+    # part that actually saturates it.
+    #
+    # ``deals_per_shape`` stays the per-update batch; this multiplies what the
+    # collector gathers, then the trees are split back into that many disjoint
+    # slices. 1 restores the original collect-then-update cadence.
+    #
+    # The cost is staleness: the last slice was collected by a policy N-1
+    # updates old. Distillation tolerates that far better than a
+    # reinforcement objective would -- the teacher's labels are correct for
+    # any state, so a slightly stale state distribution costs coverage, not
+    # correctness.
+    updates_per_collect: int = 1
+    distill_teacher_checkpoint: str = ""
+    # Who acts during collection.
+    #
+    # ``student`` is on-policy distillation: the student visits its own states
+    # and the teacher labels them. This is the setting that fixes compounding
+    # error -- a teacher-driven dataset only ever shows states the teacher
+    # reaches, so a student that drifts has never been taught the way back.
+    # The cost is that early states are poor, since a random student wanders.
+    #
+    # ``teacher`` is the classical fixed-dataset alternative: states come from
+    # the teacher's own distribution and are immediately on-manifold, at the
+    # price of never covering the student's mistakes.
+    distill_rollout_policy: Literal["student", "teacher"] = "student"
+    # Forward KL, KL(teacher || student), summed over the legal action set at
+    # every recorded decision. Mode-covering: the student is penalized for
+    # putting no mass where the teacher puts some, which is what transfers the
+    # teacher's full distribution rather than just its argmax.
+    distill_policy_coef: float = 1.0
+    # The teacher's scalar value prediction, as MSE on the same dense
+    # positions the reinforcement path supervises.
+    distill_value_coef: float = 1.0
+    # Belief/auxiliary heads: suit presence, rank boundary, trick count, next
+    # winner, bid hit. Distilled as soft-target cross-entropy against the
+    # teacher's logits rather than against ground truth, so the student
+    # inherits the teacher's calibration including its uncertainty.
+    distill_aux_coef: float = 1.0
+    # Softmax temperature applied to *both* sides of every distilled
+    # categorical. Above 1 this flattens the targets and surfaces the
+    # teacher's relative ranking of low-probability actions.
+    distill_temperature: float = 1.0
+
     # Branch-free PPO. ``ppo_trainable_policies=1`` shares one actor across
     # every learned seat; larger values assign distinct actor weights to seats
     # round-robin (with a rotating offset between deals). The actors share the
     # same architecture and one optimizer step but not parameters.
     ppo_clip_ratio: float = 0.1
+    # Optional post-step KL guard. Disabling it skips the extra actor replay,
+    # rollback snapshots and retries; the PPO loss and gradient clip remain.
+    ppo_trust_region: bool = True
     ppo_trainable_policies: int = 1
     ppo_self_play_seats: Literal["focal", "all"] = "all"
     # The focal stays an on-policy sample. This separately controls neural
@@ -847,6 +1170,10 @@ class SeqTrainingConfig:
     # compatible PPO shape groups. 0 keeps exact per-shape batches. Padding is
     # appended after every selected causal position and cannot affect logits.
     ppo_sequence_bucket_width: int = 0
+    # Optional independent width for the oracle/critic sequences. None reuses
+    # the actor width. The two streams have different length distributions,
+    # so one shared launch/padding tradeoff need not be optimal for both.
+    ppo_critic_sequence_bucket_width: Optional[int] = None
     # The default oracle critic has its own trunk and receives one distinct,
     # owner-tagged token for every dealt card. It processes one canonical
     # sequence per environmental game and emits one value per absolute seat.
@@ -855,11 +1182,57 @@ class SeqTrainingConfig:
     ppo_critic_mode: PPOCriticMode = "oracle"
     ppo_critic_learning_rate: float = 3e-4
     ppo_critic_epochs: int = 4
+    # Monte Carlo subtracts the frozen pre-update oracle value from the final
+    # return. GAE instead bootstraps between consecutive genuine game decision
+    # states; lambda=1 is exactly the Monte-Carlo estimator and lambda=0 is
+    # one-step TD. The final advantages are normalized either way.
+    ppo_advantage_estimator: PPOAdvantageEstimator = "monte_carlo"
+    ppo_gae_lambda: float = 0.95
     ppo_advantage_normalize: bool = True
     # Head-only actor auxiliaries probe what the policy trunk already encodes
     # without steering that representation. The independent PPO critic keeps
     # its ordinary end-to-end gradients regardless of this setting.
     ppo_actor_auxiliary_detach_hidden: bool = False
+    # State-belief heads can be supervised only where the observer acts, or at
+    # every genuine causal token. Dense supervision retains the same total
+    # per-trajectory weight, distributing it over more targets rather than
+    # increasing the auxiliary coefficients.
+    ppo_auxiliary_positions: Literal["policy", "all"] = "policy"
+    # Where an "all positions" auxiliary/value objective begins. ``sequence``
+    # preserves the original GAME + dealt-card-prefix supervision. ``bidding``
+    # gives those prefix tokens zero loss weight and starts on the first token
+    # strictly after the dealt-card block. With a bidding TURN token this is
+    # the opening-bid readout state. Actor and oracle streams use their own
+    # N-card and P*N-card boundaries respectively.
+    dense_supervision_start: Literal["sequence", "bidding"] = "sequence"
+    # Weight on the actor's own per-seat value head. The oracle critic remains
+    # the sole source of PPO advantages and evaluation; this head is a dense
+    # observer-information value probe trained on the same targets with the
+    # same centering and normalization as the oracle, so the two losses answer
+    # "how much of the value function is learnable without perfect
+    # information?" directly. 0 disables the head entirely.
+    ppo_actor_value_coef: float = 0.0
+    # Separate gradient-norm budgets for the two objectives that share the
+    # actor trunk. 0 keeps the historical behaviour: one backward over the
+    # summed loss, one global clip, and whatever ratio the loss weights
+    # happen to imply.
+    #
+    # Why a ratio and not two absolute budgets: Adam is invariant to a
+    # uniform rescale of the gradient, so only the *relative* size of the two
+    # contributions changes anything. The absolute size is already fixed by
+    # max_grad_norm on the sum.
+    #
+    # Why this is not equivalent to raising the auxiliary coefficients: the
+    # implied ratio is a function of the hand-size mix. The PPO objective
+    # carries one row per decision (mean hand_size + 1 = 7.5 rows over a
+    # 3..10 schedule) while every auxiliary head carries unit mass per
+    # sequence, so a fixed coefficient means a different balance for a 3-card
+    # game than a 10-card one. Measuring the two norms and rescaling makes
+    # the balance the same everywhere and independent of the schedule.
+    #
+    # Cost: the auxiliary and policy halves need their own backward pass over
+    # the shared trunk, so the actor update does two backwards instead of one.
+    ppo_auxiliary_grad_fraction: float = 0.0
     # Entropy is normalized by log(number of legal actions), separately for
     # bids and plays. Forced decisions have no entropy target. In adaptive
     # mode, a learned positive temperature tracks the configured floor.
@@ -868,6 +1241,16 @@ class SeqTrainingConfig:
     ppo_entropy_learning_rate: float = 1e-3
     ppo_bid_entropy_target: float = 0.65
     ppo_play_entropy_target: float = 0.60
+    # Optional iteration-indexed schedule for the normalized phase targets.
+    # The base targets above are its starting values. ``linear`` changes them
+    # at a constant rate; a half-cosine has zero slope at both endpoints.
+    ppo_entropy_target_schedule: Literal[
+        "constant", "linear", "cosine"
+    ] = "constant"
+    ppo_entropy_schedule_start_iteration: int = 0
+    ppo_entropy_schedule_end_iteration: int = 0
+    ppo_bid_entropy_target_end: float = 0.65
+    ppo_play_entropy_target_end: float = 0.60
 
     # NeuRD. One loss over every focal decision, with gradient on the logit of
     # action a equal to -A(a), independent of pi(a).
@@ -971,11 +1354,12 @@ class SeqTrainingConfig:
     # -1.0 roughly equalizes weight across depths for a branching factor of 2.
     branch_depth_exponent: float = 0.0
 
-    # Value is a control variate for focal policy decisions, so its statistically
+    # Value is a control variate for policy decisions, so its statistically
     # correct target is the conditional expected return. Normalized MSE learns
     # that mean; Smooth-L1 is retained only for explicit legacy experiments.
-    # Restricting supervision to policy readouts avoids spending most of the
-    # value gradient on event-token positions where the baseline is never used.
+    # ``all`` also supervises every genuine serialized state. For an oracle
+    # critic this means every active player's EV at every token; its per-game
+    # loss mass is averaged across positions rather than multiplied by length.
     value_objective: Literal["mse", "smooth_l1"] = "mse"
     value_positions: Literal["policy", "all"] = "policy"
     value_reward_scale: float = 5.0
@@ -989,9 +1373,28 @@ class SeqTrainingConfig:
     # wider, harder form.
     value_coef: float = 0.5
     trick_coef: float = 0.0
+    # One softmax over seats per position: who takes the next trick to be
+    # resolved? Labeled densely from the moment the last bid lands through the
+    # penultimate trick, and IGNORE outside that window -- before the bids are
+    # in the question conflates "who wins trick 0" with "what will the
+    # remaining seats bid", and after the last trick there is no next trick.
+    # Where trick count is a whole-round outcome restated at every position,
+    # this target moves every trick, so it stays hard for the entire hand
+    # instead of collapsing to a point mass the way the trick mask does.
+    next_winner_coef: float = 0.0
+    # Oracle-only listwise prediction of each active player's future
+    # within-hand card order. Contextual exact-card scores are normalized
+    # separately within each absolute seat's remaining hand to define a
+    # Plackett-Luce distribution over its remaining-card permutation.
+    oracle_card_order_coef: float = 0.0
     # Per (seat, suit) sigmoid: does that seat still hold the suit? Labels move
     # with the round, so they are rebuilt at every position of the replay.
     suit_coef: float = 0.25
+    # Per opponent/suit, two sigmoids: does the opponent hold a rank below the
+    # observer's current lowest card or above its current highest? A final
+    # aggregate row asks the same two questions of any opponent. Suits absent
+    # from the observer's current hand are masked.
+    rank_boundary_coef: float = 0.0
     # Per seat sigmoid: will that seat finish the round on its bid? The label is
     # the round's outcome, so it is one constant per seat, broadcast over every
     # position -- a forecast that sharpens as the round resolves.
@@ -1042,6 +1445,24 @@ class SeqTrainingConfig:
             else self.auxiliary_learning_rate
         )
 
+    def dense_start_position(
+        self,
+        model_config: SeqModelConfig,
+        *,
+        num_players: int,
+        hand_size: int,
+        oracle: bool = False,
+    ) -> int:
+        """First non-padding position carrying dense loss weight."""
+
+        if self.dense_supervision_start == "sequence":
+            return 0
+        if oracle:
+            return model_config.oracle_post_deal_position(
+                num_players, hand_size
+            )
+        return model_config.actor_post_deal_position(hand_size)
+
     def validate(self) -> None:
         self.rollout.validate()
         if self.learning_rate <= 0 or self.core_lr <= 0 or self.auxiliary_lr <= 0:
@@ -1054,6 +1475,45 @@ class SeqTrainingConfig:
             raise ValueError("value_positions must be either 'policy' or 'all'.")
         if self.value_reward_scale <= 0:
             raise ValueError("value_reward_scale must be > 0.")
+        if min(
+            self.value_coef,
+            self.trick_coef,
+            self.next_winner_coef,
+            self.oracle_card_order_coef,
+            self.suit_coef,
+            self.rank_boundary_coef,
+            self.bid_hit_coef,
+            self.entropy_coef,
+        ) < 0:
+            raise ValueError("Loss coefficients must be >= 0.")
+        if self.updates_per_collect < 1:
+            raise ValueError("updates_per_collect must be >= 1.")
+        if self.policy_objective == "distill":
+            if not self.distill_teacher_checkpoint:
+                raise ValueError(
+                    "policy_objective='distill' requires distill_teacher_checkpoint."
+                )
+            if self.distill_temperature <= 0.0:
+                raise ValueError("distill_temperature must be positive.")
+            if not (
+                self.distill_policy_coef
+                or self.distill_value_coef
+                or self.distill_aux_coef
+            ):
+                raise ValueError("Distillation needs at least one nonzero coefficient.")
+            # The duals are deliberately out of scope for the bootstrap run.
+            # Failing loudly beats silently carrying an inherited controller
+            # config that the distillation update never reads.
+            if self.ppo_entropy_mode == "adaptive":
+                raise ValueError(
+                    "Distillation does not run the entropy controller; set "
+                    "ppo_entropy_mode='fixed'."
+                )
+            if self.policy_kl_cap or self.policy_kl_p99_cap:
+                raise ValueError(
+                    "Distillation does not run a trust region; set policy_kl_cap "
+                    "and policy_kl_p99_cap to 0."
+                )
         if self.policy_objective not in POLICY_OBJECTIVES:
             raise ValueError(
                 f"Unknown policy_objective {self.policy_objective!r}; expected "
@@ -1069,12 +1529,31 @@ class SeqTrainingConfig:
             )
         if self.ppo_self_play_seats not in ("focal", "all"):
             raise ValueError("ppo_self_play_seats must be 'focal' or 'all'.")
+        if self.ppo_actor_value_coef < 0:
+            raise ValueError("ppo_actor_value_coef must be >= 0.")
+        if self.ppo_auxiliary_grad_fraction < 0:
+            raise ValueError("ppo_auxiliary_grad_fraction must be >= 0.")
+        if self.ppo_auxiliary_positions not in ("policy", "all"):
+            raise ValueError(
+                "ppo_auxiliary_positions must be either 'policy' or 'all'."
+            )
+        if self.dense_supervision_start not in ("sequence", "bidding"):
+            raise ValueError(
+                "dense_supervision_start must be either 'sequence' or 'bidding'."
+            )
         if self.ppo_opponent_action_mode not in ("sample", "argmax"):
             raise ValueError(
                 "ppo_opponent_action_mode must be 'sample' or 'argmax'."
             )
         if self.ppo_sequence_bucket_width < 0:
             raise ValueError("ppo_sequence_bucket_width must be >= 0.")
+        if (
+            self.ppo_critic_sequence_bucket_width is not None
+            and self.ppo_critic_sequence_bucket_width < 0
+        ):
+            raise ValueError(
+                "ppo_critic_sequence_bucket_width must be >= 0 when set."
+            )
         if self.ppo_critic_mode not in PPO_CRITIC_MODES:
             raise ValueError(
                 f"Unknown ppo_critic_mode {self.ppo_critic_mode!r}; expected "
@@ -1084,6 +1563,21 @@ class SeqTrainingConfig:
             raise ValueError("ppo_critic_learning_rate must be > 0.")
         if self.ppo_critic_epochs < 1:
             raise ValueError("ppo_critic_epochs must be >= 1.")
+        if self.ppo_advantage_estimator not in PPO_ADVANTAGE_ESTIMATORS:
+            raise ValueError(
+                f"Unknown ppo_advantage_estimator "
+                f"{self.ppo_advantage_estimator!r}; expected one of "
+                f"{sorted(PPO_ADVANTAGE_ESTIMATORS)}."
+            )
+        if not 0.0 <= self.ppo_gae_lambda <= 1.0:
+            raise ValueError("ppo_gae_lambda must be in [0, 1].")
+        if (
+            self.ppo_advantage_estimator == "gae"
+            and self.ppo_critic_mode != "oracle"
+        ):
+            raise ValueError(
+                "ppo_advantage_estimator='gae' requires the oracle critic."
+            )
         if self.ppo_entropy_mode not in ("off", "fixed", "adaptive"):
             raise ValueError(
                 "ppo_entropy_mode must be 'off', 'fixed', or 'adaptive'."
@@ -1096,6 +1590,34 @@ class SeqTrainingConfig:
             raise ValueError("ppo_bid_entropy_target must be in [0, 1].")
         if not 0.0 <= self.ppo_play_entropy_target <= 1.0:
             raise ValueError("ppo_play_entropy_target must be in [0, 1].")
+        if self.ppo_entropy_target_schedule not in (
+            "constant",
+            "linear",
+            "cosine",
+        ):
+            raise ValueError(
+                "ppo_entropy_target_schedule must be 'constant', 'linear', "
+                "or 'cosine'."
+            )
+        if self.ppo_entropy_schedule_start_iteration < 0:
+            raise ValueError(
+                "ppo_entropy_schedule_start_iteration must be >= 0."
+            )
+        if self.ppo_entropy_schedule_end_iteration < 0:
+            raise ValueError("ppo_entropy_schedule_end_iteration must be >= 0.")
+        if (
+            self.ppo_entropy_target_schedule != "constant"
+            and self.ppo_entropy_schedule_end_iteration
+            <= self.ppo_entropy_schedule_start_iteration
+        ):
+            raise ValueError(
+                "An entropy target schedule requires end_iteration > "
+                "start_iteration."
+            )
+        if not 0.0 <= self.ppo_bid_entropy_target_end <= 1.0:
+            raise ValueError("ppo_bid_entropy_target_end must be in [0, 1].")
+        if not 0.0 <= self.ppo_play_entropy_target_end <= 1.0:
+            raise ValueError("ppo_play_entropy_target_end must be in [0, 1].")
         if self.league_pool_size < 1:
             raise ValueError("league_pool_size must be >= 1.")
         if not 0.0 <= self.league_recent_fraction <= 1.0:
@@ -1104,7 +1626,10 @@ class SeqTrainingConfig:
             raise ValueError("precision must be 'fp32', 'fp16', or 'bf16'.")
         if self.kv_dtype not in ("fp32", "fp16", "bf16"):
             raise ValueError("kv_dtype must be 'fp32', 'fp16', or 'bf16'.")
-        if self.policy_kl_cap <= 0:
+        # The trust region is a property of the reinforcement objectives.
+        # Distillation has no behaviour policy to stay near, so a zero cap
+        # there means "no trust region", not "misconfigured".
+        if self.policy_kl_cap <= 0 and self.policy_objective != "distill":
             raise ValueError("policy_kl_cap must be > 0.")
         if self.policy_kl_p99_cap < 0:
             raise ValueError(
@@ -1209,3 +1734,24 @@ class SeqTrainingConfig:
                 and cell.num_players not in self.player_counts
             ):
                 raise ValueError("Schedule cell player count not in player_counts.")
+
+    def ppo_entropy_targets(self, iteration: int) -> tuple[float, float]:
+        """Return the normalized bid/play entropy targets at ``iteration``."""
+
+        if self.ppo_entropy_target_schedule == "constant":
+            return self.ppo_bid_entropy_target, self.ppo_play_entropy_target
+        start = self.ppo_entropy_schedule_start_iteration
+        end = self.ppo_entropy_schedule_end_iteration
+        progress = min(max((iteration - start) / (end - start), 0.0), 1.0)
+        fraction = (
+            progress
+            if self.ppo_entropy_target_schedule == "linear"
+            else 0.5 - 0.5 * math.cos(math.pi * progress)
+        )
+        bid = self.ppo_bid_entropy_target + fraction * (
+            self.ppo_bid_entropy_target_end - self.ppo_bid_entropy_target
+        )
+        play = self.ppo_play_entropy_target + fraction * (
+            self.ppo_play_entropy_target_end - self.ppo_play_entropy_target
+        )
+        return bid, play

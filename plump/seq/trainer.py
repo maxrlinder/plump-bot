@@ -29,6 +29,7 @@ import random
 import time
 import uuid
 from collections import defaultdict
+from collections.abc import Sequence
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Optional
@@ -36,6 +37,7 @@ from typing import Optional
 import numpy as np
 import torch
 import torch.nn.functional as F
+from torch import nn
 
 from plump.rewards import compute_relative_rewards
 from plump.rounds import rules_fingerprint
@@ -47,11 +49,18 @@ from .config import (
     SeqTrainingConfig,
 )
 from .model import (
+    ADDITIVE_CONDITIONING_KEYS,
+    NA_PATTERN_EMBEDDING_KEYS,
+    NEXT_WINNER_HEAD_KEYS,
+    ORACLE_CARD_ORDER_HEAD_KEYS,
+    PLAYER_VALUE_HEAD_KEYS,
+    RANK_BOUNDARY_HEAD_KEYS,
     SEQ_MODEL_FORMAT_VERSION,
     STRUCTURED_CARD_OUTPUT_KEYS,
     SeqPlumpModel,
     SeqPPOCritic,
     SeqPPOOracleCritic,
+    EMBEDDING_NORM_KEYS,
     load_seq_model_state_dict,
 )
 from .policy import SeqLeague, best_seq_device
@@ -61,8 +70,12 @@ from .ppo import (
     PPOCriticGroup,
     PPOTrainingGroup,
     build_ppo_training_batch,
+    center_zero_sum_values,
     normalize_ppo_advantages,
+    oracle_gae_advantages,
+    plackett_luce_card_order_terms,
     ppo_clipped_terms,
+    ppo_policy_kl,
     ppo_critic_rows_by_chunk,
     ppo_rows_by_chunk,
 )
@@ -74,12 +87,66 @@ from .tokens import (
     build_seat_tokens,
 )
 
+
 _AUXILIARY_HEAD_PREFIXES = (
     "value_head.",
+    "player_value_head.",
     "trick_count_head.",
     "suit_presence_head.",
     "bid_hit_head.",
+    "rank_boundary_head.",
+    "next_winner_head.",
 )
+
+# Input-side embedding tables. Their gradients are scatter-adds accumulated
+# over every token occurrence, so a handful of hot rows dominate the actor's
+# global norm. The actor is clipped as one group, so this list only selects
+# which parameters get their pre-clip norm reported separately. Output
+# embeddings stay out of it: they are read like a head, once per decision.
+# Training-config fields introduced after checkpoints were already being
+# written. A checkpoint that predates one simply lacks the key, which must not
+# read as a configuration mismatch and strand every earlier checkpoint.
+_ADDITIVE_TRAINING_FIELDS: tuple[str, ...] = (
+    "ppo_actor_value_coef",
+    "ppo_critic_sequence_bucket_width",
+    "ppo_advantage_estimator",
+    "ppo_gae_lambda",
+    "next_winner_coef",
+    "dense_supervision_start",
+    "ppo_auxiliary_grad_fraction",
+    "ppo_trust_region",
+)
+
+_INPUT_EMBEDDING_PREFIXES = (
+    "slot_embedding.",
+    "pos_embedding.",
+    "bid_pressure_embedding.",
+    "na_pattern_embedding.",
+    "per_layer_slot_embedding.",
+    "per_layer_pos_embedding.",
+    "per_layer_na_pattern_embedding.",
+    "value_slot_embedding.",
+    "value_pos_embedding.",
+    "value_na_pattern_embedding.",
+)
+
+
+def _grad_norm(parameters: Sequence[torch.nn.Parameter]) -> float:
+    """Global norm of the gradients currently held by ``parameters``."""
+
+    grads = [
+        parameter.grad.detach()
+        for parameter in parameters
+        if parameter.grad is not None
+    ]
+    if not grads:
+        return 0.0
+    return float(
+        torch.linalg.vector_norm(
+            torch.stack([torch.linalg.vector_norm(grad) for grad in grads])
+        )
+    )
+
 
 # --------------------------------------------------------------------- #
 # Batch containers                                                       #
@@ -120,7 +187,9 @@ class SeqTrainingGroup:
     position_weight: np.ndarray  # [B, L] on-policy dense-auxiliary weight
     trick_targets: np.ndarray  # [B, max_players]
     trick_masks: np.ndarray
+    next_winner_targets: np.ndarray  # [B, L], IGNORE_LABEL outside the play phase
     suit_targets: np.ndarray
+    rank_boundary_targets: np.ndarray
     bid_hit_targets: np.ndarray  # [B, max_players]
     policy: dict[str, PolicyRows]
 
@@ -135,19 +204,79 @@ class SeqUpdateStats:
     value_correlation: float = 0.0
     value_prediction_std: float = 0.0
     loss_suit: float = 0.0
+    loss_rank_boundary: float = 0.0
     loss_trick: float = 0.0
     loss_oracle_trick: float = 0.0
+    loss_next_winner: float = 0.0
+    loss_oracle_next_winner: float = 0.0
+    loss_oracle_card_order: float = 0.0
     loss_bid_hit: float = 0.0
     suit_accuracy_10c_0: float = 0.0
     suit_accuracy_10c_4: float = 0.0
     suit_accuracy_10c_8: float = 0.0
+    suit_loss_10c_0: float = 0.0
+    suit_loss_10c_4: float = 0.0
+    suit_loss_10c_8: float = 0.0
+    rank_boundary_balanced_accuracy_10c_0: float = 0.0
+    rank_boundary_balanced_accuracy_10c_4: float = 0.0
+    rank_boundary_balanced_accuracy_10c_8: float = 0.0
+    rank_boundary_loss_10c_0: float = 0.0
+    rank_boundary_loss_10c_4: float = 0.0
+    rank_boundary_loss_10c_8: float = 0.0
     trick_accuracy_10c_0: float = 0.0
     trick_accuracy_10c_4: float = 0.0
     trick_accuracy_10c_8: float = 0.0
     oracle_trick_accuracy: float = 0.0
+    next_winner_accuracy: float = 0.0
+    oracle_next_winner_accuracy: float = 0.0
+    oracle_card_order_top1_accuracy: float = 0.0
+    # --- distillation ---
+    # Forward KL(teacher || student) in nats, per decision, split by phase.
+    distill_kl_bid: float = 0.0
+    distill_kl_play: float = 0.0
+    distill_kl: float = 0.0
+    # Share of decisions where the student's argmax matches the teacher's.
+    # This is the headline "am I mimicking yet" number.
+    distill_agree_bid: float = 0.0
+    distill_agree_play: float = 0.0
+    distill_agree: float = 0.0
+    # Probability the student assigns to the teacher's argmax action.
+    distill_top1_mass_bid: float = 0.0
+    distill_top1_mass_play: float = 0.0
+    # Teacher and student entropies, to show the student is matching the
+    # teacher's spread rather than collapsing onto its mode.
+    distill_teacher_entropy_bid: float = 0.0
+    distill_teacher_entropy_play: float = 0.0
+    distill_student_entropy_bid: float = 0.0
+    distill_student_entropy_play: float = 0.0
+    # Per-head KL(teacher || student), zero at a perfect match. Reported as
+    # KL rather than the optimized cross-entropy so the heads are mutually
+    # comparable and share a meaningful floor.
+    distill_aux_kl_suit: float = 0.0
+    distill_aux_kl_rank_boundary: float = 0.0
+    distill_aux_kl_trick: float = 0.0
+    distill_aux_kl_bid_hit: float = 0.0
+    distill_aux_kl_next_winner: float = 0.0
+    # Updates whose gradient was non-finite and therefore skipped. Any value
+    # above zero means something upstream produced a NaN; the run survives it
+    # but the cause still needs finding.
+    distill_skipped_steps: float = 0.0
+    # The part of ``distill_loss_aux`` that is the teacher's own entropy and
+    # therefore cannot be trained away. Reported so the auxiliary curve can be
+    # read against its floor: the cross-entropy is dominated by it, and looks
+    # flat long before the learnable part stops moving.
+    distill_aux_entropy_floor: float = 0.0
+    distill_loss_policy: float = 0.0
+    distill_loss_value: float = 0.0
+    distill_loss_aux: float = 0.0
+    # Student-vs-teacher value agreement on the same states.
+    distill_value_rmse: float = 0.0
+    distill_value_correlation: float = 0.0
     entropy: float = 0.0
     entropy_bid_normalized: float = 0.0
     entropy_play_normalized: float = 0.0
+    entropy_target_bid: float = 0.0
+    entropy_target_play: float = 0.0
     entropy_alpha_bid: float = 0.0
     entropy_alpha_play: float = 0.0
     ppo_ratio_clip_fraction: float = 0.0
@@ -158,6 +287,7 @@ class SeqUpdateStats:
     # legal logit by a constant, so the KL guard cannot bound this direction;
     # NeuRD's gradient along it is nonzero. Watch for a monotone trend.
     policy_logit_shift: float = 0.0
+    policy_kl_checked: bool = True
     policy_kl: float = 0.0
     policy_kl_p95: float = 0.0
     policy_kl_p99: float = 0.0
@@ -181,14 +311,36 @@ class SeqUpdateStats:
     unbranched_rows: int = 0
     value_rows: int = 0
     positions: int = 0
+    # Pre-clip global norm over every actor parameter -- the quantity the
+    # single actor clip is applied to. The two below are sub-norms of it,
+    # reported for diagnostics only; neither has its own clip budget.
     core_grad_norm: float = 0.0
+    embedding_grad_norm: float = 0.0
     auxiliary_grad_norm: float = 0.0
     critic_grad_norm: float = 0.0
+    # Separate-budget telemetry, non-zero only when
+    # ppo_auxiliary_grad_fraction > 0. Unlike the three norms above, which
+    # slice the summed gradient by parameter, these split it by *objective*:
+    # each is the norm over every actor parameter of what one half of the
+    # loss alone produced, measured before the rebalance and before the clip.
+    # Their ratio is what the budget controls; auxiliary_grad_scale is the
+    # factor applied to reach it.
+    policy_loss_grad_norm: float = 0.0
+    auxiliary_loss_grad_norm: float = 0.0
+    auxiliary_grad_scale: float = 0.0
     # Oracle-critic telemetry. Acting-seat metrics above are the baseline PPO
     # consumes; these cover every active output head and optimization progress
     # across the repeated critic epochs.
     critic_all_player_rmse: float = 0.0
     critic_all_player_correlation: float = 0.0
+    # The oracle's per-pass value loss, i.e. loss_value divided by the number
+    # of critic epochs, so it is on the same footing as the actor's one pass.
+    oracle_value_loss: float = 0.0
+    # Actor per-seat value probe, measured on exactly the oracle's dense
+    # objective: same targets, same zero-sum centering, same per-game mass.
+    actor_value_loss: float = 0.0
+    actor_all_player_rmse: float = 0.0
+    actor_value_zero_rmse: float = 0.0
     critic_loss_first_epoch: float = 0.0
     critic_loss_last_epoch: float = 0.0
     critic_loss_reduction: float = 0.0
@@ -458,9 +610,22 @@ def build_training_groups(
             by_shape[(tree.num_players, tree.hand_size)].append((tree, leaf))
 
     per_tree = train_config.tree_weighting == "per_tree"
+    dense_reach_by_leaf: dict[int, dict[int, float]] = {}
+    for tree in trees:
+        dense_start = train_config.dense_start_position(
+            model_config,
+            num_players=tree.num_players,
+            hand_size=tree.hand_size,
+        )
+        for leaf in tree.leaves:
+            dense_reach_by_leaf[id(leaf)] = {
+                position: reach
+                for position, reach in leaf.position_reach_weights().items()
+                if position >= dense_start
+            }
     owned_per_tree = {
         id(tree): sum(
-            sum(leaf.position_reach_weights().values()) for leaf in tree.leaves
+            sum(dense_reach_by_leaf[id(leaf)].values()) for leaf in tree.leaves
         )
         for tree in trees
     }
@@ -528,8 +693,20 @@ def build_training_groups(
             (batch, length, model_config.max_players, model_config.bid_count),
             dtype=bool,
         )
+        next_winner_targets = np.full((batch, length), IGNORE_LABEL, np.int64)
         suit_targets = np.full(
             (batch, length, model_config.belief_opponents, 4), IGNORE_LABEL, np.int64
+        )
+        rank_boundary_targets = np.full(
+            (
+                batch,
+                length,
+                model_config.belief_opponents + 1,
+                4,
+                2,
+            ),
+            IGNORE_LABEL,
+            np.int64,
         )
         bid_hit_targets = np.full(
             (batch, model_config.max_players), IGNORE_LABEL, np.int64
@@ -582,17 +759,21 @@ def build_training_groups(
                 tokens=tokens[row],
                 suit_labels=train_config.suit_coef > 0,
                 trick_labels=train_config.trick_coef > 0,
+                rank_boundary_labels=train_config.rank_boundary_coef > 0,
+                next_winner_labels=train_config.next_winner_coef > 0,
             )
             owned[row, leaf.owned_from :] = True
             for position, value in leaf.value_targets().items():
                 value_targets[row, position] = value
-            for position, reach in leaf.position_reach_weights().items():
+            for position, reach in dense_reach_by_leaf[id(leaf)].items():
                 position_weight[row, position] = seq_weight_for(tree) * reach
             if train_config.value_positions == "all":
                 value_weight[row] = position_weight[row]
             trick_targets[row] = arrays.trick_targets
             trick_masks[row] = arrays.trick_masks
+            next_winner_targets[row] = arrays.next_winner_targets
             suit_targets[row] = arrays.suit_targets
+            rank_boundary_targets[row] = arrays.rank_boundary_targets
             bid_hit_targets[row] = arrays.bid_hit_targets
 
             for record in leaf.decisions:
@@ -655,7 +836,9 @@ def build_training_groups(
                 position_weight=position_weight,
                 trick_targets=trick_targets,
                 trick_masks=trick_masks,
+                next_winner_targets=next_winner_targets,
                 suit_targets=suit_targets,
+                rank_boundary_targets=rank_boundary_targets,
                 bid_hit_targets=bid_hit_targets,
                 policy=policy,
             )
@@ -666,6 +849,46 @@ def build_training_groups(
 # --------------------------------------------------------------------- #
 # Trainer                                                                #
 # --------------------------------------------------------------------- #
+
+
+def load_distillation_teacher(
+    checkpoint_path: str | Path,
+    *,
+    device: torch.device,
+    student_config: SeqModelConfig,
+) -> SeqPlumpModel:
+    """Load a frozen teacher, using the checkpoint's own architecture.
+
+    The teacher keeps whatever width, depth and card-embedding mode it was
+    trained with; only the *token schema* has to match the student, because
+    both models read the same rollout tensors. That check is explicit here
+    rather than left to a shape error deep inside the first forward.
+    """
+
+    payload = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    schema = int(payload.get("schema_version", 0))
+    if schema != SEQ_SCHEMA_VERSION:
+        raise ValueError(
+            f"Teacher checkpoint has sequence schema {schema}, "
+            f"expected {SEQ_SCHEMA_VERSION}."
+        )
+    teacher_config = SeqModelConfig(**payload["model_config"])
+    mismatched = [
+        name
+        for name in ("trick_win_token", "turn_token", "max_players", "max_hand_size")
+        if getattr(teacher_config, name) != getattr(student_config, name)
+    ]
+    if mismatched or teacher_config.slot_vocab_sizes != student_config.slot_vocab_sizes:
+        raise ValueError(
+            "Teacher and student must serialize tokens identically; they differ "
+            f"in {mismatched or ['slot_vocab_sizes']}."
+        )
+    teacher = SeqPlumpModel(teacher_config)
+    load_seq_model_state_dict(teacher, payload["model_state_dict"])
+    teacher = teacher.to(device)
+    teacher.eval()
+    teacher.requires_grad_(False)
+    return teacher
 
 
 class SeqTrainer:
@@ -699,8 +922,49 @@ class SeqTrainer:
                 target.append(parameter)
         self._core_parameters = core_parameters
         self._auxiliary_parameters = auxiliary_parameters
-        self.optimizer = torch.optim.Adam(
-            (
+        # The actor is optimized and clipped as one whole. This sub-list is a
+        # reporting slice only: it lets the dashboard show how much of the
+        # actor's pre-clip norm the input embedding tables contribute, without
+        # giving them a separate budget or a separate step size.
+        embedding_parameters = [
+            parameter
+            for actor in self.models
+            for name, parameter in actor.named_parameters()
+            if not name.startswith(_AUXILIARY_HEAD_PREFIXES)
+            and name.startswith(_INPUT_EMBEDDING_PREFIXES)
+        ]
+        self.migrated_model_keys: frozenset[str] = frozenset()
+        self._embedding_parameters = embedding_parameters
+        # Per-parameter gradients for each half of the actor loss, held while
+        # the microbatch loop runs. autograd.grad keeps both halves separate
+        # without materializing and then copying/clearing parameter.grad.
+        self._auxiliary_grads: list[torch.Tensor | None] | None = None
+        self._policy_grads: list[torch.Tensor | None] | None = None
+        self._actor_parameters = [
+            parameter
+            for parameter in (*core_parameters, *auxiliary_parameters)
+            if parameter.requires_grad
+        ]
+        # Coupled PPO auxiliaries share both the trunk and the configured
+        # learning rate with the policy.  Keep them in one Adam group so the
+        # optimizer can process the actor as one parameter collection.  The
+        # split topology remains necessary for detached heads (which are not
+        # KL-sensitive) or when callers explicitly request different rates.
+        self._unified_actor_optimizer = (
+            train_config.policy_objective == "ppo"
+            and not train_config.ppo_actor_auxiliary_detach_hidden
+            and train_config.core_lr == train_config.auxiliary_lr
+        )
+        if self._unified_actor_optimizer:
+            actor_parameter_groups = (
+                {
+                    "params": [*core_parameters, *auxiliary_parameters],
+                    "kl_sensitive": True,
+                    "lr": train_config.core_lr,
+                },
+            )
+        else:
+            actor_parameter_groups = (
                 {
                     "params": core_parameters,
                     # Shared trunk plus action heads: these parameters can
@@ -710,19 +974,40 @@ class SeqTrainer:
                 },
                 {
                     "params": auxiliary_parameters,
-                    # Readout-only heads cannot change bid/card logits.
+                    # Detached/readout-only parameters cannot change action
+                    # logits and can retain their independent step size.
                     "kl_sensitive": False,
                     "lr": train_config.auxiliary_lr,
                 },
-            ),
+            )
+        self.optimizer = torch.optim.Adam(
+            actor_parameter_groups,
             lr=train_config.learning_rate,
             betas=train_config.adam_betas,
+            fused=self.device.type == "mps" and train_config.policy_objective == "ppo",
         )
+        # Distillation freezes a teacher that supplies every target. Who
+        # *acts* is a separate choice: on-policy (the default) has the student
+        # visit its own states so the teacher can correct the drift the
+        # student actually exhibits.
+        self.teacher: SeqPlumpModel | None = None
+        if train_config.policy_objective == "distill":
+            self.teacher = load_distillation_teacher(
+                train_config.distill_teacher_checkpoint,
+                device=self.device,
+                student_config=self.model.config,
+            )
+        teacher_acts = (
+            self.teacher is not None
+            and train_config.distill_rollout_policy == "teacher"
+        )
+        acting_model = self.teacher if teacher_acts else self.model
+        acting_pool = [self.teacher] if teacher_acts else self.models
         self.collector = SeqRolloutCollector(
-            self.model,
+            acting_model,
             train_config,
             device=self.device,
-            trainable_models=self.models,
+            trainable_models=acting_pool,
         )
         self.critic: SeqPPOCritic | SeqPPOOracleCritic | None = None
         self.critic_optimizer: torch.optim.Optimizer | None = None
@@ -749,6 +1034,7 @@ class SeqTrainer:
                 critic_parameters,
                 lr=train_config.ppo_critic_learning_rate,
                 betas=train_config.adam_betas,
+                fused=self.device.type == "mps",
             )
             initial_alpha = max(train_config.ppo_entropy_coef, 1e-8)
             self.log_entropy_alpha = {
@@ -785,8 +1071,51 @@ class SeqTrainer:
     # Collection                                                      #
     # -------------------------------------------------------------- #
 
+    def _clip_actor(self) -> tuple[float, float, float]:
+        """Clip every actor parameter against one global-norm budget.
+
+        Returns ``(actor_norm, embedding_norm, auxiliary_norm)``. Only the
+        first is a clip: the trunk, the action heads, the input embeddings and
+        the auxiliary heads share a single budget and are rescaled by the same
+        factor, so no part of the actor can be throttled independently of the
+        rest. The other two are pre-clip diagnostics, measured before the
+        rescale because ``clip_grad_norm_`` rewrites ``.grad`` in place.
+        """
+
+        embedding = _grad_norm(self._embedding_parameters)
+        auxiliary = _grad_norm(self._auxiliary_parameters)
+        actor = float(
+            torch.nn.utils.clip_grad_norm_(
+                self._actor_parameters, self.train.max_grad_norm
+            )
+        )
+        return actor, embedding, auxiliary
+
+    def split_for_updates(self, trees: list[SeqTree]) -> list[list[SeqTree]]:
+        """Split one wave's trees into the slices each update consumes.
+
+        Round-robin rather than contiguous: trees arrive grouped by schedule
+        cell, so a contiguous split would hand one update all the 3-card deals
+        and another all the 10-card ones. Every slice needs the same shape mix
+        the schedule describes, because ``build_training_groups`` renormalizes
+        weights within whatever it is given.
+        """
+
+        count = max(int(self.train.updates_per_collect), 1)
+        if count == 1:
+            return [trees]
+        slices: list[list[SeqTree]] = [[] for _ in range(count)]
+        for index, tree in enumerate(trees):
+            slices[index % count].append(tree)
+        return [slice_ for slice_ in slices if slice_]
+
     def collect(self) -> tuple[list[SeqTree], SeqRolloutSummary]:
-        for model in self.models:
+        for model in (
+            [self.teacher]
+            if self.teacher is not None
+            and self.train.distill_rollout_policy == "teacher"
+            else self.models
+        ):
             model.eval()
         trees = self.collector.collect(
             self.league,
@@ -827,6 +1156,8 @@ class SeqTrainer:
     # -------------------------------------------------------------- #
 
     def update(self, trees: list[SeqTree]) -> SeqUpdateStats:
+        if self.train.policy_objective == "distill":
+            return self._update_distill(trees)
         if self.train.policy_objective == "ppo":
             return self._update_ppo(trees)
         started = time.perf_counter()
@@ -858,16 +1189,11 @@ class SeqTrainer:
             self.model.train()
             self.optimizer.zero_grad(set_to_none=True)
             self._epoch_backward(groups, stats)
-            stats.core_grad_norm = float(
-                torch.nn.utils.clip_grad_norm_(
-                    self._core_parameters, self.train.max_grad_norm
-                )
-            )
-            stats.auxiliary_grad_norm = float(
-                torch.nn.utils.clip_grad_norm_(
-                    self._auxiliary_parameters, self.train.max_grad_norm
-                )
-            )
+            (
+                stats.core_grad_norm,
+                stats.embedding_grad_norm,
+                stats.auxiliary_grad_norm,
+            ) = self._clip_actor()
             self._apply_warmup_lr()
             nominal_lrs = [float(group["lr"]) for group in self.optimizer.param_groups]
             accepted = False
@@ -966,16 +1292,26 @@ class SeqTrainer:
         if self.critic is None or self.critic_optimizer is None:
             raise RuntimeError("PPO requires an initialized independent critic.")
         self.collector.release_caches()
-        self._release_device_memory()
         batch = build_ppo_training_batch(trees, self.model.config, self.train)
         groups = batch.policy_groups
-        stats = SeqUpdateStats()
+        stats = SeqUpdateStats(policy_kl_checked=self.train.ppo_trust_region)
         stats.build_sec = time.perf_counter() - started
         stats.policy_rows = sum(
             len(rows.weight) for group in groups for rows in group.policy.values()
         )
         stats.unbranched_rows = stats.policy_rows
-        stats.value_rows = stats.policy_rows
+        if (
+            self.train.ppo_critic_mode == "oracle"
+            and self.train.value_positions == "all"
+        ):
+            stats.value_rows = int(
+                sum(
+                    np.count_nonzero(group.position_weight)
+                    for group in batch.critic_groups
+                )
+            )
+        else:
+            stats.value_rows = stats.policy_rows
         stats.positions = int(
             sum(group.tokens.shape[0] * group.tokens.shape[1] for group in groups)
         )
@@ -985,6 +1321,10 @@ class SeqTrainer:
         )
         stats.advantage_mean = advantage_mean
         stats.advantage_std = advantage_std
+        (
+            stats.entropy_target_bid,
+            stats.entropy_target_play,
+        ) = self.train.ppo_entropy_targets(self.iteration)
         if self.train.ppo_advantage_normalize:
             normalize_ppo_advantages(groups)
         stats.peak_update_device_bytes = max(
@@ -993,8 +1333,12 @@ class SeqTrainer:
 
         for actor_epoch in range(self.train.epochs):
             actor_snapshot = (
-                [copy.deepcopy(model.state_dict()) for model in self.models],
-                copy.deepcopy(self.optimizer.state_dict()),
+                (
+                    [copy.deepcopy(model.state_dict()) for model in self.models],
+                    copy.deepcopy(self.optimizer.state_dict()),
+                )
+                if self.train.ppo_trust_region
+                else None
             )
             for model in self.models:
                 model.train()
@@ -1002,7 +1346,14 @@ class SeqTrainer:
             epoch = self._ppo_actor_backward(groups)
             stats.loss_policy += epoch["policy_loss"]
             stats.loss_suit += epoch["suit_loss"]
+            stats.loss_rank_boundary += epoch["rank_boundary_loss"]
             stats.loss_trick += epoch["trick_loss"]
+            stats.loss_bid_hit += epoch["bid_hit_loss"]
+            stats.loss_next_winner += epoch["next_winner_loss"]
+            stats.next_winner_accuracy = epoch["next_winner_accuracy"]
+            stats.actor_value_loss += epoch["actor_value_loss"]
+            stats.actor_all_player_rmse = epoch["actor_value_rmse"]
+            stats.actor_value_zero_rmse = epoch["actor_value_zero_rmse"]
             stats.entropy = epoch["entropy"]
             stats.entropy_bid_normalized = epoch["bid_entropy"]
             stats.entropy_play_normalized = epoch["play_entropy"]
@@ -1020,21 +1371,47 @@ class SeqTrainer:
                     )
                     setattr(
                         stats,
+                        f"suit_loss_10c_{stage}",
+                        epoch[f"suit_loss_10c_{stage}"],
+                    )
+                    setattr(
+                        stats,
                         f"trick_accuracy_10c_{stage}",
                         epoch[f"trick_accuracy_10c_{stage}"],
                     )
+                    setattr(
+                        stats,
+                        f"rank_boundary_balanced_accuracy_10c_{stage}",
+                        epoch[
+                            f"rank_boundary_balanced_accuracy_10c_{stage}"
+                        ],
+                    )
+                    setattr(
+                        stats,
+                        f"rank_boundary_loss_10c_{stage}",
+                        epoch[f"rank_boundary_loss_10c_{stage}"],
+                    )
             stats.policy_logit_shift = epoch["logit_shift"]
-            stats.core_grad_norm = float(
-                torch.nn.utils.clip_grad_norm_(
-                    self._core_parameters, self.train.max_grad_norm
-                )
-            )
-            stats.auxiliary_grad_norm = float(
-                torch.nn.utils.clip_grad_norm_(
-                    self._auxiliary_parameters, self.train.max_grad_norm
-                )
-            )
+            (
+                stats.policy_loss_grad_norm,
+                stats.auxiliary_loss_grad_norm,
+                stats.auxiliary_grad_scale,
+            ) = self._apply_auxiliary_grad_budget()
+            (
+                stats.core_grad_norm,
+                stats.embedding_grad_norm,
+                stats.auxiliary_grad_norm,
+            ) = self._clip_actor()
             self._apply_warmup_lr()
+            if not self.train.ppo_trust_region:
+                # No post-step replay or rollback state is needed. The loss,
+                # auxiliary budget, clipping and LR schedule above are shared
+                # with the guarded path, as is the entropy controller below.
+                self.optimizer.step()
+                self.optimizer_steps += 1
+                self._update_entropy_temperature(epoch)
+                continue
+            assert actor_snapshot is not None
             nominal_lrs = [float(group["lr"]) for group in self.optimizer.param_groups]
             accepted = False
             attempts = self.train.kl_backtrack_attempts + 1
@@ -1152,11 +1529,12 @@ class SeqTrainer:
         critic_groups: list[PPOCriticGroup],
         stats: SeqUpdateStats,
     ) -> tuple[float, float]:
-        """Evaluate each game once and address values by absolute actor seat."""
+        """Evaluate dense oracle values and address PPO baselines by seat."""
 
         assert isinstance(self.critic, SeqPPOOracleCritic)
         self.critic.eval()
         prediction_by_address: dict[tuple[int, int, int, int], float] = {}
+        advantage_by_address: dict[tuple[int, int, int, int], float] = {}
         all_player_predictions: list[np.ndarray] = []
         all_player_targets: list[np.ndarray] = []
         all_player_weights: list[np.ndarray] = []
@@ -1172,31 +1550,69 @@ class SeqTrainer:
                         self.device
                     )
                     with autocast_context(self.device, self.train.precision):
-                        values = self.critic.forward_full(tokens)
-                    seq = torch.tensor(
-                        rows["seq_index"], device=self.device, dtype=torch.long
-                    )
-                    pos = torch.tensor(
-                        rows["position"], device=self.device, dtype=torch.long
-                    )
-                    selected_all = (
-                        values[seq, pos].float().cpu().numpy()
-                    )
+                        dense_values = self.critic.forward_full(tokens)
+                    sequence_player_counts = torch.from_numpy(
+                        group.player_counts[start:stop].astype(
+                            np.int64, copy=False
+                        )
+                    ).to(self.device)
+                    flat_player_counts = sequence_player_counts[:, None].expand(
+                        -1, dense_values.shape[1]
+                    ).reshape(-1)
+                    dense_values = center_zero_sum_values(
+                        dense_values.float().reshape(
+                            -1, self.model.config.max_players
+                        ),
+                        flat_player_counts,
+                    ).view_as(dense_values)
+                    dense_values_cpu = dense_values.cpu().numpy()
+                    dense_advantages = None
+                    if self.train.ppo_advantage_estimator == "gae":
+                        dense_advantages = oracle_gae_advantages(
+                            group.tokens[start:stop],
+                            dense_values_cpu,
+                            group.returns[start:stop],
+                            group.player_counts[start:stop],
+                            self.train.ppo_gae_lambda,
+                        )
+
+                    # PPO consumes only these acting-seat decision addresses,
+                    # but the oracle quality panel reflects the dense objective
+                    # over every genuine state and every active player.
+                    seq_cpu = np.asarray(rows["seq_index"], dtype=np.int64)
+                    pos_cpu = np.asarray(rows["position"], dtype=np.int64)
+                    selected_all = dense_values_cpu[seq_cpu, pos_cpu]
                     acting_seat = np.asarray(rows["acting_seat"], dtype=np.int64)
                     selected = selected_all[
                         np.arange(selected_all.shape[0]), acting_seat
                     ]
-                    target_all = np.stack(rows["returns"])
-                    players = np.asarray(rows["num_players"], dtype=np.int64)
-                    active = (
-                        np.arange(self.model.config.max_players)[None, :]
-                        < players[:, None]
+                    selected_advantages = (
+                        None
+                        if dense_advantages is None
+                        else dense_advantages[seq_cpu, pos_cpu, acting_seat]
                     )
-                    row_weight = np.asarray(rows["weight"], dtype=np.float64)
-                    all_player_predictions.append(selected_all[active])
-                    all_player_targets.append(target_all[active])
+
+                    dense_seq, dense_pos = np.nonzero(
+                        group.position_weight[start:stop] > 0
+                    )
+                    dense_prediction = dense_values_cpu[dense_seq, dense_pos]
+                    dense_target = group.returns[start:stop][dense_seq]
+                    dense_players = group.player_counts[start:stop][
+                        dense_seq
+                    ].astype(np.int64, copy=False)
+                    dense_active = (
+                        np.arange(self.model.config.max_players)[None, :]
+                        < dense_players[:, None]
+                    )
+                    dense_weight = group.position_weight[start:stop][
+                        dense_seq, dense_pos
+                    ].astype(np.float64, copy=False)
+                    all_player_predictions.append(
+                        dense_prediction[dense_active]
+                    )
+                    all_player_targets.append(dense_target[dense_active])
                     all_player_weights.append(
-                        np.repeat(row_weight / players, players)
+                        np.repeat(dense_weight / dense_players, dense_players)
                     )
                     for local, prediction in enumerate(selected):
                         address = (
@@ -1210,6 +1626,10 @@ class SeqTrainer:
                                 "Oracle critic address appeared more than once."
                             )
                         prediction_by_address[address] = float(prediction)
+                        if selected_advantages is not None:
+                            advantage_by_address[address] = float(
+                                selected_advantages[local]
+                            )
 
         if all_player_predictions:
             prediction = np.concatenate(all_player_predictions).astype(
@@ -1242,6 +1662,7 @@ class SeqTrainer:
 
         predictions: list[float] = []
         targets: list[float] = []
+        advantages: list[float] = []
         weights: list[float] = []
         for group in groups:
             for rows in group.policy.values():
@@ -1258,12 +1679,36 @@ class SeqTrainer:
                         raise AssertionError(
                             "Actor row has no oracle value prediction."
                         ) from error
-                    rows.advantages[index] = target - prediction
+                    advantage = (
+                        advantage_by_address[address]
+                        if self.train.ppo_advantage_estimator == "gae"
+                        else float(target) - prediction
+                    )
+                    rows.advantages[index] = advantage
                     predictions.append(prediction)
                     targets.append(float(target))
+                    advantages.append(advantage)
                     weights.append(float(rows.weight[index]))
 
-        return self._ppo_value_statistics(predictions, targets, weights, stats)
+        monte_carlo_statistics = self._ppo_value_statistics(
+            predictions, targets, weights, stats
+        )
+        if self.train.ppo_advantage_estimator == "monte_carlo":
+            return monte_carlo_statistics
+        return self._weighted_mean_std(advantages, weights)
+
+    @staticmethod
+    def _weighted_mean_std(
+        values: list[float], weights: list[float]
+    ) -> tuple[float, float]:
+        value = np.asarray(values, dtype=np.float64)
+        weight = np.asarray(weights, dtype=np.float64)
+        total = float(weight.sum())
+        if total <= 0:
+            return 0.0, 1.0
+        mean = float(np.dot(weight, value) / total)
+        variance = float(np.dot(weight, (value - mean) ** 2) / total)
+        return mean, math.sqrt(max(variance, 1e-12))
 
     @staticmethod
     def _ppo_value_statistics(
@@ -1295,10 +1740,9 @@ class SeqTrainer:
         stats.value_prediction_std = math.sqrt(max(prediction_var, 0.0))
         denominator = math.sqrt(max(prediction_var * target_var, 0.0))
         stats.value_correlation = covariance / denominator if denominator else 0.0
-        advantages = target - prediction
-        mean = float(np.dot(weight, advantages) / total)
-        variance = float(np.dot(weight, (advantages - mean) ** 2) / total)
-        return mean, math.sqrt(max(variance, 1e-12))
+        return SeqTrainer._weighted_mean_std(
+            (target - prediction).tolist(), weight.tolist()
+        )
 
     def _entropy_alpha(self, phase: str) -> float:
         if self.train.ppo_entropy_mode == "off":
@@ -1307,8 +1751,139 @@ class SeqTrainer:
             return self.train.ppo_entropy_coef
         return float(self.log_entropy_alpha[phase].detach().exp().clamp(max=10.0))
 
+    def _auxiliary_budget_active(self) -> bool:
+        return self.train.ppo_auxiliary_grad_fraction > 0
+
+    def _backward_actor_losses(
+        self, auxiliary_loss: torch.Tensor, policy_loss: torch.Tensor
+    ) -> None:
+        """Backward one microbatch, keeping the two objectives separable.
+
+        Without a budget the halves are summed and differentiated once. With
+        one, request each gradient directly and accumulate it in its own
+        buffers. The shared trunk still receives two backwards, but there is
+        no intermediate parameter.grad allocation or first-microbatch clone.
+        """
+
+        if not self._auxiliary_budget_active():
+            total = auxiliary_loss + policy_loss
+            if total.requires_grad:
+                total.backward()
+            return
+        if auxiliary_loss.requires_grad:
+            gradients = torch.autograd.grad(
+                auxiliary_loss,
+                self._actor_parameters,
+                retain_graph=policy_loss.requires_grad,
+                allow_unused=True,
+            )
+            self._auxiliary_grads = self._accumulate_actor_grads(
+                self._auxiliary_grads, gradients
+            )
+        if policy_loss.requires_grad:
+            gradients = torch.autograd.grad(
+                policy_loss, self._actor_parameters, allow_unused=True
+            )
+            self._policy_grads = self._accumulate_actor_grads(
+                self._policy_grads, gradients
+            )
+
+    @staticmethod
+    def _accumulate_actor_grads(
+        stash: list[torch.Tensor | None] | None,
+        gradients: Sequence[torch.Tensor | None],
+    ) -> list[torch.Tensor | None]:
+        """Own newly returned gradients and batch subsequent additions."""
+
+        if stash is None:
+            return [None if g is None else g.detach() for g in gradients]
+        destinations = []
+        additions = []
+        for index, gradient in enumerate(gradients):
+            if gradient is None:
+                continue
+            if stash[index] is None:
+                stash[index] = gradient.detach()
+            else:
+                destinations.append(stash[index])
+                additions.append(gradient)
+        if destinations:
+            torch._foreach_add_(destinations, additions)
+        return stash
+
+    @staticmethod
+    def _stash_norm(stash: list[torch.Tensor | None] | None) -> float:
+        present = (
+            [] if stash is None else [g for g in stash if g is not None]
+        )
+        if not present:
+            return 0.0
+        return float(
+            torch.linalg.vector_norm(
+                torch.stack([torch.linalg.vector_norm(g) for g in present])
+            )
+        )
+
+    def _apply_auxiliary_grad_budget(self) -> tuple[float, float, float]:
+        """Rescale the auxiliary gradient to its share, then fold it back in.
+
+        Returns ``(policy_norm, auxiliary_norm, scale)``, both norms measured
+        over every actor parameter before the rebalance and before the clip.
+
+        The budget is a ratio because Adam is invariant to a uniform rescale
+        of the gradient: only the relative size of the two contributions
+        changes the step. The absolute size stays the business of the single
+        ``max_grad_norm`` clip applied to the sum afterwards.
+        """
+
+        auxiliary_stash = self._auxiliary_grads
+        policy_stash = self._policy_grads
+        self._auxiliary_grads = None
+        self._policy_grads = None
+        if not self._auxiliary_budget_active():
+            return 0.0, 0.0, 0.0
+        policy_norm = self._stash_norm(policy_stash)
+        auxiliary_norm = self._stash_norm(auxiliary_stash)
+        # A zero policy norm would otherwise scale the auxiliary half to
+        # nothing. Nothing is competing with it in that case, so pass it
+        # through and let the global clip bound the step.
+        if auxiliary_norm <= 0:
+            scale = 0.0
+        elif policy_norm <= 0:
+            scale = 1.0
+        else:
+            scale = (
+                self.train.ppo_auxiliary_grad_fraction
+                * policy_norm
+                / auxiliary_norm
+            )
+        for index, parameter in enumerate(self._actor_parameters):
+            policy_gradient = (
+                None if policy_stash is None else policy_stash[index]
+            )
+            auxiliary_gradient = (
+                None if auxiliary_stash is None else auxiliary_stash[index]
+            )
+            if auxiliary_gradient is not None and scale != 1.0:
+                auxiliary_gradient.mul_(scale)
+            if policy_gradient is None:
+                combined = auxiliary_gradient
+            elif auxiliary_gradient is None:
+                combined = policy_gradient
+            else:
+                combined = policy_gradient.add_(auxiliary_gradient)
+            parameter.grad = combined
+        return policy_norm, auxiliary_norm, scale
+
     def _ppo_actor_backward(self, groups: list[PPOTrainingGroup]) -> dict[str, float]:
         totals: dict[str, list[torch.Tensor]] = defaultdict(list)
+        self._auxiliary_grads = None
+        self._policy_grads = None
+        # Temperatures only change after an accepted actor step. Read them
+        # once, avoiding a device-to-host synchronization in every microbatch.
+        entropy_alpha = {
+            phase: self._entropy_alpha(phase) for phase in ("bid", "play")
+        }
         for group in groups:
             model = self._ppo_model(group.policy_id)
             chunks = list(self._microbatches(group))
@@ -1323,89 +1898,414 @@ class SeqTrainer:
                     if self.train.ppo_actor_auxiliary_detach_hidden
                     else hidden
                 )
+                # The two halves are accumulated apart so each can be given
+                # its own gradient-norm budget. With the budget off they are
+                # summed again before the single backward, which is bit-for-bit
+                # the previous behaviour.
                 loss = torch.zeros((), device=self.device, dtype=torch.float32)
+                policy_objective = torch.zeros(
+                    (), device=self.device, dtype=torch.float32
+                )
 
-                position_weight = torch.from_numpy(
-                    group.position_weight[start:stop]
-                ).to(self.device)
-                stage_positions = group.belief_stage_positions[start:stop]
+                active_auxiliary_heads = frozenset(
+                    name
+                    for name, coefficient in (
+                        ("suit", self.train.suit_coef),
+                        ("rank_boundary", self.train.rank_boundary_coef),
+                        ("trick", self.train.trick_coef),
+                        ("next_winner", self.train.next_winner_coef),
+                    )
+                    if coefficient > 0
+                )
+                wants_bid_hit = self.train.bid_hit_coef > 0
+                auxiliary_logits: dict[str, torch.Tensor] = {}
+                bid_hit_logits: torch.Tensor | None = None
+                auxiliary_seq_np = np.empty(0, dtype=np.int64)
+                auxiliary_pos_np = np.empty(0, dtype=np.int64)
+                stage_indices = np.full(
+                    (stop - start, len(PPO_BELIEF_STAGES)), -1, dtype=np.int64
+                )
+                if active_auxiliary_heads or wants_bid_hit:
+                    if self.train.ppo_auxiliary_positions == "all":
+                        # Padding introduced by length bucketing has zero
+                        # position weight. Gather every genuine causal token
+                        # and retain the precomputed per-trajectory average.
+                        auxiliary_seq_np, auxiliary_pos_np = np.nonzero(
+                            group.position_weight[start:stop] > 0
+                        )
+                        auxiliary_weight_np = group.position_weight[start:stop][
+                            auxiliary_seq_np, auxiliary_pos_np
+                        ]
+                    else:
+                        # Decision-only mode remains available as an ablation.
+                        auxiliary_seq_np = np.concatenate(
+                            [
+                                np.asarray(
+                                    rows_by_phase[phase]["seq_index"],
+                                    dtype=np.int64,
+                                )
+                                for phase in ("bid", "play")
+                            ]
+                        )
+                        auxiliary_pos_np = np.concatenate(
+                            [
+                                np.asarray(
+                                    rows_by_phase[phase]["position"],
+                                    dtype=np.int64,
+                                )
+                                for phase in ("bid", "play")
+                            ]
+                        )
+                        decision_count = np.bincount(
+                            auxiliary_seq_np, minlength=stop - start
+                        )
+                        if np.any(decision_count == 0):
+                            raise AssertionError(
+                                "Every PPO actor sequence must contain a decision."
+                            )
+                        sequence_weight = group.position_weight[start:stop].sum(
+                            axis=1
+                        )
+                        auxiliary_weight_np = (
+                            sequence_weight[auxiliary_seq_np]
+                            / decision_count[auxiliary_seq_np]
+                        )
+                    auxiliary_weight = torch.from_numpy(
+                        auxiliary_weight_np.astype(np.float32, copy=False)
+                    ).to(self.device)
+                    auxiliary_seq = torch.from_numpy(auxiliary_seq_np).to(self.device)
+                    auxiliary_pos = torch.from_numpy(auxiliary_pos_np).to(self.device)
+                    with autocast_context(self.device, self.train.precision):
+                        if self.train.ppo_auxiliary_positions == "all":
+                            # Project one contiguous dense matrix, then remove
+                            # the small amount of bucket padding from logits.
+                            # This is faster on MPS than gathering wide hidden
+                            # rows before the matrix multiplication.
+                            dense_hidden = auxiliary_hidden.reshape(
+                                -1, auxiliary_hidden.shape[-1]
+                            )
+                            dense_logits = model.auxiliary_logits(
+                                dense_hidden,
+                                active_auxiliary_heads,
+                            )
+                            flat = auxiliary_seq * hidden.shape[1] + auxiliary_pos
+                            auxiliary_logits = {
+                                name: logits[flat]
+                                for name, logits in dense_logits.items()
+                            }
+                            if wants_bid_hit:
+                                # Gathered, not dense: this head's first layer
+                                # is d_model x d_model, so projecting the
+                                # padded matrix would cost far more than the
+                                # narrow packed readouts above.
+                                bid_hit_logits = model.bid_hit_head(
+                                    dense_hidden[flat]
+                                )
+                        else:
+                            gathered_hidden = auxiliary_hidden[
+                                auxiliary_seq, auxiliary_pos
+                            ]
+                            auxiliary_logits = model.auxiliary_logits(
+                                gathered_hidden,
+                                active_auxiliary_heads,
+                            )
+                            if wants_bid_hit:
+                                bid_hit_logits = model.bid_hit_head(
+                                    gathered_hidden
+                                )
+
+                    lookup = np.full(
+                        (stop - start, hidden.shape[1]), -1, dtype=np.int64
+                    )
+                    lookup[auxiliary_seq_np, auxiliary_pos_np] = np.arange(
+                        auxiliary_seq_np.size, dtype=np.int64
+                    )
+                    raw_stage_positions = group.belief_stage_positions[start:stop]
+                    valid_stage = raw_stage_positions >= 0
+                    stage_rows, stage_columns = np.nonzero(valid_stage)
+                    stage_indices[stage_rows, stage_columns] = lookup[
+                        stage_rows, raw_stage_positions[valid_stage]
+                    ]
+                    if np.any(stage_indices[valid_stage] < 0):
+                        raise AssertionError(
+                            "A PPO belief stage has no auxiliary readout."
+                        )
 
                 if self.train.suit_coef > 0:
-                    with autocast_context(self.device, self.train.precision):
-                        suit_logits = model.suit_presence_head(
-                            auxiliary_hidden
-                        ).view(
-                            auxiliary_hidden.shape[0],
-                            auxiliary_hidden.shape[1],
-                            model.config.belief_opponents,
-                            4,
-                        )
-                    suit_logits = suit_logits.float()
+                    suit_logits = auxiliary_logits["suit"].view(
+                        auxiliary_seq_np.size,
+                        model.config.belief_opponents,
+                        4,
+                    ).float()
                     suit_targets = torch.from_numpy(
-                        group.suit_targets[start:stop]
+                        group.suit_targets[start:stop][
+                            auxiliary_seq_np, auxiliary_pos_np
+                        ]
                     ).to(self.device)
                     suit_labeled = suit_targets != IGNORE_LABEL
                     bce = F.binary_cross_entropy_with_logits(
                         suit_logits,
-                        suit_targets.clamp_min(0).float(),
+                        suit_targets.clamp_min(0).to(suit_logits.dtype),
                         reduction="none",
                     )
                     per_position = (
-                        (bce * suit_labeled.float()).sum(dim=(2, 3))
-                        / suit_labeled.float().sum(dim=(2, 3)).clamp_min(1.0)
-                    )
-                    suit_loss = (per_position * position_weight).sum()
+                        (bce * suit_labeled.to(bce.dtype)).sum(dim=(1, 2))
+                        / suit_labeled.sum(dim=(1, 2)).clamp_min(1).to(bce.dtype)
+                    ).float()
+                    suit_loss = (per_position * auxiliary_weight).sum()
                     loss = loss + self.train.suit_coef * suit_loss
-                    totals["suit_loss"].append(suit_loss.detach())
+                    # Keep reporting storage independent of the packed-head
+                    # backward graph. On MPS, the backward may reuse the
+                    # first split's scalar buffer after a model-state snapshot,
+                    # which previously made the reported suit loss become 0.
+                    totals["suit_loss"].append(suit_loss.detach().clone())
                     self._record_ppo_belief_stage_accuracy(
                         totals,
                         "suit",
                         suit_logits,
                         suit_targets,
                         None,
-                        stage_positions,
+                        stage_indices,
+                    )
+
+                if self.train.rank_boundary_coef > 0:
+                    rank_boundary_logits = auxiliary_logits["rank_boundary"].view(
+                        auxiliary_seq_np.size,
+                        model.config.belief_opponents + 1,
+                        4,
+                        2,
+                    ).float()
+                    rank_boundary_targets = torch.from_numpy(
+                        group.rank_boundary_targets[start:stop][
+                            auxiliary_seq_np, auxiliary_pos_np
+                        ]
+                    ).to(self.device)
+                    labeled = rank_boundary_targets != IGNORE_LABEL
+                    bce = F.binary_cross_entropy_with_logits(
+                        rank_boundary_logits,
+                        rank_boundary_targets.clamp_min(0).to(
+                            rank_boundary_logits.dtype
+                        ),
+                        reduction="none",
+                    )
+                    per_position = (
+                        (bce * labeled.to(bce.dtype)).sum(dim=(1, 2, 3))
+                        / labeled.sum(dim=(1, 2, 3)).clamp_min(1).to(bce.dtype)
+                    ).float()
+                    rank_boundary_loss = (per_position * auxiliary_weight).sum()
+                    loss = (
+                        loss
+                        + self.train.rank_boundary_coef * rank_boundary_loss
+                    )
+                    totals["rank_boundary_loss"].append(
+                        rank_boundary_loss.detach().clone()
+                    )
+                    self._record_ppo_rank_boundary_stage_accuracy(
+                        totals,
+                        rank_boundary_logits,
+                        rank_boundary_targets,
+                        stage_indices,
                     )
 
                 if self.train.trick_coef > 0:
-                    with autocast_context(self.device, self.train.precision):
-                        trick_logits = model.trick_count_head(
-                            auxiliary_hidden
-                        ).view(
-                            auxiliary_hidden.shape[0],
-                            auxiliary_hidden.shape[1],
-                            model.config.max_players,
-                            model.config.bid_count,
-                        )
-                    trick_logits = trick_logits.float()
+                    trick_logits = auxiliary_logits["trick"].view(
+                        auxiliary_seq_np.size,
+                        model.config.max_players,
+                        model.config.bid_count,
+                    ).float()
                     trick_targets = torch.from_numpy(
-                        group.trick_targets[start:stop]
+                        group.trick_targets[start:stop][auxiliary_seq_np]
                     ).to(self.device)
                     trick_masks = torch.from_numpy(
-                        group.trick_masks[start:stop]
+                        group.trick_masks[start:stop][
+                            auxiliary_seq_np, auxiliary_pos_np
+                        ]
                     ).to(self.device)
                     masked_logits = trick_logits.masked_fill(~trick_masks, -1e9)
                     log_probs = torch.log_softmax(masked_logits, dim=-1)
-                    safe_targets = trick_targets.clamp_min(0)[:, None, :, None].expand(
-                        -1, masked_logits.shape[1], -1, 1
-                    )
-                    gathered = log_probs.gather(3, safe_targets).squeeze(-1)
+                    safe_targets = trick_targets.clamp_min(0)[:, :, None]
+                    gathered = log_probs.gather(2, safe_targets).squeeze(-1)
                     labeled = (
-                        (trick_targets != IGNORE_LABEL)[:, None, :]
+                        (trick_targets != IGNORE_LABEL)
                         & trick_masks.any(dim=-1)
                     )
-                    per_position = (-gathered * labeled.float()).sum(dim=2) / (
-                        labeled.float().sum(dim=2).clamp_min(1.0)
+                    per_position = (-gathered * labeled.float()).sum(dim=1) / (
+                        labeled.float().sum(dim=1).clamp_min(1.0)
                     )
-                    trick_loss = (per_position * position_weight).sum()
+                    trick_loss = (per_position * auxiliary_weight).sum()
                     loss = loss + self.train.trick_coef * trick_loss
-                    totals["trick_loss"].append(trick_loss.detach())
+                    totals["trick_loss"].append(trick_loss.detach().clone())
                     self._record_ppo_belief_stage_accuracy(
                         totals,
                         "trick",
                         masked_logits,
                         trick_targets,
                         trick_masks,
-                        stage_positions,
+                        stage_indices,
+                    )
+
+                if bid_hit_logits is not None:
+                    # Did each seat end the round on exactly its bid. One
+                    # independent sigmoid per seat, averaged over the seats
+                    # this row actually has, then weighted like every other
+                    # dense auxiliary.
+                    bid_hit_targets = torch.from_numpy(
+                        group.bid_hit_targets[start:stop][auxiliary_seq_np]
+                    ).to(self.device)
+                    bid_hit_labeled = (bid_hit_targets != IGNORE_LABEL).float()
+                    per_seat = F.binary_cross_entropy_with_logits(
+                        bid_hit_logits.float(),
+                        bid_hit_targets.clamp_min(0).float(),
+                        reduction="none",
+                    )
+                    per_position = (per_seat * bid_hit_labeled).sum(dim=1) / (
+                        bid_hit_labeled.sum(dim=1).clamp_min(1.0)
+                    )
+                    bid_hit_loss = (per_position * auxiliary_weight).sum()
+                    loss = loss + self.train.bid_hit_coef * bid_hit_loss
+                    totals["bid_hit_loss"].append(bid_hit_loss.detach().clone())
+
+                if self.train.next_winner_coef > 0:
+                    # One softmax per position over this row's active seats.
+                    # Length bucketing can merge table sizes into one group, so
+                    # the seat mask has to come from the row's own count rather
+                    # than the group's nominal num_players.
+                    next_winner_logits = auxiliary_logits["next_winner"].float()
+                    next_winner_targets = torch.from_numpy(
+                        group.next_winner_targets[start:stop][
+                            auxiliary_seq_np, auxiliary_pos_np
+                        ]
+                    ).to(self.device)
+                    seat_counts = torch.from_numpy(
+                        group.player_counts[start:stop][
+                            auxiliary_seq_np
+                        ].astype(np.int64, copy=False)
+                    ).to(self.device)
+                    seat_active = (
+                        torch.arange(
+                            model.config.max_players, device=self.device
+                        )[None, :]
+                        < seat_counts[:, None]
+                    )
+                    masked_next_winner = next_winner_logits.masked_fill(
+                        ~seat_active, -1e9
+                    )
+                    log_probs = torch.log_softmax(masked_next_winner, dim=-1)
+                    labeled = next_winner_targets != IGNORE_LABEL
+                    gathered = log_probs.gather(
+                        1, next_winner_targets.clamp_min(0)[:, None]
+                    ).squeeze(-1)
+                    # Positions outside the play phase carry IGNORE_LABEL and
+                    # drop out here, so the head is trained on exactly the
+                    # window where "the next trick" refers to something.
+                    per_position = -gathered * labeled.float()
+                    next_winner_loss = (per_position * auxiliary_weight).sum()
+                    loss = (
+                        loss + self.train.next_winner_coef * next_winner_loss
+                    )
+                    totals["next_winner_loss"].append(
+                        next_winner_loss.detach().clone()
+                    )
+                    totals["next_winner_correct"].append(
+                        (
+                            (masked_next_winner.argmax(dim=-1)
+                             == next_winner_targets)
+                            & labeled
+                        )
+                        .sum()
+                        .detach()
+                    )
+                    totals["next_winner_total"].append(labeled.sum().detach())
+
+                if self.train.ppo_actor_value_coef > 0:
+                    # Always dense over every genuine causal token, regardless
+                    # of ppo_auxiliary_positions: the oracle's value objective
+                    # is dense, and matching it exactly is what makes the two
+                    # losses comparable. When the belief heads are already
+                    # dense these are the same addresses, so reuse them.
+                    if (
+                        active_auxiliary_heads
+                        and self.train.ppo_auxiliary_positions == "all"
+                    ):
+                        value_seq_np = auxiliary_seq_np
+                        value_pos_np = auxiliary_pos_np
+                        assert auxiliary_weight is not None
+                        value_weight = auxiliary_weight
+                    else:
+                        value_seq_np, value_pos_np = np.nonzero(
+                            group.position_weight[start:stop] > 0
+                        )
+                        value_weight = torch.from_numpy(
+                            group.position_weight[start:stop][
+                                value_seq_np, value_pos_np
+                            ]
+                        ).to(self.device)
+                    value_seq = torch.from_numpy(value_seq_np).to(self.device)
+                    value_pos = torch.from_numpy(value_pos_np).to(self.device)
+                    with autocast_context(self.device, self.train.precision):
+                        # One contiguous projection then gather, exactly like
+                        # the packed belief heads: faster on MPS than gathering
+                        # wide hidden rows before the matrix multiplication.
+                        dense_values = model.player_value_head(
+                            auxiliary_hidden.reshape(
+                                -1, auxiliary_hidden.shape[-1]
+                            )
+                        )
+                    predictions = dense_values[
+                        value_seq * hidden.shape[1] + value_pos
+                    ].float()
+                    value_players = torch.from_numpy(
+                        group.player_counts[start:stop][value_seq_np].astype(
+                            np.int64, copy=False
+                        )
+                    ).to(self.device)
+                    value_targets = torch.from_numpy(
+                        group.value_targets[start:stop][value_seq_np]
+                    ).to(self.device)
+                    value_active = (
+                        torch.arange(
+                            model.config.max_players, device=self.device
+                        )[None, :]
+                        < value_players[:, None]
+                    ).float()
+                    predictions = center_zero_sum_values(
+                        predictions, value_players
+                    )
+                    raw_error = predictions - value_targets
+                    error = raw_error / self.train.value_reward_scale
+                    # Identical to the oracle's normalization: each game keeps
+                    # unit objective mass, spread over its causal positions and
+                    # averaged across the seats its table actually has.
+                    actor_value_loss = (
+                        0.5
+                        * value_weight
+                        * (error.square() * value_active).sum(dim=-1)
+                        / value_players.float()
+                    ).sum()
+                    loss = loss + (
+                        self.train.ppo_actor_value_coef * actor_value_loss
+                    )
+                    totals["actor_value_loss"].append(
+                        actor_value_loss.detach().clone()
+                    )
+                    # Reward-unit RMSE accumulators, weighted per active seat
+                    # exactly as critic_all_player_rmse is, so the two curves
+                    # are the same measurement on the same rows.
+                    per_seat_weight = value_weight / value_players.float()
+                    totals["actor_value_squared_error"].append(
+                        (
+                            per_seat_weight
+                            * (raw_error.square() * value_active).sum(dim=-1)
+                        ).sum().detach()
+                    )
+                    totals["actor_value_target_squared"].append(
+                        (
+                            per_seat_weight
+                            * (value_targets.square() * value_active).sum(dim=-1)
+                        ).sum().detach()
+                    )
+                    totals["actor_value_weight"].append(
+                        value_weight.sum().detach()
                     )
 
                 for phase, rows in rows_by_phase.items():
@@ -1440,14 +2340,16 @@ class SeqTrainer:
                         clip_ratio=self.train.ppo_clip_ratio,
                     )
                     policy_loss = (weight * terms.losses).sum()
-                    loss = loss + self.train.policy_coef * policy_loss
+                    policy_objective = (
+                        policy_objective + self.train.policy_coef * policy_loss
+                    )
                     eligible_weight = weight * terms.entropy_eligible.float()
                     entropy_term = (
                         eligible_weight * terms.normalized_entropy
                     ).sum()
-                    alpha = self._entropy_alpha(phase)
+                    alpha = entropy_alpha[phase]
                     if alpha:
-                        loss = loss - alpha * entropy_term
+                        policy_objective = policy_objective - alpha * entropy_term
                     totals["policy_loss"].append(policy_loss.detach())
                     totals["entropy_raw"].append((weight * terms.entropy).sum().detach())
                     totals["row_weight"].append(weight.sum().detach())
@@ -1469,18 +2371,44 @@ class SeqTrainer:
                     totals["logit_shift"].append(
                         (weight * logit_shift).sum().detach()
                     )
-                if loss.requires_grad:
-                    loss.backward()
+                self._backward_actor_losses(loss, policy_objective)
 
         reduced = {
             key: math.fsum(float(value) for value in values)
             for key, values in totals.items()
         }
         row_weight = max(reduced.get("row_weight", 0.0), 1e-12)
+        value_weight_total = reduced.get("actor_value_weight", 0.0)
         result = {
             "policy_loss": reduced.get("policy_loss", 0.0),
             "suit_loss": reduced.get("suit_loss", 0.0),
+            "rank_boundary_loss": reduced.get("rank_boundary_loss", 0.0),
             "trick_loss": reduced.get("trick_loss", 0.0),
+            "bid_hit_loss": reduced.get("bid_hit_loss", 0.0),
+            "next_winner_loss": reduced.get("next_winner_loss", 0.0),
+            "next_winner_accuracy": (
+                reduced.get("next_winner_correct", 0.0)
+                / reduced["next_winner_total"]
+                if reduced.get("next_winner_total", 0.0) > 0
+                else 0.0
+            ),
+            "actor_value_loss": reduced.get("actor_value_loss", 0.0),
+            "actor_value_rmse": (
+                math.sqrt(
+                    max(reduced.get("actor_value_squared_error", 0.0), 0.0)
+                    / value_weight_total
+                )
+                if value_weight_total > 0
+                else 0.0
+            ),
+            "actor_value_zero_rmse": (
+                math.sqrt(
+                    max(reduced.get("actor_value_target_squared", 0.0), 0.0)
+                    / value_weight_total
+                )
+                if value_weight_total > 0
+                else 0.0
+            ),
             "entropy": reduced.get("entropy_raw", 0.0) / row_weight,
             "clip_fraction": reduced.get("clip", 0.0) / row_weight,
             "behavior_kl": reduced.get("behavior_kl", 0.0) / row_weight,
@@ -1501,7 +2429,84 @@ class SeqTrainer:
                     if total > 0
                     else 0.0
                 )
+        for stage in PPO_BELIEF_STAGES:
+            suit_total = reduced.get(f"suit_stage_{stage}_total", 0.0)
+            result[f"suit_loss_10c_{stage}"] = (
+                reduced.get(f"suit_stage_{stage}_loss", 0.0) / suit_total
+                if suit_total > 0
+                else 0.0
+            )
+        for stage in PPO_BELIEF_STAGES:
+            positive = reduced.get(
+                f"rank_boundary_stage_{stage}_positive", 0.0
+            )
+            negative = reduced.get(
+                f"rank_boundary_stage_{stage}_negative", 0.0
+            )
+            recalls = []
+            if positive > 0:
+                recalls.append(
+                    reduced.get(f"rank_boundary_stage_{stage}_tp", 0.0)
+                    / positive
+                )
+            if negative > 0:
+                recalls.append(
+                    reduced.get(f"rank_boundary_stage_{stage}_tn", 0.0)
+                    / negative
+                )
+            result[f"rank_boundary_balanced_accuracy_10c_{stage}"] = (
+                math.fsum(recalls) / len(recalls) if recalls else 0.0
+            )
+            rank_total = positive + negative
+            result[f"rank_boundary_loss_10c_{stage}"] = (
+                reduced.get(f"rank_boundary_stage_{stage}_loss", 0.0)
+                / rank_total
+                if rank_total > 0
+                else 0.0
+            )
         return result
+
+    @staticmethod
+    def _record_ppo_rank_boundary_stage_accuracy(
+        totals: dict[str, list[torch.Tensor]],
+        logits: torch.Tensor,
+        targets: torch.Tensor,
+        stage_indices: np.ndarray,
+    ) -> None:
+        """Accumulate class-balanced bit accuracy at fixed ten-card stages."""
+
+        device = logits.device
+        for stage_index, cards_played in enumerate(PPO_BELIEF_STAGES):
+            selected_np = stage_indices[:, stage_index]
+            selected_np = selected_np[selected_np >= 0]
+            if selected_np.size == 0:
+                continue
+            selected = torch.from_numpy(selected_np).to(
+                device=device, dtype=torch.long
+            )
+            selected_targets = targets[selected]
+            selected_logits = logits[selected]
+            selected_predictions = selected_logits >= 0
+            labeled = selected_targets != IGNORE_LABEL
+            positive = labeled & (selected_targets == 1)
+            negative = labeled & (selected_targets == 0)
+            prefix = f"rank_boundary_stage_{cards_played}"
+            totals[f"{prefix}_tp"].append(
+                (selected_predictions & positive).sum().detach()
+            )
+            totals[f"{prefix}_positive"].append(positive.sum().detach())
+            totals[f"{prefix}_tn"].append(
+                ((~selected_predictions) & negative).sum().detach()
+            )
+            totals[f"{prefix}_negative"].append(negative.sum().detach())
+            bce = F.binary_cross_entropy_with_logits(
+                selected_logits,
+                selected_targets.clamp_min(0).float(),
+                reduction="none",
+            )
+            totals[f"{prefix}_loss"].append(
+                (bce * labeled.float()).sum().detach()
+            )
 
     @staticmethod
     def _record_ppo_belief_stage_accuracy(
@@ -1510,31 +2515,38 @@ class SeqTrainer:
         logits: torch.Tensor,
         targets: torch.Tensor,
         feasibility: torch.Tensor | None,
-        stage_positions: np.ndarray,
+        stage_indices: np.ndarray,
     ) -> None:
         """Accumulate micro-accuracy before 1st/5th/9th ten-card plays."""
 
         device = logits.device
         for stage_index, cards_played in enumerate(PPO_BELIEF_STAGES):
-            positions_np = stage_positions[:, stage_index]
-            rows_np = np.flatnonzero(positions_np >= 0)
-            if rows_np.size == 0:
+            selected_np = stage_indices[:, stage_index]
+            selected_np = selected_np[selected_np >= 0]
+            if selected_np.size == 0:
                 continue
-            rows = torch.from_numpy(rows_np).to(device=device, dtype=torch.long)
-            positions = torch.from_numpy(positions_np[rows_np]).to(
+            selected = torch.from_numpy(selected_np).to(
                 device=device, dtype=torch.long
             )
-            selected_logits = logits[rows, positions]
+            selected_logits = logits[selected]
             if head == "suit":
-                selected_targets = targets[rows, positions]
+                selected_targets = targets[selected]
                 labeled = selected_targets != IGNORE_LABEL
                 predictions = selected_logits >= 0
+                bce = F.binary_cross_entropy_with_logits(
+                    selected_logits,
+                    selected_targets.clamp_min(0).float(),
+                    reduction="none",
+                )
+                totals[f"{head}_stage_{cards_played}_loss"].append(
+                    (bce * labeled.float()).sum().detach()
+                )
             else:
-                selected_targets = targets[rows]
+                selected_targets = targets[selected]
                 assert feasibility is not None
                 labeled = (
                     (selected_targets != IGNORE_LABEL)
-                    & feasibility[rows, positions].any(dim=-1)
+                    & feasibility[selected].any(dim=-1)
                 )
                 predictions = selected_logits.argmax(dim=-1)
             totals[f"{head}_stage_{cards_played}_correct"].append(
@@ -1549,10 +2561,8 @@ class SeqTrainer:
             return
         self.entropy_optimizer.zero_grad(set_to_none=True)
         loss = torch.zeros((), device=self.device)
-        targets = {
-            "bid": self.train.ppo_bid_entropy_target,
-            "play": self.train.ppo_play_entropy_target,
-        }
+        bid_target, play_target = self.train.ppo_entropy_targets(self.iteration)
+        targets = {"bid": bid_target, "play": play_target}
         for phase, target in targets.items():
             observed = torch.tensor(epoch[f"{phase}_entropy"], device=self.device)
             loss = loss + self.log_entropy_alpha[phase] * (observed - target)
@@ -1591,24 +2601,13 @@ class SeqTrainer:
                         old_probs = torch.from_numpy(
                             np.stack(rows["old_probs_full"])
                         ).to(self.device)
-                        actions = torch.tensor(
-                            rows["action"], device=self.device, dtype=torch.long
-                        )
-                        advantages = torch.tensor(
-                            rows["advantages"], device=self.device
-                        )
                         with autocast_context(self.device, self.train.precision):
                             logits = model.policy_logits(
                                 hidden[seq, pos], phase
                             )
-                        terms = ppo_clipped_terms(
-                            logits,
-                            old_probs,
-                            actions,
-                            advantages,
-                            clip_ratio=self.train.ppo_clip_ratio,
+                        divergences.append(
+                            ppo_policy_kl(logits, old_probs).cpu().numpy()
                         )
-                        divergences.append(terms.divergences.cpu().numpy())
                         weights.append(np.asarray(rows["weight"], dtype=np.float32))
         if not divergences:
             return 0.0, 0.0, 0.0, 0.0
@@ -1686,15 +2685,21 @@ class SeqTrainer:
         groups: list[PPOCriticGroup],
         stats: SeqUpdateStats,
     ) -> None:
-        """Fit every active player's return from each learned decision state."""
+        """Fit every active player's return at configured oracle states."""
 
         assert isinstance(self.critic, SeqPPOOracleCritic)
         assert self.critic_optimizer is not None
         value_terms: list[torch.Tensor] = []
         trick_terms: list[torch.Tensor] = []
+        card_order_terms: list[torch.Tensor] = []
+        next_winner_terms: list[torch.Tensor] = []
         epoch_losses: list[float] = []
         oracle_trick_correct: list[torch.Tensor] = []
         oracle_trick_total: list[torch.Tensor] = []
+        oracle_card_order_correct: list[torch.Tensor] = []
+        oracle_card_order_total: list[torch.Tensor] = []
+        oracle_next_winner_correct: list[torch.Tensor] = []
+        oracle_next_winner_total: list[torch.Tensor] = []
         for critic_epoch in range(self.train.ppo_critic_epochs):
             self.critic.train()
             self.critic_optimizer.zero_grad(set_to_none=True)
@@ -1709,30 +2714,136 @@ class SeqTrainer:
                     tokens = torch.from_numpy(group.tokens[start:stop]).to(
                         self.device
                     )
-                    with autocast_context(self.device, self.train.precision):
-                        if self.train.trick_coef > 0:
-                            values, trick_logits = (
-                                self.critic.forward_value_and_trick(tokens)
-                            )
-                        else:
-                            values = self.critic.forward_full(tokens)
                     seq = torch.tensor(
                         rows["seq_index"], device=self.device, dtype=torch.long
                     )
                     pos = torch.tensor(
                         rows["position"], device=self.device, dtype=torch.long
                     )
-                    targets = torch.from_numpy(np.stack(rows["returns"])).to(
-                        self.device
+                    seq_np = np.asarray(rows["seq_index"], dtype=np.int64)
+                    pos_np = np.asarray(rows["position"], dtype=np.int64)
+                    auxiliary_active = (
+                        self.train.trick_coef > 0
+                        or self.train.oracle_card_order_coef > 0
+                        or self.train.next_winner_coef > 0
                     )
-                    weight = torch.tensor(
-                        rows["weight"], device=self.device, dtype=torch.float32
-                    )
-                    players = torch.tensor(
-                        rows["num_players"],
-                        device=self.device,
-                        dtype=torch.long,
-                    )
+                    auxiliary_seq_np = np.empty(0, dtype=np.int64)
+                    auxiliary_pos_np = np.empty(0, dtype=np.int64)
+                    auxiliary_weight = None
+                    auxiliary_seq = None
+                    auxiliary_pos = None
+                    if auxiliary_active:
+                        if (
+                            auxiliary_active
+                            and self.train.ppo_auxiliary_positions == "all"
+                        ):
+                            auxiliary_seq_np, auxiliary_pos_np = np.nonzero(
+                                group.position_weight[start:stop] > 0
+                            )
+                            auxiliary_weight_np = group.position_weight[start:stop][
+                                auxiliary_seq_np, auxiliary_pos_np
+                            ]
+                        else:
+                            auxiliary_seq_np = seq_np
+                            auxiliary_pos_np = pos_np
+                            decision_count = np.bincount(
+                                seq_np, minlength=stop - start
+                            )
+                            if np.any(decision_count == 0):
+                                raise AssertionError(
+                                    "Every oracle sequence must contain a decision."
+                                )
+                            sequence_weight = group.position_weight[
+                                start:stop
+                            ].sum(axis=1)
+                            auxiliary_weight_np = (
+                                sequence_weight[seq_np]
+                                / decision_count[seq_np]
+                            )
+                        auxiliary_weight = torch.from_numpy(
+                            auxiliary_weight_np.astype(np.float32, copy=False)
+                        ).to(self.device)
+                        auxiliary_seq = torch.from_numpy(auxiliary_seq_np).to(
+                            self.device
+                        )
+                        auxiliary_pos = torch.from_numpy(auxiliary_pos_np).to(
+                            self.device
+                        )
+
+                    dense_value = self.train.value_positions == "all"
+                    value_seq = None
+                    value_pos = None
+                    if dense_value:
+                        if (
+                            auxiliary_active
+                            and self.train.ppo_auxiliary_positions == "all"
+                        ):
+                            value_seq_np = auxiliary_seq_np
+                            value_pos_np = auxiliary_pos_np
+                        else:
+                            value_seq_np, value_pos_np = np.nonzero(
+                                group.position_weight[start:stop] > 0
+                            )
+                        value_seq = torch.from_numpy(value_seq_np).to(
+                            self.device
+                        )
+                        value_pos = torch.from_numpy(value_pos_np).to(
+                            self.device
+                        )
+                    with autocast_context(self.device, self.train.precision):
+                        (
+                            predictions,
+                            trick_logits,
+                            card_order_logits,
+                            next_winner_logits,
+                        ) = self.critic.forward_selected(
+                            tokens,
+                            seq,
+                            pos,
+                            value_seq=value_seq,
+                            value_pos=value_pos,
+                            dense_value_projection=dense_value,
+                            auxiliary_seq=auxiliary_seq,
+                            auxiliary_pos=auxiliary_pos,
+                            dense_auxiliary_projection=(
+                                self.train.ppo_auxiliary_positions == "all"
+                            ),
+                            with_trick=self.train.trick_coef > 0,
+                            with_card_order=(
+                                self.train.oracle_card_order_coef > 0
+                            ),
+                            with_next_winner=(
+                                self.train.next_winner_coef > 0
+                            ),
+                        )
+                    if dense_value:
+                        targets = torch.from_numpy(
+                            group.returns[start:stop][value_seq_np]
+                        ).to(self.device)
+                        weight = torch.from_numpy(
+                            group.position_weight[start:stop][
+                                value_seq_np, value_pos_np
+                            ].astype(np.float32, copy=False)
+                        ).to(self.device)
+                        players = torch.from_numpy(
+                            group.player_counts[start:stop][value_seq_np].astype(
+                                np.int64, copy=False
+                            )
+                        ).to(self.device)
+                    else:
+                        targets = torch.from_numpy(
+                            np.stack(rows["returns"])
+                        ).to(self.device)
+                        weight = torch.tensor(
+                            rows["weight"],
+                            device=self.device,
+                            dtype=torch.float32,
+                        )
+                        players = torch.tensor(
+                            rows["num_players"],
+                            device=self.device,
+                            dtype=torch.long,
+                        )
                     active = (
                         torch.arange(
                             self.model.config.max_players,
@@ -1740,13 +2851,15 @@ class SeqTrainer:
                         )[None, :]
                         < players[:, None]
                     )
-                    predictions = values[seq, pos].float()
+                    predictions = center_zero_sum_values(
+                        predictions.float(), players
+                    )
                     error = (
                         predictions - targets.float()
                     ) / self.train.value_reward_scale
-                    # Each state retains its actor-objective weight. Averaging
-                    # the output-seat axis supplies all-player supervision
-                    # without multiplying larger-player games' critic weight.
+                    # Each game retains unit objective mass: dense mode divides
+                    # it across causal positions, while the output-seat mean
+                    # supplies every active player without favoring wide tables.
                     value_loss = (
                         0.5
                         * weight
@@ -1756,43 +2869,148 @@ class SeqTrainer:
                     loss = value_loss
                     value_terms.append(value_loss.detach())
 
+                    auxiliary_active_players = None
+                    if auxiliary_active:
+                        auxiliary_player_counts = torch.from_numpy(
+                            (
+                                group.trick_targets[start:stop][auxiliary_seq_np]
+                                != IGNORE_LABEL
+                            ).sum(axis=1)
+                        ).to(self.device)
+                        auxiliary_active_players = (
+                            torch.arange(
+                                self.model.config.max_players,
+                                device=self.device,
+                            )[None, :]
+                            < auxiliary_player_counts[:, None]
+                        )
+
                     if self.train.trick_coef > 0:
+                        assert trick_logits is not None
+                        assert auxiliary_weight is not None
                         trick_targets = torch.from_numpy(
-                            group.trick_targets[start:stop]
+                            group.trick_targets[start:stop][auxiliary_seq_np]
                         ).to(self.device)
                         trick_masks = torch.from_numpy(
-                            group.trick_masks[start:stop]
-                        ).to(self.device)
-                        position_weight = torch.from_numpy(
-                            group.position_weight[start:stop]
+                            group.trick_masks[start:stop][
+                                auxiliary_seq_np, auxiliary_pos_np
+                            ]
                         ).to(self.device)
                         masked_logits = trick_logits.float().masked_fill(
                             ~trick_masks, -1e9
                         )
                         log_probs = torch.log_softmax(masked_logits, dim=-1)
-                        safe_targets = trick_targets.clamp_min(0)[
-                            :, None, :, None
-                        ].expand(-1, masked_logits.shape[1], -1, 1)
-                        gathered = log_probs.gather(3, safe_targets).squeeze(-1)
+                        safe_targets = trick_targets.clamp_min(0)[:, :, None]
+                        gathered = log_probs.gather(2, safe_targets).squeeze(-1)
                         labeled = (
-                            (trick_targets != IGNORE_LABEL)[:, None, :]
+                            (trick_targets != IGNORE_LABEL)
                             & trick_masks.any(dim=-1)
                         )
                         per_position = (
-                            (-gathered * labeled.float()).sum(dim=2)
-                            / labeled.float().sum(dim=2).clamp_min(1.0)
+                            (-gathered * labeled.float()).sum(dim=1)
+                            / labeled.float().sum(dim=1).clamp_min(1.0)
                         )
-                        trick_loss = (per_position * position_weight).sum()
+                        trick_loss = (per_position * auxiliary_weight).sum()
                         loss = loss + self.train.trick_coef * trick_loss
                         trick_terms.append(trick_loss.detach())
                         if critic_epoch == 0:
-                            predictions = masked_logits.argmax(dim=-1)
+                            trick_predictions = masked_logits.argmax(dim=-1)
                             oracle_trick_correct.append(
-                                ((predictions == trick_targets[:, None, :]) & labeled)
+                                ((trick_predictions == trick_targets) & labeled)
                                 .sum()
                                 .detach()
                             )
                             oracle_trick_total.append(labeled.sum().detach())
+
+                    if self.train.next_winner_coef > 0:
+                        assert next_winner_logits is not None
+                        assert auxiliary_weight is not None
+                        next_winner_targets = torch.from_numpy(
+                            group.next_winner_targets[start:stop][
+                                auxiliary_seq_np, auxiliary_pos_np
+                            ]
+                        ).to(self.device)
+                        seat_counts = torch.from_numpy(
+                            group.player_counts[start:stop][
+                                auxiliary_seq_np
+                            ].astype(np.int64, copy=False)
+                        ).to(self.device)
+                        seat_active = (
+                            torch.arange(
+                                self.model.config.max_players,
+                                device=self.device,
+                            )[None, :]
+                            < seat_counts[:, None]
+                        )
+                        masked_next_winner = next_winner_logits.float().masked_fill(
+                            ~seat_active, -1e9
+                        )
+                        log_probs = torch.log_softmax(masked_next_winner, dim=-1)
+                        labeled = next_winner_targets != IGNORE_LABEL
+                        gathered = log_probs.gather(
+                            1, next_winner_targets.clamp_min(0)[:, None]
+                        ).squeeze(-1)
+                        per_position = -gathered * labeled.float()
+                        next_winner_loss = (
+                            per_position * auxiliary_weight
+                        ).sum()
+                        loss = (
+                            loss
+                            + self.train.next_winner_coef * next_winner_loss
+                        )
+                        next_winner_terms.append(next_winner_loss.detach())
+                        if critic_epoch == 0:
+                            oracle_next_winner_correct.append(
+                                (
+                                    (
+                                        masked_next_winner.argmax(dim=-1)
+                                        == next_winner_targets
+                                    )
+                                    & labeled
+                                )
+                                .sum()
+                                .detach()
+                            )
+                            oracle_next_winner_total.append(
+                                labeled.sum().detach()
+                            )
+
+                    if self.train.oracle_card_order_coef > 0:
+                        assert card_order_logits is not None
+                        assert auxiliary_weight is not None
+                        assert auxiliary_active_players is not None
+                        card_order_targets = torch.from_numpy(
+                            group.card_play_order[start:stop][auxiliary_seq_np]
+                        ).to(self.device)
+                        played_counts = torch.from_numpy(
+                            group.cards_played[start:stop][
+                                auxiliary_seq_np, auxiliary_pos_np
+                            ]
+                        ).to(self.device)
+                        per_state, order_correct, order_labeled = (
+                            plackett_luce_card_order_terms(
+                                card_order_logits,
+                                card_order_targets,
+                                played_counts,
+                                auxiliary_active_players,
+                            )
+                        )
+                        card_order_loss = (
+                            per_state * auxiliary_weight
+                        ).sum()
+                        loss = (
+                            loss
+                            + self.train.oracle_card_order_coef
+                            * card_order_loss
+                        )
+                        card_order_terms.append(card_order_loss.detach())
+                        if critic_epoch == 0:
+                            oracle_card_order_correct.append(
+                                order_correct.sum().detach()
+                            )
+                            oracle_card_order_total.append(
+                                order_labeled.sum().detach()
+                            )
                     loss.backward()
                     pending.append(loss.detach())
             stats.critic_grad_norm = float(
@@ -1809,14 +3027,45 @@ class SeqTrainer:
             epoch_loss = math.fsum(float(value) for value in pending)
             epoch_losses.append(epoch_loss)
         stats.loss_value = math.fsum(float(value) for value in value_terms)
+        stats.oracle_value_loss = stats.loss_value / max(
+            1, self.train.ppo_critic_epochs
+        )
         stats.loss_oracle_trick = math.fsum(
             float(value) for value in trick_terms
+        )
+        stats.loss_oracle_card_order = math.fsum(
+            float(value) for value in card_order_terms
+        )
+        stats.loss_oracle_next_winner = math.fsum(
+            float(value) for value in next_winner_terms
         )
         correct = math.fsum(float(value) for value in oracle_trick_correct)
         labeled = math.fsum(float(value) for value in oracle_trick_total)
         stats.oracle_trick_accuracy = (
             correct / labeled
             if labeled > 0
+            else 0.0
+        )
+        order_correct = math.fsum(
+            float(value) for value in oracle_card_order_correct
+        )
+        order_labeled = math.fsum(
+            float(value) for value in oracle_card_order_total
+        )
+        stats.oracle_card_order_top1_accuracy = (
+            order_correct / order_labeled
+            if order_labeled > 0
+            else 0.0
+        )
+        winner_correct = math.fsum(
+            float(value) for value in oracle_next_winner_correct
+        )
+        winner_labeled = math.fsum(
+            float(value) for value in oracle_next_winner_total
+        )
+        stats.oracle_next_winner_accuracy = (
+            winner_correct / winner_labeled
+            if winner_labeled > 0
             else 0.0
         )
         self._record_critic_loss_dynamics(stats, epoch_losses)
@@ -1922,7 +3171,9 @@ class SeqTrainer:
                 covariance / denominator if denominator > 0 else 0.0
             )
         stats.loss_suit = totals["suit"]
+        stats.loss_rank_boundary = totals["rank_boundary"]
         stats.loss_trick = totals["trick"]
+        stats.loss_next_winner = totals["next_winner"]
         stats.loss_bid_hit = totals["bid_hit"]
         stats.entropy = totals["entropy"]
         policy_row_weight = totals["policy_row_weight"]
@@ -1943,8 +3194,10 @@ class SeqTrainer:
             name
             for name, coef in (
                 ("suit", train.suit_coef),
+                ("rank_boundary", train.rank_boundary_coef),
                 ("trick", train.trick_coef),
                 ("bid_hit", train.bid_hit_coef),
+                ("next_winner", train.next_winner_coef),
             )
             if coef > 0
         )
@@ -2034,6 +3287,35 @@ class SeqTrainer:
             loss = loss + train.suit_coef * suit_loss
             term_parts["suit"].append(suit_loss.detach())
 
+        # Rank-boundary beliefs: opponent rows plus one any-opponent row,
+        # normalized over only the meaningful bits at each position. Absent
+        # observer suits and inactive seats remain IGNORE_LABEL.
+        rank_boundary_labeled = None
+        if train.rank_boundary_coef > 0:
+            rank_boundary_targets = torch.from_numpy(
+                group.rank_boundary_targets[start:stop]
+            ).to(device)
+            rank_boundary_labeled = (
+                (rank_boundary_targets != IGNORE_LABEL)
+                & owned[:, :, None, None, None]
+            )
+        if rank_boundary_labeled is not None and rank_boundary_labeled.any():
+            bce = F.binary_cross_entropy_with_logits(
+                output.rank_boundary_logits,
+                rank_boundary_targets.clamp_min(0).float(),
+                reduction="none",
+            )
+            labeled_count = rank_boundary_labeled.float().sum(
+                dim=(2, 3, 4)
+            )
+            per_position = (
+                (bce * rank_boundary_labeled.float()).sum(dim=(2, 3, 4))
+                / labeled_count.clamp_min(1.0)
+            )
+            rank_boundary_loss = (per_position * position_weight).sum()
+            loss = loss + train.rank_boundary_coef * rank_boundary_loss
+            term_parts["rank_boundary"].append(rank_boundary_loss.detach())
+
         # Trick counts (feasibility-masked CE, per relative player).
         player_labeled = None
         if train.trick_coef > 0:
@@ -2082,6 +3364,39 @@ class SeqTrainer:
             bid_hit_loss = (per_position * position_weight).sum()
             loss = loss + train.bid_hit_coef * bid_hit_loss
             term_parts["bid_hit"].append(bid_hit_loss.detach())
+
+        # Next trick winner (softmax over active seats, per position). The
+        # label is IGNORE_LABEL outside the play phase, so unlike the targets
+        # above this one supervises a strict sub-window of the owned tokens.
+        if train.next_winner_coef > 0:
+            next_winner_targets = torch.from_numpy(
+                group.next_winner_targets[start:stop]
+            ).to(device)
+            labeled = (next_winner_targets != IGNORE_LABEL) & owned
+            if labeled.any():
+                seat_active = (
+                    torch.arange(
+                        self.model.config.max_players, device=device
+                    )[None, None, :]
+                    < torch.full(
+                        (stop - start, 1, 1),
+                        group.num_players,
+                        device=device,
+                        dtype=torch.long,
+                    )
+                )
+                logits = output.next_winner_logits.masked_fill(
+                    ~seat_active, -1e9
+                )
+                log_probs = torch.log_softmax(logits, dim=-1)
+                gathered = log_probs.gather(
+                    2, next_winner_targets.clamp_min(0)[:, :, None]
+                ).squeeze(-1)
+                next_winner_loss = (
+                    -gathered * labeled.float() * position_weight
+                ).sum()
+                loss = loss + train.next_winner_coef * next_winner_loss
+                term_parts["next_winner"].append(next_winner_loss.detach())
 
         # Policy: NeuRD over every focal decision, branched or not.
         for phase_key, rows in policy_rows.items():
@@ -2369,6 +3684,403 @@ class SeqTrainer:
     # Checkpoints & league                                            #
     # -------------------------------------------------------------- #
 
+    # ---------------------------- distillation --------------------------- #
+
+    def _update_distill(self, trees: list[SeqTree]) -> SeqUpdateStats:
+        """One supervised pass against the frozen teacher.
+
+        No advantages, no critic, no trust region and no duals. Those
+        controllers all exist to keep a policy-gradient step from moving too
+        far relative to the behaviour policy that produced the data; a KL to a
+        fixed target has no such failure mode, so the update is a plain
+        accumulate-and-step.
+        """
+
+        started = time.perf_counter()
+        self.collector.release_caches()
+        self._release_device_memory()
+        groups = build_training_groups(trees, self.model.config, self.train)
+        stats = SeqUpdateStats()
+        stats.build_sec = time.perf_counter() - started
+        stats.policy_rows = sum(
+            len(rows.weight) for g in groups for rows in g.policy.values()
+        )
+        stats.unbranched_rows = stats.policy_rows
+        stats.value_rows = int(
+            sum(np.count_nonzero(group.value_weight) for group in groups)
+        )
+        stats.positions = int(sum(g.owned.sum() for g in groups))
+
+        totals: dict[str, float] = defaultdict(float)
+        for _ in range(max(1, self.train.epochs)):
+            self.model.train()
+            self.optimizer.zero_grad(set_to_none=True)
+            totals = defaultdict(float)
+            for group in groups:
+                chunks = list(self._microbatches(group))
+                for (start, stop), rows in zip(chunks, _rows_by_chunk(group, chunks)):
+                    loss, terms = self._distill_chunk_loss(group, start, stop, rows)
+                    loss.backward()
+                    for key, value in terms.items():
+                        totals[key] += value
+            # A single NaN step is unrecoverable: it writes NaN into the
+            # weights, and every subsequent forward, gradient and metric is
+            # NaN forever after. The run then looks alive while learning
+            # nothing. Checking before the step costs one reduction per
+            # parameter and makes that failure mode survivable -- the step is
+            # dropped and the model stays at its last good weights.
+            finite = all(
+                torch.isfinite(parameter.grad).all()
+                for parameter in self._actor_parameters
+                if parameter.grad is not None
+            )
+            if not finite:
+                stats.distill_skipped_steps += 1.0
+                self.optimizer.zero_grad(set_to_none=True)
+                continue
+            (
+                stats.core_grad_norm,
+                stats.embedding_grad_norm,
+                stats.auxiliary_grad_norm,
+            ) = self._clip_actor()
+            self._apply_warmup_lr()
+            self.optimizer.step()
+            # The effective card matrix is rebuilt from rank/suit rows; a step
+            # invalidates the evaluation-time cache of those 52 directions.
+            self.model.clear_card_output_cache()
+            self.optimizer_steps += 1
+        self._record_distill_stats(stats, totals)
+        stats.update_sec = time.perf_counter() - started
+        return stats
+
+    def _distill_chunk_loss(self, group, start, stop, policy_rows):
+        device = self.device
+        train = self.train
+        temperature = float(train.distill_temperature)
+        aux_names: frozenset[str] = (
+            frozenset(("suit", "rank_boundary", "trick", "bid_hit", "next_winner"))
+            if train.distill_aux_coef > 0
+            else frozenset()
+        )
+        tokens = torch.from_numpy(group.tokens[start:stop]).to(device)
+        with autocast_context(self.device, train.precision):
+            with torch.no_grad():
+                teacher = self.teacher.forward_full(tokens, aux_heads=aux_names)
+            student = self.model.forward_full(tokens, aux_heads=aux_names)
+
+        owned = torch.from_numpy(group.owned[start:stop]).to(device)
+        position_weight = (
+            torch.from_numpy(group.position_weight[start:stop]).to(device)
+            * owned.float()
+        )
+        terms: dict[str, float] = defaultdict(float)
+        loss = tokens.new_zeros((), dtype=torch.float32)
+
+        # ---- policy: forward KL against the teacher's forward pass ---------
+        #
+        # Under on-policy collection the student is what acted, so the
+        # recorded ``old_probs_full`` is the *student's* distribution and is
+        # useless as a target. It is still the authority on which actions were
+        # legal -- legality is a property of the state, not of the policy that
+        # visited it -- so it survives here purely as the mask that both sides
+        # are restricted and renormalized onto.
+        if train.distill_policy_coef > 0:
+            for phase_key, rows in policy_rows.items():
+                if not rows["weight"]:
+                    continue
+                student_logits_all = (
+                    student.bid_logits if phase_key == "bid" else student.card_logits
+                )
+                teacher_logits_all = (
+                    teacher.bid_logits if phase_key == "bid" else teacher.card_logits
+                )
+                seq_idx = torch.from_numpy(
+                    np.asarray(rows["seq_index"], dtype=np.int64)
+                ).to(device)
+                pos_idx = torch.from_numpy(
+                    np.asarray(rows["position"], dtype=np.int64)
+                ).to(device)
+                logits = student_logits_all[seq_idx, pos_idx].float()
+                teacher_logits = teacher_logits_all[seq_idx, pos_idx].float()
+                behaviour = torch.from_numpy(
+                    np.stack(rows["old_probs_full"]).astype(np.float32)
+                ).to(device)
+                legal = behaviour > 0
+                target = torch.softmax(
+                    teacher_logits.masked_fill(~legal, -float("inf")) / temperature,
+                    dim=-1,
+                )
+                student_log_probs = torch.log_softmax(
+                    logits.masked_fill(~legal, -float("inf")) / temperature, dim=-1
+                )
+                safe_log_student = torch.where(
+                    legal, student_log_probs, torch.zeros_like(student_log_probs)
+                )
+                log_target = torch.where(
+                    legal, target.clamp_min(1e-12).log(), torch.zeros_like(target)
+                )
+                # KL(teacher || student), summed over legal actions per row.
+                row_kl = (target * (log_target - safe_log_student)).sum(dim=-1)
+                # Weight by the group builder's own per-row weights, which sum
+                # to exactly 1 across every group and phase in the update.
+                #
+                # A per-chunk ``.mean()`` here is wrong and was the source of
+                # the ~200 gradient norms: every microbatch calls backward
+                # separately, so per-chunk means *add* rather than average, and
+                # the policy term ended up scaled by the number of chunks --
+                # roughly 40x, drifting with however many shapes and
+                # microbatches a given update happened to produce. Value and
+                # auxiliary terms were already normalized this way, so policy
+                # also silently dominated them by that same factor.
+                row_weight = torch.from_numpy(
+                    np.asarray(rows["weight"], dtype=np.float32)
+                ).to(device)
+                phase_loss = (row_kl * row_weight).sum() * (temperature**2)
+                loss = loss + train.distill_policy_coef * phase_loss
+
+                with torch.no_grad():
+                    rows_n = float(row_kl.numel())
+                    teacher_best = target.argmax(dim=-1)
+                    student_best = student_log_probs.argmax(dim=-1)
+                    student_probs = safe_log_student.exp() * legal
+                    teacher_entropy = -(
+                        target * log_target
+                    ).sum(dim=-1)
+                    student_entropy = -(student_probs * safe_log_student).sum(dim=-1)
+                    terms[f"kl_{phase_key}"] += float(row_kl.sum())
+                    terms[f"n_{phase_key}"] += rows_n
+                    terms[f"agree_{phase_key}"] += float(
+                        (teacher_best == student_best).sum()
+                    )
+                    terms[f"top1_{phase_key}"] += float(
+                        student_probs.gather(1, teacher_best[:, None]).sum()
+                    )
+                    terms[f"tent_{phase_key}"] += float(teacher_entropy.sum())
+                    terms[f"sent_{phase_key}"] += float(student_entropy.sum())
+                terms["loss_policy"] += float(phase_loss.detach())
+
+        # ---- value: match the teacher's prediction, not the return ---------
+        #
+        # Regressing on the teacher's value rather than the Monte Carlo return
+        # is the point of distillation: the teacher's estimate is the return's
+        # conditional mean with the sampling noise already integrated out.
+        if train.distill_value_coef > 0 and float(position_weight.sum()) > 0:
+            weight = position_weight
+            total_weight = weight.sum().clamp_min(1.0)
+            error = student.value.float() - teacher.value.float()
+            value_loss = (error.square() * weight).sum() / total_weight
+            loss = loss + train.distill_value_coef * value_loss
+            with torch.no_grad():
+                terms["loss_value"] += float(value_loss.detach())
+                terms["value_sq"] += float((error.square() * weight).sum())
+                terms["value_w"] += float(weight.sum())
+                sp, tp = student.value.float(), teacher.value.float()
+                terms["v_s"] += float((sp * weight).sum())
+                terms["v_t"] += float((tp * weight).sum())
+                terms["v_ss"] += float((sp * sp * weight).sum())
+                terms["v_tt"] += float((tp * tp * weight).sum())
+                terms["v_st"] += float((sp * tp * weight).sum())
+
+        # ---- auxiliary heads: soft targets, not ground truth ---------------
+        #
+        # Every head is distilled against the teacher's *distribution* so the
+        # student inherits its calibration, including where it is unsure.
+        # Binary heads use the teacher's sigmoid as a soft BCE label; the two
+        # categorical heads use its softmax as a soft cross-entropy label.
+        if aux_names and float(position_weight.sum()) > 0:
+            aux_loss = tokens.new_zeros((), dtype=torch.float32)
+            total_weight = position_weight.sum().clamp_min(1.0)
+
+            def reduce(per_position: torch.Tensor) -> torch.Tensor:
+                return (per_position * position_weight).sum() / total_weight
+
+            def collapse(values: torch.Tensor, extra_mask=None) -> torch.Tensor:
+                """Average trailing head axes down to [B, L]."""
+
+                while values.dim() > position_weight.dim():
+                    if extra_mask is not None:
+                        values = (values * extra_mask).sum(dim=-1) / extra_mask.sum(
+                            dim=-1
+                        ).clamp_min(1.0)
+                        extra_mask = None
+                    else:
+                        values = values.mean(dim=-1)
+                return values
+
+            def soft_bce(student_logits, teacher_logits, extra_mask=None):
+                """Soft-label BCE, plus the KL it implies.
+
+                The cross-entropy the optimizer needs carries the teacher's own
+                entropy as an additive floor, so it cannot reach zero and two
+                heads' values are not comparable. Subtracting that entropy
+                leaves KL(teacher || student), which is zero exactly when the
+                student matches -- the form the dashboard plots.
+                """
+
+                target = torch.sigmoid(teacher_logits.float())
+                bce = F.binary_cross_entropy_with_logits(
+                    student_logits.float(), target, reduction="none"
+                )
+                entropy = F.binary_cross_entropy_with_logits(
+                    teacher_logits.float(), target, reduction="none"
+                )
+                loss = reduce(collapse(bce, extra_mask))
+                kl = reduce(collapse(bce - entropy, extra_mask))
+                return loss, kl
+
+            def soft_ce(student_logits, teacher_logits, mask=None):
+                s = student_logits.float()
+                t = teacher_logits.float()
+                if mask is not None:
+                    s = s.masked_fill(~mask, -1e9)
+                    t = t.masked_fill(~mask, -1e9)
+                target = torch.softmax(t / temperature, dim=-1)
+                log_target = torch.log_softmax(t / temperature, dim=-1)
+                per = -(target * torch.log_softmax(s / temperature, dim=-1)).sum(dim=-1)
+                entropy = -(target * log_target).sum(dim=-1)
+                scale = temperature**2
+                loss = reduce(collapse(per)) * scale
+                kl = reduce(collapse(per - entropy)) * scale
+                return loss, kl
+
+            heads: list[tuple[str, torch.Tensor, torch.Tensor]] = []
+            if student.suit_logits is not None:
+                heads.append(("suit", *soft_bce(student.suit_logits, teacher.suit_logits)))
+            if student.rank_boundary_logits is not None:
+                heads.append(
+                    (
+                        "rank_boundary",
+                        *soft_bce(
+                            student.rank_boundary_logits,
+                            teacher.rank_boundary_logits,
+                        ),
+                    )
+                )
+            if student.bid_hit_logits is not None:
+                heads.append(
+                    ("bid_hit", *soft_bce(student.bid_hit_logits, teacher.bid_hit_logits))
+                )
+            if student.trick_logits is not None:
+                trick_masks = torch.from_numpy(group.trick_masks[start:stop]).to(device)
+                while trick_masks.dim() < student.trick_logits.dim():
+                    trick_masks = trick_masks.unsqueeze(1)
+                heads.append(
+                    (
+                        "trick",
+                        *soft_ce(
+                            student.trick_logits,
+                            teacher.trick_logits,
+                            trick_masks.expand_as(student.trick_logits),
+                        ),
+                    )
+                )
+            if student.next_winner_logits is not None:
+                seat_active = torch.arange(
+                    self.model.config.max_players, device=device
+                )[None, None, :] < torch.full(
+                    (stop - start, 1, 1),
+                    group.num_players,
+                    device=device,
+                    dtype=torch.long,
+                )
+                heads.append(
+                    (
+                        "next_winner",
+                        *soft_ce(
+                            student.next_winner_logits,
+                            teacher.next_winner_logits,
+                            seat_active.expand_as(student.next_winner_logits),
+                        ),
+                    )
+                )
+            for name, head_loss, head_kl in heads:
+                aux_loss = aux_loss + head_loss
+                terms[f"auxkl_{name}"] += float(head_kl.detach())
+                terms["auxkl_n"] += 1.0
+            loss = loss + train.distill_aux_coef * aux_loss
+            terms["loss_aux"] += float(aux_loss.detach())
+
+        return loss, terms
+
+    def _record_distill_stats(self, stats: SeqUpdateStats, totals) -> None:
+        """Turn weighted sums into the per-decision means the dashboard reads."""
+
+        def mean(numerator: str, denominator: str) -> float:
+            count = totals.get(denominator, 0.0)
+            return float(totals.get(numerator, 0.0) / count) if count else 0.0
+
+        n_bid = totals.get("n_bid", 0.0)
+        n_play = totals.get("n_play", 0.0)
+        stats.distill_kl_bid = mean("kl_bid", "n_bid")
+        stats.distill_kl_play = mean("kl_play", "n_play")
+        stats.distill_agree_bid = mean("agree_bid", "n_bid")
+        stats.distill_agree_play = mean("agree_play", "n_play")
+        stats.distill_top1_mass_bid = mean("top1_bid", "n_bid")
+        stats.distill_top1_mass_play = mean("top1_play", "n_play")
+        stats.distill_teacher_entropy_bid = mean("tent_bid", "n_bid")
+        stats.distill_teacher_entropy_play = mean("tent_play", "n_play")
+        stats.distill_student_entropy_bid = mean("sent_bid", "n_bid")
+        stats.distill_student_entropy_play = mean("sent_play", "n_play")
+        total_rows = n_bid + n_play
+        if total_rows:
+            stats.distill_kl = (
+                totals.get("kl_bid", 0.0) + totals.get("kl_play", 0.0)
+            ) / total_rows
+            stats.distill_agree = (
+                totals.get("agree_bid", 0.0) + totals.get("agree_play", 0.0)
+            ) / total_rows
+        # No division by chunk count here, deliberately. ``position_weight``
+        # is normalized to sum to 1 across the whole update, so a single
+        # chunk's weights sum to far less than 1 and the clamp_min(1.0) in
+        # reduce() leaves each chunk contributing a weighted *sum*. Those sums
+        # add up to the weighted mean over the update exactly once -- dividing
+        # again by the number of chunks would under-report by that factor,
+        # which is what made every head look near-zero at initialization.
+        for head in (
+            "suit",
+            "rank_boundary",
+            "trick",
+            "bid_hit",
+            "next_winner",
+        ):
+            setattr(
+                stats,
+                f"distill_aux_kl_{head}",
+                float(totals.get(f"auxkl_{head}", 0.0)),
+            )
+        stats.distill_aux_entropy_floor = max(
+            float(totals.get("loss_aux", 0.0))
+            - sum(
+                float(totals.get(f"auxkl_{head}", 0.0))
+                for head in ("suit", "rank_boundary", "trick", "bid_hit", "next_winner")
+            ),
+            0.0,
+        )
+        stats.distill_loss_policy = float(totals.get("loss_policy", 0.0))
+        stats.distill_loss_value = float(totals.get("loss_value", 0.0))
+        stats.distill_loss_aux = float(totals.get("loss_aux", 0.0))
+        # Reuse the shared loss columns so existing tooling still resolves.
+        stats.loss_policy = stats.distill_loss_policy
+        stats.loss_value = stats.distill_loss_value
+        weight = totals.get("value_w", 0.0)
+        if weight:
+            stats.distill_value_rmse = float(
+                math.sqrt(max(totals.get("value_sq", 0.0) / weight, 0.0))
+            )
+            stats.value_rmse = stats.distill_value_rmse
+            mean_s = totals.get("v_s", 0.0) / weight
+            mean_t = totals.get("v_t", 0.0) / weight
+            var_s = max(totals.get("v_ss", 0.0) / weight - mean_s * mean_s, 0.0)
+            var_t = max(totals.get("v_tt", 0.0) / weight - mean_t * mean_t, 0.0)
+            covariance = totals.get("v_st", 0.0) / weight - mean_s * mean_t
+            if var_s > 0 and var_t > 0:
+                stats.distill_value_correlation = float(
+                    covariance / math.sqrt(var_s * var_t)
+                )
+            stats.value_prediction_std = float(math.sqrt(var_s))
+        stats.entropy_bid_normalized = stats.distill_student_entropy_bid
+        stats.entropy_play_normalized = stats.distill_student_entropy_play
+
     def save_checkpoint(self, path: str | Path) -> None:
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -2484,12 +4196,39 @@ class SeqTrainer:
             )
         if payload.get("rules_fingerprint") != rules_fingerprint():
             raise ValueError("Checkpoint rules fingerprint mismatch.")
-        if payload.get("model_config") != asdict(self.model.config):
+        checkpoint_model_config = payload.get("model_config")
+        current_model_config = asdict(self.model.config)
+        additive_config_fields = {
+            "per_layer_embedding_dim",
+            "value_embedding_mode",
+            "embedding_rms_norm",
+        }
+        comparable_current = {
+            key: value
+            for key, value in current_model_config.items()
+            if key not in additive_config_fields
+        }
+        comparable_checkpoint = {
+            key: value
+            for key, value in checkpoint_model_config.items()
+            if key not in additive_config_fields
+        } if isinstance(checkpoint_model_config, dict) else None
+        additive_mismatch = isinstance(checkpoint_model_config, dict) and any(
+            field in checkpoint_model_config
+            and checkpoint_model_config[field] != current_model_config[field]
+            for field in additive_config_fields
+        )
+        if comparable_checkpoint != comparable_current or additive_mismatch:
             raise ValueError("Checkpoint model configuration mismatch.")
-        if not allow_training_config_mismatch and payload.get(
-            "training_config"
-        ) != asdict(self.train):
-            raise ValueError("Checkpoint training configuration mismatch.")
+        if not allow_training_config_mismatch:
+            checkpoint_training = payload.get("training_config")
+            current_training = asdict(self.train)
+            if isinstance(checkpoint_training, dict):
+                for field in _ADDITIVE_TRAINING_FIELDS:
+                    if field not in checkpoint_training:
+                        current_training.pop(field, None)
+            if checkpoint_training != current_training:
+                raise ValueError("Checkpoint training configuration mismatch.")
         checkpoint_config = payload.get("resolved_config")
         if (
             not allow_training_config_mismatch
@@ -2507,12 +4246,17 @@ class SeqTrainer:
             isinstance(actor_states, list) and len(actor_states) == len(self.models)
         )
         if exact_actor_pool:
+            missing_model_keys: set[str] = set()
             for model, state in zip(self.models, actor_states):
-                load_seq_model_state_dict(model, state)
-            self.optimizer.load_state_dict(payload["optimizer_state_dict"])
+                missing_model_keys.update(load_seq_model_state_dict(model, state))
+            optimizer_state = self._migrate_optimizer_state(
+                payload["optimizer_state_dict"],
+                missing_model_keys=frozenset(missing_model_keys),
+            )
+            self.optimizer.load_state_dict(optimizer_state)
         else:
             primary_state = payload["model_state_dict"]
-            structured_output_migrated = load_seq_model_state_dict(
+            missing_model_keys = load_seq_model_state_dict(
                 self.model, primary_state
             )
             for model in self.models[1:]:
@@ -2525,9 +4269,14 @@ class SeqTrainer:
             if len(self.models) == 1 and source_actor_count == 1:
                 optimizer_state = self._migrate_optimizer_state(
                     payload["optimizer_state_dict"],
-                    structured_output_migrated=structured_output_migrated,
+                    missing_model_keys=missing_model_keys,
                 )
                 self.optimizer.load_state_dict(optimizer_state)
+
+        # Keys the load had to synthesize because the checkpoint predates them.
+        # Callers use this to tell an additive no-op apart from a key like the
+        # embedding norm gain, which is meaningless until it is calibrated.
+        self.migrated_model_keys = frozenset(missing_model_keys)
 
         if self.critic is not None and self.critic_optimizer is not None:
             source_training = payload.get("training_config", {})
@@ -2538,11 +4287,108 @@ class SeqTrainer:
             )
             compatible_critic = source_critic_mode == self.train.ppo_critic_mode
             if "critic_state_dict" in payload and compatible_critic:
-                self.critic.load_state_dict(payload["critic_state_dict"])
+                critic_result = self.critic.load_state_dict(
+                    payload["critic_state_dict"], strict=False
+                )
+                rank_boundary_critic_keys = {
+                    f"backbone.{key}" for key in RANK_BOUNDARY_HEAD_KEYS
+                }
+                additive_critic_keys = {
+                    f"backbone.{key}" for key in ADDITIVE_CONDITIONING_KEYS
+                } & set(self.critic.state_dict())
+                additive_critic_families = (
+                    {
+                        "backbone.bid_pressure_embedding.weight",
+                    } & additive_critic_keys,
+                    {
+                        key for key in additive_critic_keys
+                        if key.startswith("backbone.per_layer_")
+                        and key.removeprefix("backbone.")
+                        not in NA_PATTERN_EMBEDDING_KEYS
+                    },
+                    {
+                        key for key in additive_critic_keys
+                        if key.startswith("backbone.value_")
+                        and key.removeprefix("backbone.")
+                        not in NA_PATTERN_EMBEDDING_KEYS
+                    },
+                    {"backbone.na_pattern_embedding.weight"}
+                    & additive_critic_keys,
+                    {"backbone.per_layer_na_pattern_embedding.weight"}
+                    & additive_critic_keys,
+                    {"backbone.value_na_pattern_embedding.weight"}
+                    & additive_critic_keys,
+                )
+                embedding_norm_critic_keys = {
+                    f"backbone.{key}" for key in EMBEDDING_NORM_KEYS
+                } & set(self.critic.state_dict())
+                # The critic's backbone carries a frozen copy of the actor's
+                # per-seat head. It is never trained here -- the critic reads
+                # values from its own player_value_head -- so a checkpoint
+                # written before the actor had one is simply missing it.
+                player_value_critic_keys = {
+                    f"backbone.{key}" for key in PLAYER_VALUE_HEAD_KEYS
+                } & set(self.critic.state_dict())
+                next_winner_critic_keys = {
+                    f"backbone.{key}" for key in NEXT_WINNER_HEAD_KEYS
+                } & set(self.critic.state_dict())
+                allowed_critic_missing = (
+                    rank_boundary_critic_keys
+                    | set(ORACLE_CARD_ORDER_HEAD_KEYS)
+                    | additive_critic_keys
+                    | embedding_norm_critic_keys
+                    | player_value_critic_keys
+                    | next_winner_critic_keys
+                )
+                critic_missing = set(critic_result.missing_keys)
+                complete_missing_families = all(
+                    not (critic_missing & family)
+                    or (critic_missing & family) == family
+                    for family in (
+                        rank_boundary_critic_keys,
+                        set(ORACLE_CARD_ORDER_HEAD_KEYS),
+                        player_value_critic_keys,
+                        next_winner_critic_keys,
+                        *additive_critic_families,
+                    )
+                )
+                if (
+                    not critic_missing <= allowed_critic_missing
+                    or not complete_missing_families
+                    or critic_result.unexpected_keys
+                ):
+                    raise RuntimeError(
+                        "Critic checkpoint state mismatch: "
+                        f"missing={sorted(critic_missing)}, "
+                        f"unexpected={sorted(critic_result.unexpected_keys)}"
+                    )
+                if critic_missing & {
+                    f"backbone.{key}" for key in NA_PATTERN_EMBEDDING_KEYS
+                }:
+                    self.critic.backbone.initialize_na_pattern_embeddings()
+                if critic_missing & embedding_norm_critic_keys:
+                    # Gain 1.0 is a placeholder; the critic backbone is
+                    # calibrated alongside the actors before training starts.
+                    with torch.no_grad():
+                        self.critic.backbone.embedding_norm.weight.fill_(1.0)
+                    missing_model_keys = set(missing_model_keys) | set(
+                        EMBEDDING_NORM_KEYS
+                    )
+                    self.migrated_model_keys = frozenset(missing_model_keys)
                 if "critic_optimizer_state_dict" in payload:
                     try:
+                        critic_optimizer_state = payload[
+                            "critic_optimizer_state_dict"
+                        ]
+                        if critic_missing:
+                            critic_optimizer_state = self._migrate_named_optimizer_parameters(
+                                critic_optimizer_state,
+                                self.critic_optimizer,
+                                self.critic,
+                                missing_keys=critic_missing,
+                            )
                         self.critic_optimizer.load_state_dict(
-                            payload["critic_optimizer_state_dict"]
+                            critic_optimizer_state
                         )
                     except ValueError:
                         # Checkpoints written before the oracle trick-count
@@ -2558,18 +4404,20 @@ class SeqTrainer:
                     self.critic.initialize_from_actor(self.model)
                 else:
                     self.critic.backbone.load_state_dict(self.model.state_dict())
-            # The adaptive temperatures are dual/controller state for one
-            # particular entropy constraint, not learned policy state. Reusing
-            # their accumulated pressure after changing a target makes the old
-            # constraint dominate the new run for hundreds of updates. Keep
-            # them only when the complete controller specification matches;
-            # otherwise retain the freshly initialized coefficient/optimizer.
+            # The adaptive temperatures are dual/controller state, not learned
+            # policy state, so they carry over whenever the controller
+            # mechanics match. The target level is what the controller drives
+            # toward rather than part of its state: a converged multiplier is
+            # a strictly better warm start for a new level than the cold
+            # ppo_entropy_coef, and the controller closes the remaining gap at
+            # its own learning rate. Resetting on any target change turned the
+            # entropy constraint off for thousands of iterations after a nudge
+            # of a few hundredths, which is the opposite of what retargeting
+            # is asking for.
             entropy_fields = (
                 "ppo_entropy_mode",
                 "ppo_entropy_coef",
                 "ppo_entropy_learning_rate",
-                "ppo_bid_entropy_target",
-                "ppo_play_entropy_target",
             )
             compatible_entropy = isinstance(source_training, dict) and all(
                 source_training.get(field) == getattr(self.train, field)
@@ -2640,20 +4488,128 @@ class SeqTrainer:
         self.collector._policy_cursor = int(
             collector_state.get("policy_cursor", 0)
         )
+        self._configure_ppo_optimizer_execution()
+
+    def _configure_ppo_optimizer_execution(self) -> None:
+        """Select the runtime Adam kernel without resetting saved moments.
+
+        Old checkpoints store unfused groups and CPU step counters. MPS fused
+        Adam needs device counters; CPU preparation/evaluation must still be
+        able to load its checkpoints with ordinary Adam. Kernel selection is
+        therefore a runtime detail, independent of the checkpoint's device.
+        """
+
+        if self.train.policy_objective != "ppo":
+            return
+        fused = self.device.type == "mps"
+        counter_device = self.device if fused else torch.device("cpu")
+        for optimizer in (self.optimizer, self.critic_optimizer):
+            if optimizer is None:
+                continue
+            for group in optimizer.param_groups:
+                group["fused"] = fused
+                group["foreach"] = False if fused else None
+            for state in optimizer.state.values():
+                if "step" in state:
+                    state["step"] = state["step"].to(counter_device)
+
+    @staticmethod
+    def _migrate_named_optimizer_parameters(
+        state: dict,
+        optimizer: torch.optim.Optimizer,
+        module: nn.Module,
+        *,
+        missing_keys: set[str],
+    ) -> dict:
+        """Map one-group optimizer state across inserted named parameters."""
+
+        migrated = copy.deepcopy(state)
+        source_groups = migrated.get("param_groups", [])
+        target_groups = optimizer.state_dict().get("param_groups", [])
+        if len(source_groups) != 1 or len(target_groups) != 1:
+            raise ValueError("Named optimizer migration requires one group.")
+        current_names = [
+            name for name, parameter in module.named_parameters()
+            if parameter.requires_grad
+        ]
+        source_names = [name for name in current_names if name not in missing_keys]
+        source_ids = list(source_groups[0]["params"])
+        target_ids = list(target_groups[0]["params"])
+        if len(source_ids) != len(source_names) or len(target_ids) != len(current_names):
+            raise ValueError("Checkpoint optimizer names do not match its parameters.")
+        target_by_name = dict(zip(current_names, target_ids))
+        identifier_map = {
+            source_id: target_by_name[name]
+            for source_id, name in zip(source_ids, source_names)
+        }
+        if set(migrated.get("state", {})) - set(identifier_map):
+            raise ValueError("Checkpoint optimizer contains unknown parameters.")
+        migrated["state"] = {
+            identifier_map[source]: value
+            for source, value in migrated.get("state", {}).items()
+        }
+        group = copy.deepcopy(source_groups[0])
+        group["params"] = target_ids
+        migrated["param_groups"] = [group]
+        return migrated
+
+    @staticmethod
+    def _migrate_appended_optimizer_parameters(
+        state: dict,
+        optimizer: torch.optim.Optimizer,
+        *,
+        added_parameters: int,
+    ) -> dict:
+        """Preserve Adam state when trainable parameters are appended.
+
+        Oracle card-order weight/bias are deliberately registered after all
+        existing trainable critic parameters, so the old topology is an exact
+        prefix. Existing moments retain their parameter identity; the new
+        suffix starts with ordinary empty Adam state.
+        """
+
+        migrated = copy.deepcopy(state)
+        source_groups = migrated.get("param_groups", [])
+        target_groups = optimizer.state_dict().get("param_groups", [])
+        if len(source_groups) != 1 or len(target_groups) != 1:
+            raise ValueError(
+                "Appended-parameter optimizer migration requires one group."
+            )
+        source_ids = list(source_groups[0]["params"])
+        target_ids = list(target_groups[0]["params"])
+        if len(source_ids) + added_parameters != len(target_ids):
+            raise ValueError(
+                "Checkpoint optimizer is not a prefix of the current one."
+            )
+        identifier_map = dict(zip(source_ids, target_ids[: len(source_ids)]))
+        unknown = set(migrated.get("state", {})) - set(identifier_map)
+        if unknown:
+            raise ValueError(
+                "Checkpoint optimizer contains state for unknown parameters."
+            )
+        migrated["state"] = {
+            identifier_map[source]: value
+            for source, value in migrated.get("state", {}).items()
+        }
+        group = copy.deepcopy(source_groups[0])
+        group["params"] = target_ids
+        migrated["param_groups"] = [group]
+        return migrated
 
     def _migrate_optimizer_state(
         self,
         state: dict,
         *,
-        structured_output_migrated: bool,
+        missing_model_keys: frozenset[str],
     ) -> dict:
-        """Map old Adam parameter IDs onto the current two-group optimizer.
+        """Map old Adam parameter IDs onto the current optimizer topology.
 
-        Format-1 models lack the final two core parameters: the rank and suit
-        card-output embeddings. Their exact-card and auxiliary Adam moments
-        must retain their identities while the new rows start with empty Adam
-        state. This also retains support for the former single flat group.
-        No other parameter-count mismatch is accepted.
+        Format-1 models can lack the final two core parameters (rank/suit card
+        output embeddings), and format-2 models lack the final two auxiliary
+        parameters (rank-boundary weight/bias). Existing Adam moments retain
+        their identities and only the new parameters start without state. The
+        same mapping permits lossless transitions between split and unified
+        PPO actor groups. No other parameter-count mismatch is accepted.
         """
 
         migrated = copy.deepcopy(state)
@@ -2664,20 +4620,30 @@ class SeqTrainer:
             )
 
         templates = self.optimizer.state_dict()["param_groups"]
-        current_core = len(templates[0]["params"])
-        current_auxiliary = len(templates[1]["params"])
-        missing_count = (
-            len(STRUCTURED_CARD_OUTPUT_KEYS)
-            if structured_output_migrated
-            else 0
-        )
-        source_core = current_core - missing_count
-        if source_core < 0:
-            raise ValueError("Checkpoint optimizer parameter count is invalid.")
+        if len(templates) not in (1, 2):
+            raise ValueError("Current optimizer must contain one or two groups.")
+        core_keys: list[tuple[int, str]] = []
+        auxiliary_keys: list[tuple[int, str]] = []
+        for actor_index, actor in enumerate(self.models):
+            for name, _ in actor.named_parameters():
+                target = (
+                    auxiliary_keys
+                    if name.startswith(_AUXILIARY_HEAD_PREFIXES)
+                    else core_keys
+                )
+                target.append((actor_index, name))
+        source_core_keys = [
+            key for key in core_keys if key[1] not in missing_model_keys
+        ]
+        source_auxiliary_keys = [
+            key for key in auxiliary_keys if key[1] not in missing_model_keys
+        ]
+        source_core = len(source_core_keys)
+        source_auxiliary = len(source_auxiliary_keys)
 
         if len(source_groups) == 1:
             flat = list(source_groups[0]["params"])
-            if len(flat) != source_core + current_auxiliary:
+            if len(flat) != source_core + source_auxiliary:
                 raise ValueError(
                     "Checkpoint optimizer parameter count does not match the model."
                 )
@@ -2692,16 +4658,34 @@ class SeqTrainer:
             )
             if [len(parameters) for parameters in source_parameter_groups] != [
                 source_core,
-                current_auxiliary,
+                source_auxiliary,
             ]:
                 raise ValueError(
                     "Checkpoint optimizer group sizes do not match the model."
                 )
             metadata_groups = tuple(source_groups)
 
+        if len(templates) == 1:
+            target_flat = list(templates[0]["params"])
+            current_target_groups = (
+                target_flat[: len(core_keys)],
+                target_flat[len(core_keys) :],
+            )
+        else:
+            current_target_groups = (
+                list(templates[0]["params"]),
+                list(templates[1]["params"]),
+            )
+        target_ids_by_key = {
+            key: parameter_id
+            for keys, parameter_ids in zip(
+                (core_keys, auxiliary_keys), current_target_groups
+            )
+            for key, parameter_id in zip(keys, parameter_ids)
+        }
         target_parameter_groups = (
-            list(templates[0]["params"][:source_core]),
-            list(templates[1]["params"]),
+            [target_ids_by_key[key] for key in source_core_keys],
+            [target_ids_by_key[key] for key in source_auxiliary_keys],
         )
         identifier_map: dict[int, int] = {}
         for source_parameters, target_parameters in zip(
@@ -2721,10 +4705,12 @@ class SeqTrainer:
         }
 
         groups = []
-        for metadata, template in zip(
-            metadata_groups,
-            templates,
-        ):
+        target_metadata = (
+            (metadata_groups[0],)
+            if len(templates) == 1
+            else metadata_groups
+        )
+        for metadata, template in zip(target_metadata, templates):
             group = copy.deepcopy(metadata)
             # Include every current parameter in the serialized group. The
             # two new output embeddings simply have no entry in ``state`` and

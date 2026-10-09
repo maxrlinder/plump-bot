@@ -9,15 +9,49 @@ import numpy as np
 
 from plump.dashboard import (
     DEFAULT_SMOOTH_WINDOW,
+    EVALUATION_SMOOTH_WINDOW,
+    _checkpoint_evaluation,
     _current_entropy_targets,
     _current_kl_caps,
     _duration,
     _evaluation_points,
+    _actor_versus_oracle_value,
     _has_signal,
     _next_evaluation_eta,
+    _next_trick_winner_learning,
     _smooth,
     render_dashboard,
 )
+import matplotlib.pyplot as plt
+
+
+def test_checkpoint_evaluation_is_marker_free_rolling_five_lines():
+    points = [
+        {
+            "iteration": float(index * 100),
+            "mode": "argmax",
+            "reward": float(index),
+            "bid_hit": float(index) / 10.0,
+            "ci_low": float(index) - 0.5,
+            "ci_high": float(index) + 0.5,
+        }
+        for index in range(1, 7)
+    ]
+    figure, axis = plt.subplots()
+    _checkpoint_evaluation(axis, points)
+    reward = next(line for line in axis.lines if line.get_label() == "reward · argmax")
+    bid = next(
+        line
+        for line in figure.axes[1].lines
+        if line.get_label() == "bid accuracy · argmax"
+    )
+    assert EVALUATION_SMOOTH_WINDOW == 5
+    assert reward.get_marker() == "None"
+    assert bid.get_marker() == "None"
+    assert np.allclose(reward.get_ydata(), [1.0, 1.5, 2.0, 2.5, 3.0, 4.0])
+    assert np.allclose(bid.get_ydata(), [0.1, 0.15, 0.2, 0.25, 0.3, 0.4])
+    assert not axis.collections
+    plt.close(figure)
 
 
 def test_dashboard_omits_disabled_p99_cap_but_keeps_mean_cap(tmp_path):
@@ -66,6 +100,9 @@ def test_dashboard_renders_sparse_partial_and_resumed_rows(tmp_path):
                 "loss_suit",
                 "loss_trick",
                 "loss_oracle_trick",
+                "loss_next_winner",
+                "loss_oracle_next_winner",
+                "loss_oracle_card_order",
                 "suit_accuracy_10c_0",
                 "suit_accuracy_10c_4",
                 "suit_accuracy_10c_8",
@@ -73,6 +110,9 @@ def test_dashboard_renders_sparse_partial_and_resumed_rows(tmp_path):
                 "trick_accuracy_10c_4",
                 "trick_accuracy_10c_8",
                 "oracle_trick_accuracy",
+                "next_winner_accuracy",
+                "oracle_next_winner_accuracy",
+                "oracle_card_order_top1_accuracy",
                 "core_grad_norm",
                 "auxiliary_grad_norm",
                 "critic_grad_norm",
@@ -103,6 +143,9 @@ def test_dashboard_renders_sparse_partial_and_resumed_rows(tmp_path):
                 "loss_suit": 0.65,
                 "loss_trick": 1.4,
                 "loss_oracle_trick": 1.2,
+                "loss_next_winner": 0.8,
+                "loss_oracle_next_winner": 1.5,
+                "loss_oracle_card_order": 1.8,
                 "suit_accuracy_10c_0": 0.55,
                 "suit_accuracy_10c_4": 0.65,
                 "suit_accuracy_10c_8": 0.75,
@@ -110,6 +153,9 @@ def test_dashboard_renders_sparse_partial_and_resumed_rows(tmp_path):
                 "trick_accuracy_10c_4": 0.25,
                 "trick_accuracy_10c_8": 0.45,
                 "oracle_trick_accuracy": 0.5,
+                "next_winner_accuracy": 0.45,
+                "oracle_next_winner_accuracy": 0.6,
+                "oracle_card_order_top1_accuracy": 0.3,
                 "core_grad_norm": 80.0,
                 "auxiliary_grad_norm": 0.08,
                 "critic_grad_norm": 1.8,
@@ -139,6 +185,9 @@ def test_dashboard_renders_sparse_partial_and_resumed_rows(tmp_path):
                 "loss_suit": 0.55,
                 "loss_trick": 1.3,
                 "loss_oracle_trick": 1.0,
+                "loss_next_winner": 0.7,
+                "loss_oracle_next_winner": 1.3,
+                "loss_oracle_card_order": 1.5,
                 "suit_accuracy_10c_0": 0.56,
                 "suit_accuracy_10c_4": 0.67,
                 "suit_accuracy_10c_8": 0.78,
@@ -146,6 +195,9 @@ def test_dashboard_renders_sparse_partial_and_resumed_rows(tmp_path):
                 "trick_accuracy_10c_4": 0.28,
                 "trick_accuracy_10c_8": 0.5,
                 "oracle_trick_accuracy": 0.58,
+                "next_winner_accuracy": 0.5,
+                "oracle_next_winner_accuracy": 0.68,
+                "oracle_card_order_top1_accuracy": 0.4,
                 "core_grad_norm": 60.0,
                 "auxiliary_grad_norm": 0.06,
                 "critic_grad_norm": 1.4,
@@ -181,6 +233,43 @@ def test_dashboard_omits_disabled_zero_only_metrics():
     assert not _has_signal(disabled, omit_zero=True)
     assert _has_signal(disabled, omit_zero=False)
     assert _has_signal(active, omit_zero=True)
+
+
+def test_next_trick_winner_has_dedicated_actor_oracle_panels():
+    rows = [
+        {
+            "iteration": "1",
+            "next_winner_accuracy": "0.5",
+            "oracle_next_winner_accuracy": "0.7",
+            "loss_next_winner": "0.8",
+            "loss_oracle_next_winner": "1.4",
+        },
+        {
+            "iteration": "2",
+            "next_winner_accuracy": "0.6",
+            "oracle_next_winner_accuracy": "0.75",
+            "loss_next_winner": "0.7",
+            "loss_oracle_next_winner": "1.2",
+        },
+    ]
+    figure, (accuracy_ax, loss_ax) = plt.subplots(1, 2)
+    _next_trick_winner_learning(
+        accuracy_ax,
+        loss_ax,
+        np.asarray([1.0, 2.0]),
+        rows,
+        smooth=1,
+    )
+
+    assert accuracy_ax.get_title() == "Next-trick-winner accuracy"
+    assert loss_ax.get_title() == "Next-trick-winner loss"
+    assert [line.get_label() for line in accuracy_ax.lines] == ["actor", "oracle"]
+    assert [line.get_label() for line in loss_ax.lines] == [
+        "actor CE",
+        "oracle CE · epoch sum",
+    ]
+    assert accuracy_ax.get_ylim() == (0.0, 1.0)
+    plt.close(figure)
 
 
 def test_dashboard_formats_elapsed_time_compactly():
@@ -286,3 +375,45 @@ def test_dashboard_loads_argmax_and_sample_checkpoint_evaluations(tmp_path):
         ("argmax", 0.2),
         ("sample", -0.3),
     ]
+
+
+def test_value_comparison_panel_starts_where_the_actor_probe_does():
+    """The oracle has tens of thousands of iterations the comparison cannot use."""
+
+    rows = []
+    for iteration in range(1, 501):
+        started = iteration >= 450
+        rows.append(
+            {
+                "iteration": str(iteration),
+                "critic_all_player_rmse": "6.0",
+                "actor_all_player_rmse": (
+                    f"{6.5 - 0.001 * (iteration - 450)}" if started else ""
+                ),
+                "actor_value_zero_rmse": "6.6",
+                "oracle_value_loss": "0.73",
+                "actor_value_loss": "0.9" if started else "",
+            }
+        )
+    iteration = np.asarray([float(row["iteration"]) for row in rows])
+
+    figure, axis = plt.subplots()
+    _actor_versus_oracle_value(axis, iteration, rows, smooth=1)
+    left, right = axis.get_xlim()
+    assert 400 < left < 450, "the panel is still showing pre-probe history"
+    assert right >= 500
+    plt.close(figure)
+
+
+def test_value_comparison_panel_keeps_full_range_without_a_probe():
+    rows = [
+        {"iteration": str(index), "critic_all_player_rmse": "6.0"}
+        for index in range(1, 21)
+    ]
+    iteration = np.asarray([float(row["iteration"]) for row in rows])
+
+    figure, axis = plt.subplots()
+    _actor_versus_oracle_value(axis, iteration, rows, smooth=1)
+    left, _ = axis.get_xlim()
+    assert left <= 1.0
+    plt.close(figure)

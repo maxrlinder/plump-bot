@@ -25,11 +25,17 @@ if screen -ls | grep -Fq ".${monitor_session}"; then
   exit 2
 fi
 
+# Supervised so the trainer's process is recycled periodically; see
+# tools/train_supervised.sh for why and PLUMP_RECYCLE_AFTER for the interval.
 train_command=(
-  uv run plump train "$run_name" --config "$config_path" "$@"
+  "$project_root/tools/train_supervised.sh"
+  "$run_name" "$config_path" "$@"
 )
+# Evaluation defaults to CPU so it never contends with training for the
+# accelerator or its unified memory; PLUMP_MONITOR_DEVICE overrides.
 monitor_command=(
   "$project_root/tools/watch_evaluation_dashboard.sh" "$run_name"
+  --device "${PLUMP_MONITOR_DEVICE:-cpu}"
 )
 
 printf -v train_shell '%q ' "${train_command[@]}"

@@ -53,6 +53,7 @@ def test_run_creation_records_config_and_rejects_field_changes(tmp_path):
     assert resolved.training.branch_depth_exponent == -0.5
     assert resolved.training.value_objective == "mse"
     assert resolved.training.value_positions == "policy"
+    assert resolved.training.ppo_auxiliary_positions == "policy"
     assert resolved.training.value_reward_scale == 5.0
     assert resolved.training.core_lr == 2.5e-5
     assert resolved.training.auxiliary_lr == 2.5e-5
@@ -65,6 +66,8 @@ def test_run_creation_records_config_and_rejects_field_changes(tmp_path):
     assert resolved.training.checkpoint_every == 50
     assert resolved.training.suit_coef == 0.05
     assert resolved.training.trick_coef == 0.05
+    assert resolved.training.oracle_card_order_coef == 0.0
+    assert resolved.training.rank_boundary_coef == 0.0
     assert resolved.training.rollout.opponent_mode == "heuristic_then_historical"
     assert resolved.training.rollout.opponent_fraction == 0.5
     assert resolved.training.rollout.opponent_packing == "concurrent"
@@ -92,6 +95,18 @@ def test_run_creation_records_config_and_rejects_field_changes(tmp_path):
         overrides=["training.use_kv_cache=false"]
     )
     assert not cache_free.training.use_kv_cache
+    rank_boundary = load_training_config(
+        overrides=["training.rank_boundary_coef=0.05"]
+    )
+    assert rank_boundary.training.rank_boundary_coef == 0.05
+    card_order = load_training_config(
+        overrides=["training.oracle_card_order_coef=0.05"]
+    )
+    assert card_order.training.oracle_card_order_coef == 0.05
+    dense_auxiliary = load_training_config(
+        overrides=['training.ppo_auxiliary_positions="all"']
+    )
+    assert dense_auxiliary.training.ppo_auxiliary_positions == "all"
 
 
 def test_checkpoint_roundtrip_restores_rng_collector_and_relocates_league(
@@ -194,3 +209,53 @@ def test_latest_best_resolution_and_corruption_detection(tmp_path):
     second.write_bytes(b"corrupt")
     with pytest.raises(RuntimeError, match="size mismatch"):
         run.resolve_checkpoint("latest")
+
+
+def test_model_section_keys_reach_the_model_config():
+    """Every [model] key must map through; a dropped key silently no-ops a run."""
+
+    from plump.run_config import load_training_config, resolve_training_config
+
+    resolved = load_training_config("configs/ppo-mps.toml")
+    raw_model = resolved.raw["model"]
+    for key, value in raw_model.items():
+        assert hasattr(resolved.model, key), f"[model] {key} never reaches SeqModelConfig"
+
+    toggled = {**resolved.raw, "model": {**raw_model, "embedding_rms_norm": True}}
+    assert resolve_training_config(toggled).model.embedding_rms_norm is True
+
+
+def test_training_section_values_reach_the_training_config():
+    """Every [training] key must arrive with its value, not merely exist.
+
+    ``resolve_training_config`` maps the raw table field by field, and most
+    optional fields are read with a ``.get(name, default)``. A field added to
+    SeqTrainingConfig and to a config file but forgotten in that mapping is
+    therefore silent: the run starts, the config file says 0.2, and the
+    objective uses 0.0. Presence checks miss it -- the attribute exists either
+    way -- so compare the values.
+    """
+
+    import dataclasses
+    import glob
+
+    from plump.run_config import load_training_config
+    from plump.seq.config import SeqTrainingConfig
+
+    names = {field.name for field in dataclasses.fields(SeqTrainingConfig)}
+    paths = sorted(glob.glob("configs/*.toml")) + ["plump/train.toml"]
+    assert paths, "no training configs found to check"
+    for path in paths:
+        resolved = load_training_config(path)
+        for key, value in resolved.raw.get("training", {}).items():
+            if key not in names or not isinstance(value, (int, float, bool, str)):
+                continue
+            landed = getattr(resolved.training, key)
+            if isinstance(value, float) or isinstance(landed, float):
+                assert float(landed) == pytest.approx(float(value)), (
+                    f"{path}: [training] {key} = {value} arrived as {landed}"
+                )
+            else:
+                assert landed == value, (
+                    f"{path}: [training] {key} = {value} arrived as {landed}"
+                )

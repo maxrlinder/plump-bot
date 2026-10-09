@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import csv
+import json
 import math
 import re
 import tomllib
@@ -20,6 +21,7 @@ from plump.run_evaluation import ensure_evaluation_summary
 
 Field = tuple[str, str]
 DEFAULT_SMOOTH_WINDOW = 50
+EVALUATION_SMOOTH_WINDOW = 5
 
 
 def render_dashboard(
@@ -50,7 +52,7 @@ def render_dashboard(
         if evaluations_path is not None
         else metrics_path.parent / "evaluations",
     )
-    fig, axes = plt.subplots(4, 3, figsize=(20, 17), constrained_layout=True)
+    fig, axes = plt.subplots(5, 3, figsize=(20, 21), constrained_layout=True)
     fig.get_layout_engine().set(rect=(0.0, 0.035, 1.0, 0.96))
     fig.suptitle(
         title or f"Plump schema-v6 · {metrics_path.parent.name}",
@@ -99,8 +101,13 @@ def render_dashboard(
         rows,
         (
             ("loss_suit", "actor opponent-suit BCE"),
+            ("loss_rank_boundary", "actor rank-boundary BCE"),
             ("loss_trick", "actor final-trick CE"),
             ("loss_oracle_trick", "oracle final-trick CE · epoch sum"),
+            (
+                "loss_oracle_card_order",
+                "oracle card-order listwise NLL · epoch sum",
+            ),
         ),
         smooth=smooth,
         title="Belief auxiliary losses",
@@ -137,6 +144,10 @@ def render_dashboard(
         smooth=smooth,
         title="Wall time",
         ylabel="seconds",
+        # Clipped: a handful of early-run stalls and reconfiguration
+        # iterations reach 100s+ and flatten the range the run actually
+        # operates in, which is what this panel is for.
+        ymax=25.0,
     )
     _entropy_controller(
         axes[2, 2],
@@ -151,13 +162,25 @@ def render_dashboard(
         iteration,
         rows,
         (
-            ("suit_accuracy_10c_0", "0 cards played"),
-            ("suit_accuracy_10c_4", "4 cards played"),
-            ("suit_accuracy_10c_8", "8 cards played"),
+            ("suit_accuracy_10c_0", "suit · 0 played"),
+            ("suit_accuracy_10c_4", "suit · 4 played"),
+            ("suit_accuracy_10c_8", "suit · 8 played"),
+            (
+                "rank_boundary_balanced_accuracy_10c_0",
+                "rank bounds (balanced) · 0 played",
+            ),
+            (
+                "rank_boundary_balanced_accuracy_10c_4",
+                "rank bounds (balanced) · 4 played",
+            ),
+            (
+                "rank_boundary_balanced_accuracy_10c_8",
+                "rank bounds (balanced) · 8 played",
+            ),
         ),
         smooth=smooth,
-        title="Opponent-suit accuracy · 10-card games",
-        ylabel="bit accuracy",
+        title="Actor hidden-card beliefs · 10-card games",
+        ylabel="bit accuracy / balanced accuracy",
         omit_zero=True,
     )
     axes[3, 0].set_ylim(0.0, 1.0)
@@ -170,16 +193,51 @@ def render_dashboard(
             ("trick_accuracy_10c_4", "actor · 4 played"),
             ("trick_accuracy_10c_8", "actor · 8 played"),
             ("oracle_trick_accuracy", "oracle · all prefixes"),
+            (
+                "oracle_card_order_top1_accuracy",
+                "oracle next-card order",
+            ),
         ),
         smooth=smooth,
-        title="Final-trick exact accuracy",
+        title="Final-trick / card-order accuracy",
         ylabel="seat accuracy",
         omit_zero=True,
     )
     axes[3, 1].set_ylim(0.0, 1.0)
-    _evaluation_gap(axes[3, 2], evaluation_points)
+    _lines(
+        axes[3, 2],
+        iteration,
+        rows,
+        (
+            ("suit_loss_10c_0", "suit · 0 played"),
+            ("suit_loss_10c_4", "suit · 4 played"),
+            ("suit_loss_10c_8", "suit · 8 played"),
+            ("rank_boundary_loss_10c_0", "rank bounds · 0 played"),
+            ("rank_boundary_loss_10c_4", "rank bounds · 4 played"),
+            ("rank_boundary_loss_10c_8", "rank bounds · 8 played"),
+        ),
+        smooth=smooth,
+        title="Actor hidden-card belief losses · 10-card games",
+        ylabel="masked BCE per bit",
+        omit_zero=True,
+    )
+    _actor_versus_oracle_value(
+        axes[4, 0],
+        iteration,
+        rows,
+        smooth=smooth,
+    )
+    _next_trick_winner_learning(
+        axes[4, 1],
+        axes[4, 2],
+        iteration,
+        rows,
+        smooth=smooth,
+    )
 
     for ax in axes.flat:
+        if not ax.get_visible():
+            continue
         ax.set_xlabel("Iteration")
         ax.grid(alpha=0.18)
 
@@ -303,9 +361,24 @@ def _evaluation_points(
         paths.extend(
             sorted(evaluations_path.glob("iter_*/heuristic_sample.json"))
         )
+        # A lightweight fork may retain only compact sidecars rather than
+        # multi-megabyte per-round reports. Prefer the full report when both
+        # exist, and otherwise treat its summary as a first-class source.
+        full_summaries = {
+            path.with_suffix(".summary.json") for path in paths
+        }
+        paths.extend(
+            path
+            for path in sorted(evaluations_path.glob("iter_*/*.summary.json"))
+            if path not in full_summaries
+        )
         for path in paths:
             try:
-                payload = ensure_evaluation_summary(path)
+                payload = (
+                    json.loads(path.read_text())
+                    if path.name.endswith(".summary.json")
+                    else ensure_evaluation_summary(path)
+                )
                 report = payload.get("report", payload)
                 protocol = payload.get("protocol", {})
                 greedy = bool(
@@ -415,7 +488,9 @@ def _checkpoint_evaluation(
     points: list[dict[str, float | str]],
 ) -> None:
     right_ax = ax.twinx()
-    ax.set_title("Checkpoint evaluation vs heuristic")
+    ax.set_title(
+        f"Checkpoint evaluation vs heuristic · rolling {EVALUATION_SMOOTH_WINDOW}"
+    )
     if not points:
         right_ax.set_yticks([])
         right_ax.spines["right"].set_visible(False)
@@ -445,15 +520,8 @@ def _checkpoint_evaluation(
             [point["bid_hit"] for point in selected],
             dtype=np.float64,
         )
-        ci_low = np.asarray(
-            [point["ci_low"] for point in selected],
-            dtype=np.float64,
-        )
-        ci_high = np.asarray(
-            [point["ci_high"] for point in selected],
-            dtype=np.float64,
-        )
-
+        reward = _smooth(reward, EVALUATION_SMOOTH_WINDOW)
+        bid_hit = _smooth(bid_hit, EVALUATION_SMOOTH_WINDOW)
         reward_valid = np.isfinite(iteration) & np.isfinite(reward)
         if reward_valid.any():
             (reward_line,) = ax.plot(
@@ -462,24 +530,9 @@ def _checkpoint_evaluation(
                 color=reward_color,
                 linestyle=line_style,
                 linewidth=1.8,
-                marker="o",
                 label=f"reward · {label}",
             )
             handles.append(reward_line)
-            ci_valid = (
-                reward_valid
-                & np.isfinite(ci_low)
-                & np.isfinite(ci_high)
-            )
-            if ci_valid.any():
-                ax.fill_between(
-                    iteration[ci_valid],
-                    ci_low[ci_valid],
-                    ci_high[ci_valid],
-                    color=reward_color,
-                    alpha=0.10,
-                    linewidth=0,
-                )
 
         bid_valid = np.isfinite(iteration) & np.isfinite(bid_hit)
         if bid_valid.any():
@@ -489,7 +542,6 @@ def _checkpoint_evaluation(
                 color=bid_color,
                 linestyle=line_style,
                 linewidth=1.8,
-                marker="s",
                 label=f"bid accuracy · {label}",
             )
             handles.append(bid_line)
@@ -616,6 +668,7 @@ def _plot_fields(
     smooth: int,
     omit_zero: bool,
     color_offset: int = 0,
+    linestyle: str = "-",
 ) -> list:
     handles = []
     for index, (field, label) in enumerate(fields):
@@ -649,6 +702,7 @@ def _plot_fields(
             iteration[valid],
             rendered[valid],
             linewidth=1.7,
+            linestyle=linestyle,
             color=color,
             label=label,
             zorder=2,
@@ -667,6 +721,7 @@ def _lines(
     title: str,
     ylabel: str | None = None,
     omit_zero: bool = False,
+    ymax: float | None = None,
 ) -> None:
     handles = _plot_fields(
         ax,
@@ -679,10 +734,51 @@ def _lines(
     ax.set_title(title)
     if ylabel:
         ax.set_ylabel(ylabel)
+    if ymax is not None:
+        ax.set_ylim(0, ymax)
     if handles:
         ax.legend(handles=handles, fontsize=8, loc="best")
     else:
         _no_data(ax)
+
+
+def _next_trick_winner_learning(
+    accuracy_ax,
+    loss_ax,
+    iteration: np.ndarray,
+    rows: list[dict[str, str]],
+    *,
+    smooth: int,
+) -> None:
+    """Keep actor/oracle next-trick diagnostics together and easy to compare."""
+
+    _lines(
+        accuracy_ax,
+        iteration,
+        rows,
+        (
+            ("next_winner_accuracy", "actor"),
+            ("oracle_next_winner_accuracy", "oracle"),
+        ),
+        smooth=smooth,
+        title="Next-trick-winner accuracy",
+        ylabel="winner accuracy",
+        omit_zero=True,
+    )
+    accuracy_ax.set_ylim(0.0, 1.0)
+    _lines(
+        loss_ax,
+        iteration,
+        rows,
+        (
+            ("loss_next_winner", "actor CE"),
+            ("loss_oracle_next_winner", "oracle CE · epoch sum"),
+        ),
+        smooth=smooth,
+        title="Next-trick-winner loss",
+        ylabel="normalized cross-entropy",
+        omit_zero=True,
+    )
 
 
 def _trust_region(
@@ -816,8 +912,13 @@ def _gradient_norms(
         iteration,
         rows,
         (
-            ("core_grad_norm", "core/shared pre-clip"),
+            ("core_grad_norm", "actor total pre-clip"),
+            ("embedding_grad_norm", "input embeddings pre-clip"),
             ("auxiliary_grad_norm", "value/belief heads pre-clip"),
+            # By objective rather than by parameter: what each half of the
+            # actor loss produced on its own, before the budget rebalance.
+            ("policy_loss_grad_norm", "PPO loss, all actor params"),
+            ("auxiliary_loss_grad_norm", "auxiliary losses, all actor params"),
             ("critic_grad_norm", "PPO critic pre-clip"),
         ),
         smooth=smooth,
@@ -838,6 +939,54 @@ def _gradient_norms(
         ax.legend(handles=[*handles, ax.lines[-1]], fontsize=8, loc="best")
     else:
         _no_data(ax)
+
+
+def _actor_versus_oracle_value(
+    ax,
+    iteration: np.ndarray,
+    rows: list[dict[str, str]],
+    *,
+    smooth: int,
+) -> None:
+    """Compare the actor's value probe with the oracle on one dense objective.
+
+    Both heads predict the same per-seat terminal rewards at every genuine
+    causal token, with the same zero-sum centering and the same per-game mass,
+    so the gap between the two curves is exactly the cost of observer
+    information versus perfect information. The actor's curve begins only once
+    ``ppo_actor_value_coef`` is turned on, so the view starts there rather than
+    spending most of its width on oracle history the comparison cannot use.
+    """
+
+    _dual_lines(
+        ax,
+        iteration,
+        rows,
+        left=(
+            ("critic_all_player_rmse", "oracle · perfect information"),
+            ("actor_all_player_rmse", "actor · observer information"),
+            ("actor_value_zero_rmse", "zero-prediction baseline"),
+        ),
+        right=(
+            ("oracle_value_loss", "oracle loss · per pass"),
+            ("actor_value_loss", "actor loss · per pass"),
+        ),
+        smooth=smooth,
+        title="Value prediction · actor vs oracle",
+        left_label="dense all-seat RMSE (reward units)",
+        right_label="normalized loss",
+        omit_zero=True,
+    )
+    probe = _series(rows, "actor_all_player_rmse")
+    started = np.flatnonzero(np.isfinite(probe) & (probe != 0.0))
+    if started.size and iteration.size:
+        first = float(iteration[started[0]])
+        last = float(iteration[-1])
+        if last > first:
+            # Leave a sliver of the pre-probe oracle level visible so the
+            # comparison starts from a reference rather than mid-air.
+            margin = 0.02 * (last - first)
+            ax.set_xlim(first - margin, last + margin)
 
 
 def _value_and_critic_learning(
@@ -905,6 +1054,11 @@ def _current_kl_caps(metrics_path: Path) -> tuple[float, float | None] | None:
     try:
         with config_path.open("rb") as handle:
             training = tomllib.load(handle)["training"]
+        if (
+            training.get("policy_objective") == "ppo"
+            and not training.get("ppo_trust_region", True)
+        ):
+            return None
         mean_cap = float(training["policy_kl_cap"])
         p99_cap = float(training["policy_kl_p99_cap"])
     except (KeyError, OSError, TypeError, ValueError, tomllib.TOMLDecodeError):
@@ -964,9 +1118,21 @@ def _entropy_controller(
         omit_zero=True,
         color_offset=2,
     )
-    target_handles = []
+    target_handles = _plot_fields(
+        ax,
+        iteration,
+        rows,
+        (
+            ("entropy_target_bid", "bid target"),
+            ("entropy_target_play", "play target"),
+        ),
+        smooth=1,
+        omit_zero=False,
+        color_offset=0,
+        linestyle=":",
+    )
     targets = _current_entropy_targets(metrics_path)
-    if targets is not None:
+    if not target_handles and targets is not None:
         for target, color, phase in zip(targets, ("C0", "C1"), ("bid", "play")):
             target_handles.append(
                 ax.axhline(
