@@ -29,13 +29,15 @@ hand_sizes = [3, 4, 5, 6, 7, 8, 9, 10]
 player_counts = [3, 4, 5]
 player_count_weights = [2.0, 3.0, 4.0]
 schedule_repeats = 1
-# 29 deals for each of the 24 shapes (8 hand sizes x 3 player counts) = 696
-# games per update, which is the requested ~700.
+# 58 deals for each of the 24 shapes (8 hand sizes x 3 player counts) = 1392
+# games per update, doubled from 29 (696 games) at iteration 52700 when the
+# fused Metal trunk (PLUMP_METAL_TRUNK=1) halved the iteration time: the
+# wider batch keeps roughly the old ~18 s iteration.
 #
-# Retain this learning batch during throughput tuning. Changing the number
-# of games changes gradient noise and needs a learning comparison; gradient
-# clipping alone does not establish a universal batch-size speedup law.
-deals_per_shape = 29
+# Changing the number of games changes gradient noise and needs a learning
+# comparison; gradient clipping alone does not establish a universal
+# batch-size speedup law.
+deals_per_shape = 58
 # One wave, one optimizer step. The whole 696-game batch is consumed by a
 # single accumulate-and-step: _ppo_actor_backward runs every microbatch of
 # every length bucket between one zero_grad() and one optimizer.step(), so
@@ -183,7 +185,7 @@ league_recent_fraction = 0.0
 
 [rollout]
 # rows = deals_per_shape x sum(player_counts) x len(hand_sizes)
-#      = 29 x 12 x 8 = 2784, so the whole schedule runs as one merged loop and
+#      = 58 x 12 x 8 = 5568, so the whole schedule runs as one merged loop and
 # this cap never binds. Left at the historical value so a wider schedule
 # still fits without a config change.
 max_cache_rows = 12288
