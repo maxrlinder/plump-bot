@@ -268,6 +268,17 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     train.add_argument(
+        "--reset-entropy-alpha",
+        action="append",
+        choices=("bid", "play"),
+        default=[],
+        metavar="PHASE",
+        help=(
+            "with --reconfigure, return that phase's adaptive entropy "
+            "temperature to its floor (and clear its Adam moments); repeatable"
+        ),
+    )
+    train.add_argument(
         "--reconfigure-reason",
         default="CLI-authorized training reconfiguration",
         help="reason stored in the run metadata with --reconfigure",
@@ -703,6 +714,8 @@ def train_command(args: argparse.Namespace) -> int:
         raise ValueError("--resume-checkpoint requires an existing run.")
     if args.reset_league and args.from_checkpoint is None:
         raise ValueError("--reset-league requires --from-checkpoint.")
+    if args.reset_entropy_alpha and not args.reconfigure:
+        raise ValueError("--reset-entropy-alpha requires --reconfigure.")
     if args.prepare_only and existed and not args.reconfigure:
         raise ValueError(
             "--prepare-only on an existing run requires --reconfigure."
@@ -756,6 +769,15 @@ def train_command(args: argparse.Namespace) -> int:
                 checkpoint,
                 allow_training_config_mismatch=bool(reconfiguration_differences),
             )
+            for phase in dict.fromkeys(args.reset_entropy_alpha):
+                before = trainer._entropy_alpha(phase)
+                trainer.reset_entropy_alpha(phase)
+                # Recorded with the config changes, so the reset is in the
+                # reconfiguration audit and forces the resume checkpoint.
+                reconfiguration_differences.append(
+                    f"entropy alpha ({phase}): {before:.6g} -> "
+                    f"{trainer._entropy_alpha(phase):.6g} (reset)"
+                )
             discarded, stale_evaluations = _discard_reporting_after(
                 run, trainer.iteration
             )

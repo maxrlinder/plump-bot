@@ -1070,6 +1070,16 @@ class SeqTrainingConfig:
     # 0.16 against a 0.01 cap, which under rollback means no update ever
     # survives. 0 disables.
     lr_warmup_updates: int = 100
+    # Iteration-keyed decay on top of the warmup ramp, for a cooldown. With
+    # "linear" the actor learning rate (core and auxiliary groups alike)
+    # scales from 1 at lr_decay_start_iteration to lr_decay_final_scale at
+    # lr_decay_end_iteration and holds there. Keyed on the iteration, like the
+    # entropy-target schedule, so the two can share one window. The critic
+    # and entropy-controller rates are not scheduled.
+    lr_schedule: Literal["constant", "linear"] = "constant"
+    lr_decay_start_iteration: int = 0
+    lr_decay_end_iteration: int = 0
+    lr_decay_final_scale: float = 1.0
     epochs: int = 1
     # Microbatch size in token positions (sequences x length), sized to memory.
     microbatch_positions: int = 16384
@@ -1467,6 +1477,17 @@ class SeqTrainingConfig:
         self.rollout.validate()
         if self.learning_rate <= 0 or self.core_lr <= 0 or self.auxiliary_lr <= 0:
             raise ValueError("Learning rates must be > 0.")
+        if self.lr_schedule not in ("constant", "linear"):
+            raise ValueError("lr_schedule must be 'constant' or 'linear'.")
+        if self.lr_schedule != "constant" and (
+            self.lr_decay_end_iteration <= self.lr_decay_start_iteration
+        ):
+            raise ValueError(
+                "lr_decay_end_iteration must be greater than "
+                "lr_decay_start_iteration."
+            )
+        if self.lr_decay_final_scale <= 0:
+            raise ValueError("lr_decay_final_scale must be > 0.")
         if self.value_objective not in ("mse", "smooth_l1"):
             raise ValueError(
                 "value_objective must be either 'mse' or 'smooth_l1'."
@@ -1734,6 +1755,16 @@ class SeqTrainingConfig:
                 and cell.num_players not in self.player_counts
             ):
                 raise ValueError("Schedule cell player count not in player_counts.")
+
+    def lr_schedule_scale(self, iteration: int) -> float:
+        """Multiplier on the actor learning rate at ``iteration``."""
+
+        if self.lr_schedule == "constant":
+            return 1.0
+        start = self.lr_decay_start_iteration
+        end = self.lr_decay_end_iteration
+        progress = min(max((iteration - start) / (end - start), 0.0), 1.0)
+        return 1.0 + progress * (self.lr_decay_final_scale - 1.0)
 
     def ppo_entropy_targets(self, iteration: int) -> tuple[float, float]:
         """Return the normalized bid/play entropy targets at ``iteration``."""

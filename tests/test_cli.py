@@ -422,6 +422,42 @@ def test_cli_reconfigure_writes_resume_checkpoint_and_config_audit(
     assert any("training.learning_rate" in line for line in migration["changes"])
 
 
+def test_cli_reconfigure_can_reset_one_entropy_temperature(
+    tmp_path, monkeypatch, capsys
+):
+    import math
+
+    import pytest
+
+    monkeypatch.setenv("PLUMP_RUNS_DIR", str(tmp_path))
+    ppo = []
+    for override in (
+        'training.policy_objective="ppo"',
+        "training.ppo_trust_region=false",
+        "training.ppo_critic_epochs=1",
+    ):
+        ppo.extend(("--set", override))
+    assert main([*_train_args("tiny-alpha"), *ppo]) == 0
+
+    assert main([*_train_args("tiny-alpha"), *ppo, "--reset-entropy-alpha", "play"]) != 0
+    assert "--reset-entropy-alpha requires --reconfigure" in capsys.readouterr().err
+
+    reset = [
+        *_train_args("tiny-alpha"), *ppo,
+        "--reconfigure", "--prepare-only", "--reset-entropy-alpha", "play",
+    ]
+    assert main(reset) == 0
+
+    run = tmp_path / "tiny-alpha"
+    latest = json.loads((run / "checkpoints" / "latest.json").read_text())
+    assert latest["path"].startswith("resume_000001_reconfigured")
+    payload = torch.load(run / "checkpoints" / latest["path"], weights_only=False)
+    assert float(payload["entropy_log_alpha"]["play"]) == pytest.approx(math.log(1e-6))
+    assert float(payload["entropy_log_alpha"]["bid"]) > math.log(1e-6)
+    migration = json.loads((run / "metadata.json").read_text())["config_migrations"][-1]
+    assert any("entropy alpha (play)" in line for line in migration["changes"])
+
+
 def test_parse_int_list_accepts_lists_and_inclusive_ranges():
     from plump.cli import _parse_int_list
 

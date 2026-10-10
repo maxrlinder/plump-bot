@@ -120,7 +120,16 @@ _ADDITIVE_TRAINING_FIELDS: tuple[str, ...] = (
     "dense_supervision_start",
     "ppo_auxiliary_grad_fraction",
     "ppo_trust_region",
+    "lr_schedule",
+    "lr_decay_start_iteration",
+    "lr_decay_end_iteration",
+    "lr_decay_final_scale",
 )
+
+# Bounds on each adaptive entropy temperature, applied after every controller
+# step. The floor is what a reset returns a temperature to.
+ENTROPY_ALPHA_MIN = 1e-6
+ENTROPY_ALPHA_MAX = 10.0
 
 _INPUT_EMBEDDING_PREFIXES = (
     "slot_embedding.",
@@ -1769,7 +1778,9 @@ class SeqTrainer:
             return 0.0
         if self.train.ppo_entropy_mode == "fixed":
             return self.train.ppo_entropy_coef
-        return float(self.log_entropy_alpha[phase].detach().exp().clamp(max=10.0))
+        return float(
+            self.log_entropy_alpha[phase].detach().exp().clamp(max=ENTROPY_ALPHA_MAX)
+        )
 
     def _auxiliary_budget_active(self) -> bool:
         return self.train.ppo_auxiliary_grad_fraction > 0
@@ -2626,7 +2637,24 @@ class SeqTrainer:
         self.entropy_optimizer.step()
         with torch.no_grad():
             for parameter in self.log_entropy_alpha.values():
-                parameter.clamp_(math.log(1e-6), math.log(10.0))
+                parameter.clamp_(
+                    math.log(ENTROPY_ALPHA_MIN), math.log(ENTROPY_ALPHA_MAX)
+                )
+
+    def reset_entropy_alpha(self, phase: str) -> None:
+        """Return one adaptive entropy temperature to its floor.
+
+        Its Adam moments go too: momentum built up while the temperature was
+        climbing would otherwise keep pushing it up after the reset.
+        """
+
+        if phase not in self.log_entropy_alpha:
+            raise ValueError(f"No adaptive entropy temperature for {phase!r}.")
+        parameter = self.log_entropy_alpha[phase]
+        with torch.no_grad():
+            parameter.fill_(math.log(ENTROPY_ALPHA_MIN))
+        if self.entropy_optimizer is not None:
+            self.entropy_optimizer.state.pop(parameter, None)
 
     def _evaluate_ppo_kl(
         self, groups: list[PPOTrainingGroup]
@@ -3140,7 +3168,8 @@ class SeqTrainer:
             stats.critic_loss_reduction = (first - last) / first
 
     def _apply_warmup_lr(self) -> None:
-        """Linear LR ramp over the first ``lr_warmup_updates`` kept steps.
+        """Linear LR ramp over the first ``lr_warmup_updates`` kept steps,
+        times the iteration-keyed ``lr_schedule`` decay.
 
         Adam's early steps are sign steps -- ``m_hat/sqrt(v_hat)`` is +/-1
         whatever the gradient magnitude, so gradient clipping cannot soften
@@ -3152,6 +3181,7 @@ class SeqTrainer:
 
         warmup = self.train.lr_warmup_updates
         scale = 1.0 if warmup <= 0 else min(1.0, (self.optimizer_steps + 1) / warmup)
+        scale *= self.train.lr_schedule_scale(self.iteration)
         for group in self.optimizer.param_groups:
             base = (
                 self.train.core_lr

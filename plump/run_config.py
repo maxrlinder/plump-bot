@@ -207,6 +207,12 @@ def resolve_training_config(raw: dict[str, Any]) -> ResolvedTraining:
             else float(training_raw["auxiliary_learning_rate"])
         ),
         lr_warmup_updates=int(training_raw["lr_warmup_updates"]),
+        lr_schedule=str(training_raw.get("lr_schedule", "constant")),
+        lr_decay_start_iteration=int(
+            training_raw.get("lr_decay_start_iteration", 0)
+        ),
+        lr_decay_end_iteration=int(training_raw.get("lr_decay_end_iteration", 0)),
+        lr_decay_final_scale=float(training_raw.get("lr_decay_final_scale", 1.0)),
         epochs=int(training_raw["epochs"]),
         microbatch_positions=int(training_raw["microbatch_positions"]),
         policy_objective=str(training_raw["policy_objective"]),

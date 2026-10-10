@@ -805,6 +805,69 @@ def test_linear_entropy_schedule_moves_at_a_constant_rate():
     assert config.ppo_entropy_targets(60_000) == pytest.approx((0.25, 0.20))
 
 
+def test_linear_lr_schedule_scales_the_actor_rate_on_top_of_warmup():
+    config = replace(
+        ppo_config(),
+        lr_schedule="linear",
+        lr_decay_start_iteration=56_200,
+        lr_decay_end_iteration=66_000,
+        lr_decay_final_scale=0.1,
+    )
+    assert config.lr_schedule_scale(56_199) == pytest.approx(1.0)
+    assert config.lr_schedule_scale(56_200) == pytest.approx(1.0)
+    assert config.lr_schedule_scale(61_100) == pytest.approx(0.55)
+    assert config.lr_schedule_scale(66_000) == pytest.approx(0.1)
+    assert config.lr_schedule_scale(90_000) == pytest.approx(0.1)
+    assert ppo_config().lr_schedule_scale(90_000) == 1.0
+
+    trainer = SeqTrainer(SeqPlumpModel(MODEL), config, device="cpu")
+    trainer.optimizer_steps = 10_000  # warmup long finished
+    trainer.iteration = 61_100
+    trainer._apply_warmup_lr()
+    for group in trainer.optimizer.param_groups:
+        assert group["lr"] == pytest.approx(0.55 * config.core_lr)
+
+    with pytest.raises(ValueError, match="lr_decay_end_iteration"):
+        replace(config, lr_decay_end_iteration=56_200).validate()
+    with pytest.raises(ValueError, match="lr_decay_final_scale"):
+        replace(config, lr_decay_final_scale=0.0).validate()
+
+
+def test_entropy_alpha_reset_drops_one_phase_to_its_floor(tmp_path):
+    """The reset clears that temperature's Adam moments too: the momentum it
+    built while climbing would otherwise push it straight back up."""
+
+    from plump.seq.trainer import ENTROPY_ALPHA_MIN
+
+    trainer = SeqTrainer(SeqPlumpModel(MODEL), ppo_config(), device="cpu")
+    trainer.log_entropy_alpha["bid"].data.fill_(math.log(0.06))
+    trainer.log_entropy_alpha["play"].data.fill_(math.log(1e-4))
+    for _ in range(3):
+        # Below both targets: both temperatures climb and gain momentum.
+        trainer._update_entropy_temperature({"bid_entropy": 0.0, "play_entropy": 0.0})
+    play = trainer.log_entropy_alpha["play"]
+    assert play in trainer.entropy_optimizer.state
+    bid_before = trainer._entropy_alpha("bid")
+
+    trainer.reset_entropy_alpha("play")
+
+    assert trainer._entropy_alpha("play") == pytest.approx(ENTROPY_ALPHA_MIN)
+    assert play not in trainer.entropy_optimizer.state
+    assert trainer._entropy_alpha("bid") == pytest.approx(bid_before)
+    path = tmp_path / "reset.pt"
+    trainer.save_checkpoint(path)
+    restored = SeqTrainer(SeqPlumpModel(MODEL), ppo_config(), device="cpu")
+    restored.load_checkpoint(path)
+    assert restored._entropy_alpha("play") == pytest.approx(ENTROPY_ALPHA_MIN)
+    assert restored._entropy_alpha("bid") == pytest.approx(bid_before)
+    # From a fresh Adam state the first step is a plain lr-sized nudge.
+    restored._update_entropy_temperature({"bid_entropy": 1.0, "play_entropy": 0.0})
+    assert restored._entropy_alpha("play") == pytest.approx(
+        ENTROPY_ALPHA_MIN * math.exp(restored.train.ppo_entropy_learning_rate),
+        rel=1e-3,
+    )
+
+
 def test_oracle_critic_has_one_sequence_per_game_and_exact_seat_ties():
     trainer = SeqTrainer(
         SeqPlumpModel(MODEL),
