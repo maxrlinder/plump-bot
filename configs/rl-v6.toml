@@ -29,15 +29,16 @@ hand_sizes = [3, 4, 5, 6, 7, 8, 9, 10]
 player_counts = [3, 4, 5]
 player_count_weights = [2.0, 3.0, 4.0]
 schedule_repeats = 1
-# 58 deals for each of the 24 shapes (8 hand sizes x 3 player counts) = 1392
-# games per update, doubled from 29 (696 games) at iteration 52700 when the
-# fused Metal trunk (PLUMP_METAL_TRUNK=1) halved the iteration time: the
-# wider batch keeps roughly the old ~18 s iteration.
+# 116 deals for each of the 24 shapes (8 hand sizes x 3 player counts) = 2784
+# games per update. History: 29 (696 games) until 52700; doubled to 58 (1392)
+# at 52700 when the fused Metal trunk (PLUMP_METAL_TRUNK=1) halved the
+# iteration time; doubled again to 116 at 71100 together with a doubled
+# learning rate, after the cooldown.
 #
 # Changing the number of games changes gradient noise and needs a learning
 # comparison; gradient clipping alone does not establish a universal
 # batch-size speedup law.
-deals_per_shape = 58
+deals_per_shape = 116
 # One wave, one optimizer step. The whole 696-game batch is consumed by a
 # single accumulate-and-step: _ppo_actor_backward runs every microbatch of
 # every length bucket between one zero_grad() and one optimizer.step(), so
@@ -65,21 +66,19 @@ play_top_k = 1
 # 3e-5, below the 0.004 guard. This is an update-size measurement; tournament
 # progress must still establish the effect on learning. Adam preconditions
 # the clipped gradient, so its parameter-step norm is not the learning rate.
-learning_rate = 0.000045
-core_learning_rate = 0.000045
-auxiliary_learning_rate = 0.000045
+#
+# Cooldown 56200 -> 66000: lr_schedule = "linear" took the actor rate from
+# 4.5e-5 to 4.5e-6 (lr_decay_final_scale = 0.1) over the same window as the
+# final entropy ramp below; the run then held 4.5e-6 to 71100. From 71100
+# the rate is a constant 9e-6 -- twice the cooldown's end value -- together
+# with twice the games per update (deals_per_shape 58 -> 116). Every update
+# is clipped, so this rate is the step length; the critic and entropy
+# controller rates are unchanged throughout.
+learning_rate = 0.000009
+core_learning_rate = 0.000009
+auxiliary_learning_rate = 0.000009
 lr_warmup_updates = 100
-# Cooldown: the actor rate falls linearly 4.5e-5 -> 4.5e-6 over the same
-# window as the final entropy ramp below, 56200 -> 66000. 9800 iterations is
-# 45 h at the 16.48 s/iteration measured over the 1000 iterations before it
-# (1392 games, Metal trunk, recycle restarts included); laptop sleep
-# stretches the wall time, not the iteration count. Every update is clipped,
-# so this rate is the step length: decaying it shrinks the jitter of an
-# almost pure-noise policy gradient. Critic and controller rates unchanged.
-lr_schedule = "linear"
-lr_decay_start_iteration = 56200
-lr_decay_end_iteration = 66000
-lr_decay_final_scale = 0.1
+lr_schedule = "constant"
 epochs = 1
 # The update's memory lever, and the only one that matters: rollout peak sat
 # at 1.9 GB across this whole sweep, so the two phases are tuned separately
@@ -192,7 +191,7 @@ league_recent_fraction = 0.0
 
 [rollout]
 # rows = deals_per_shape x sum(player_counts) x len(hand_sizes)
-#      = 58 x 12 x 8 = 5568, so the whole schedule runs as one merged loop and
+#      = 116 x 12 x 8 = 11136, so the whole schedule runs as one merged loop and
 # this cap never binds. Left at the historical value so a wider schedule
 # still fits without a config change.
 max_cache_rows = 12288
